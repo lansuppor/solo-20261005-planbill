@@ -69,13 +69,31 @@ type adjustment struct {
 	RevokedAt    string `json:"revoked_at,omitempty"`
 }
 
+// payment 是对已结算账单的一笔实收登记（正整数分）。
+// 记录一旦写入永不删除；撤销只是追加撤销信息，保留原记录，
+// 撤销后该笔不再计入实收，也不会因重放而恢复。
+type payment struct {
+	ID           string `json:"id"`
+	CustomerID   string `json:"customer_id"`
+	Month        string `json:"month"` // YYYY-MM（UTC），与所属账单一致
+	Amount       int64  `json:"amount_fen"`
+	Note         string `json:"note"`
+	Seq          int64  `json:"seq"` // 全局递增操作序号，决定历史展示顺序
+	CreatedAt    string `json:"created_at"`
+	Revoked      bool   `json:"revoked"`
+	RevokeReason string `json:"revoke_reason,omitempty"`
+	RevokeSeq    int64  `json:"revoke_seq,omitempty"`
+	RevokedAt    string `json:"revoked_at,omitempty"`
+}
+
 type state struct {
 	Version     int                     `json:"version"`
 	Customers   map[string]*customer    `json:"customers"`
 	Usage       map[string]*usageRecord `json:"usage"`       // 全局唯一用量标识 -> 记录
 	Bills       map[string]*bill        `json:"bills"`       // 客户 + "|" + 月份 -> 账单
 	Adjustments map[string]*adjustment  `json:"adjustments"` // 全局唯一调整标识 -> 记录
-	NextSeq     int64                   `json:"next_seq"`    // 已分配的最大操作序号（调整/撤销共用）
+	Payments    map[string]*payment     `json:"payments"`    // 全局唯一收款标识 -> 记录（与调整标识互不占用）
+	NextSeq     int64                   `json:"next_seq"`    // 已分配的最大操作序号（调整/撤销/收款共用）
 	path        string                  `json:"-"`
 }
 
@@ -106,9 +124,12 @@ func loadStore(dir string) (*state, error) {
 	if err := s.validate(); err != nil {
 		return nil, fmt.Errorf("数据文件已损坏: %w", err)
 	}
-	// 旧版本数据文件没有 adjustments/next_seq 字段：视为零调整。
+	// 旧版本数据文件没有 adjustments/payments/next_seq 字段：视为零调整、零实收。
 	if s.Adjustments == nil {
 		s.Adjustments = map[string]*adjustment{}
+	}
+	if s.Payments == nil {
+		s.Payments = map[string]*payment{}
 	}
 	s.path = p
 	return &s, nil
@@ -121,6 +142,7 @@ func newState(p string) *state {
 		Usage:       map[string]*usageRecord{},
 		Bills:       map[string]*bill{},
 		Adjustments: map[string]*adjustment{},
+		Payments:    map[string]*payment{},
 		path:        p,
 	}
 }
@@ -242,13 +264,16 @@ func (s *state) validate() error {
 		}
 	}
 
-	// 调整记录：标识、内容、引用与序号都必须自洽。
+	// 调整与收款记录：标识、内容、引用与序号都必须自洽。
+	// 调整与收款共用同一个全局操作序号池，标识命名空间也互不占用。
 	if s.NextSeq < 0 {
 		return fmt.Errorf("操作序号计数器为负: %d", s.NextSeq)
 	}
-	seenSeq := make(map[int64]string)
-	seenRevokeSeq := make(map[int64]string)
+	seenSeq := make(map[int64]string) // 全局操作序号（登记与撤销共用同一池）-> 来源描述
 	for id, a := range s.Adjustments {
+		if _, clash := s.Payments[id]; clash {
+			return fmt.Errorf("标识 %q 同时被调整与收款占用", id)
+		}
 		if a == nil {
 			return fmt.Errorf("调整 %q 的数据为空", id)
 		}
@@ -279,7 +304,7 @@ func (s *state) validate() error {
 		if prev, dup := seenSeq[a.Seq]; dup {
 			return fmt.Errorf("调整 %q 与 %q 的操作序号重复", id, prev)
 		}
-		seenSeq[a.Seq] = id
+		seenSeq[a.Seq] = "调整 " + id
 		if a.Revoked {
 			if strings.TrimSpace(a.RevokeReason) == "" {
 				return fmt.Errorf("调整 %q 已撤销但撤销原因为空", id)
@@ -287,19 +312,78 @@ func (s *state) validate() error {
 			if a.RevokeSeq <= a.Seq || a.RevokeSeq > s.NextSeq {
 				return fmt.Errorf("调整 %q 的撤销序号越界", id)
 			}
-			if prev, dup := seenRevokeSeq[a.RevokeSeq]; dup {
-				return fmt.Errorf("调整 %q 与 %q 的撤销序号重复", id, prev)
+			if prev, dup := seenSeq[a.RevokeSeq]; dup {
+				return fmt.Errorf("撤销调整 %q 与 %q 的操作序号重复", id, prev)
 			}
-			seenRevokeSeq[a.RevokeSeq] = id
+			seenSeq[a.RevokeSeq] = "撤销调整 " + id
 		} else if a.RevokeReason != "" || a.RevokeSeq != 0 {
 			return fmt.Errorf("调整 %q 未撤销但存在撤销信息", id)
 		}
 	}
-	// 每张账单的当前应付（原总金额 + 全部未撤销调整金额）必须介于
-	// 0 与有符号 64 位最大值之间；越界说明金额与记录不一致。
+	for id, p := range s.Payments {
+		if _, clash := s.Adjustments[id]; clash {
+			return fmt.Errorf("标识 %q 同时被收款与调整占用", id)
+		}
+		if p == nil {
+			return fmt.Errorf("收款 %q 的数据为空", id)
+		}
+		if p.ID != id {
+			return fmt.Errorf("收款标识不一致: 键 %q / 记录 %q", id, p.ID)
+		}
+		if p.ID == "" {
+			return errors.New("存在空的收款标识")
+		}
+		if p.Amount <= 0 {
+			return fmt.Errorf("收款 %q 的金额不是正整数", id)
+		}
+		if strings.TrimSpace(p.Note) == "" {
+			return fmt.Errorf("收款 %q 的备注为空", id)
+		}
+		if !validMonth(p.Month) {
+			return fmt.Errorf("收款 %q 的月份无效", id)
+		}
+		if _, ok := s.Customers[p.CustomerID]; !ok {
+			return fmt.Errorf("收款 %q 引用了不存在的客户 %q", id, p.CustomerID)
+		}
+		if _, ok := s.Bills[billKey(p.CustomerID, p.Month)]; !ok {
+			return fmt.Errorf("收款 %q 引用了不存在的账单（客户 %s 月份 %s）", id, p.CustomerID, p.Month)
+		}
+		if p.Seq < 1 || p.Seq > s.NextSeq {
+			return fmt.Errorf("收款 %q 的操作序号越界", id)
+		}
+		if prev, dup := seenSeq[p.Seq]; dup {
+			return fmt.Errorf("收款 %q 与 %q 的操作序号重复", id, prev)
+		}
+		seenSeq[p.Seq] = "收款 " + id
+		if p.Revoked {
+			if strings.TrimSpace(p.RevokeReason) == "" {
+				return fmt.Errorf("收款 %q 已撤销但撤销原因为空", id)
+			}
+			if p.RevokeSeq <= p.Seq || p.RevokeSeq > s.NextSeq {
+				return fmt.Errorf("收款 %q 的撤销序号越界", id)
+			}
+			if prev, dup := seenSeq[p.RevokeSeq]; dup {
+				return fmt.Errorf("撤销收款 %q 与 %q 的操作序号重复", id, prev)
+			}
+			seenSeq[p.RevokeSeq] = "撤销收款 " + id
+		} else if p.RevokeReason != "" || p.RevokeSeq != 0 {
+			return fmt.Errorf("收款 %q 未撤销但存在撤销信息", id)
+		}
+	}
+	// 每张账单：当前应付（原总金额 + 全部未撤销调整净额）必须介于
+	// 0 与有符号 64 位最大值之间；实收（全部未撤销收款之和）必须满足
+	// 0 ≤ 实收 ≤ 当前应付。越界说明金额与记录不一致。
 	for key, b := range s.Bills {
-		if _, _, err := billTotals(b, adjustmentsFor(s, b.CustomerID, b.Month)); err != nil {
+		_, payable, err := billTotals(b, adjustmentsFor(s, b.CustomerID, b.Month))
+		if err != nil {
 			return fmt.Errorf("账单 %q 的调整金额与记录不一致: %w", key, err)
+		}
+		received, err := paymentReceived(paymentsFor(s, b.CustomerID, b.Month))
+		if err != nil {
+			return fmt.Errorf("账单 %q 的收款金额与记录不一致: %w", key, err)
+		}
+		if received > payable {
+			return fmt.Errorf("账单 %q 的实收 %d 分超过当前应付 %d 分", key, received, payable)
 		}
 	}
 	return nil
@@ -367,6 +451,34 @@ func adjustmentsFor(s *state, customerID, month string) []*adjustment {
 	}
 	sort.Slice(list, func(i, j int) bool { return list[i].Seq < list[j].Seq })
 	return list
+}
+
+// paymentsFor 返回某客户某月账单的全部收款，按操作序号升序。
+func paymentsFor(s *state, customerID, month string) []*payment {
+	var list []*payment
+	for _, p := range s.Payments {
+		if p.CustomerID == customerID && p.Month == month {
+			list = append(list, p)
+		}
+	}
+	sort.Slice(list, func(i, j int) bool { return list[i].Seq < list[j].Seq })
+	return list
+}
+
+// paymentReceived 返回全部未撤销收款之和。各笔金额均为正整数，
+// 用非负 64 位加法累加，溢出时返回错误。
+func paymentReceived(pays []*payment) (int64, error) {
+	var received int64
+	for _, p := range pays {
+		if !p.Revoked {
+			var err error
+			received, err = add64(received, p.Amount)
+			if err != nil {
+				return 0, err
+			}
+		}
+	}
+	return received, nil
 }
 
 // errPayableOutOfRange 表示当前应付越出 [0, 有符号 64 位最大值]。

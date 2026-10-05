@@ -783,3 +783,378 @@ func TestCorruptAdjustmentDataRejected(t *testing.T) {
 		t.Fatal("损坏文件被改写")
 	}
 }
+
+// --- 收款登记与撤销 ---
+
+func TestPayHappyPathAndShow(t *testing.T) {
+	h := newHarness(t)
+	settleBill(h, "c1", "150", "6") // 总金额 900
+
+	out := h.mustRun("bill", "pay", "c1", "2026-09", "pay-1", "300", "银行转账")
+	if !strings.Contains(out, "已登记收款") ||
+		!strings.Contains(out, "实收 300 分") || !strings.Contains(out, "未收余额 600 分") {
+		t.Fatal(out)
+	}
+	out = h.mustRun("bill", "pay", "c1", "2026-09", "pay-2", "600", "现金尾款")
+	if !strings.Contains(out, "实收 900 分") || !strings.Contains(out, "未收余额 0 分") {
+		t.Fatal(out)
+	}
+
+	shown := h.mustRun("bill", "show", "c1", "2026-09")
+	for _, want := range []string{
+		"总金额：900 分", "当前应付：900 分", "实收：900 分", "未收余额：0 分",
+		"收款 pay-1：300 分", "银行转账", "收款 pay-2：600 分", "现金尾款",
+		"实收中",
+	} {
+		if !strings.Contains(shown, want) {
+			t.Fatalf("账单展示缺少 %q:\n%s", want, shown)
+		}
+	}
+	// 原账单字段保留。
+	if !strings.Contains(shown, "总数量：6") || !strings.Contains(shown, "单价：150 分") {
+		t.Fatal(shown)
+	}
+
+	// 重复结算不产生收款，返回含收款历史的原账单。
+	again := h.mustRun("bill", "settle", "c1", "2026-09")
+	if !strings.Contains(again, "幂等") || !strings.Contains(again, "实收：900 分") ||
+		!strings.Contains(again, "收款 pay-1") {
+		t.Fatal(again)
+	}
+}
+
+func TestPayValidation(t *testing.T) {
+	h := newHarness(t)
+	settleBill(h, "c1", "100", "1")
+
+	// 客户不存在 / 账单不存在 / 月份非法。
+	h.runExpectErr("bill", "pay", "ghost", "2026-09", "p1", "10", "备注")
+	h.runExpectErr("bill", "pay", "c1", "2026-10", "p1", "10", "备注")
+	h.runExpectErr("bill", "pay", "c1", "2026-9", "p1", "10", "备注")
+	// 收款标识为空、备注为空。
+	h.runExpectErr("bill", "pay", "c1", "2026-09", "", "10", "备注")
+	h.runExpectErr("bill", "pay", "c1", "2026-09", "p1", "10", "")
+	h.runExpectErr("bill", "pay", "c1", "2026-09", "p1", "10", "   ")
+	// 金额：零、负数、小数、非数字、超范围都必须拒绝。
+	h.runExpectErr("bill", "pay", "c1", "2026-09", "p1", "0", "备注")
+	h.runExpectErr("bill", "pay", "c1", "2026-09", "p1", "-1", "备注")
+	h.runExpectErr("bill", "pay", "c1", "2026-09", "p1", "1.5", "备注")
+	h.runExpectErr("bill", "pay", "c1", "2026-09", "p1", "abc", "备注")
+	h.runExpectErr("bill", "pay", "c1", "2026-09", "p1", "99999999999999999999999", "备注")
+
+	// 全部失败后 p1 未被占用：首次成功登记照常进行。
+	out := h.mustRun("bill", "pay", "c1", "2026-09", "p1", "100", "首次收款")
+	if !strings.Contains(out, "实收 100 分") {
+		t.Fatal(out)
+	}
+}
+
+func TestPayIdempotentAndConflict(t *testing.T) {
+	h := newHarness(t)
+	settleBill(h, "c1", "100", "10") // 总金额 1000
+	settleBill(h, "c2", "100", "10")
+
+	h.mustRun("bill", "pay", "c1", "2026-09", "pay-1", "500", "第一次备注")
+
+	// 内容完全相同的重放：返回原记录，不再次计入实收。
+	out := h.mustRun("bill", "pay", "c1", "2026-09", "pay-1", "500", "第一次备注")
+	if !strings.Contains(out, "不重复计入实收") || !strings.Contains(out, "实收合计：500 分") {
+		t.Fatal(out)
+	}
+
+	// 任一字段不同均拒绝：金额、备注、跨客户、跨月份。
+	h.runExpectErr("bill", "pay", "c1", "2026-09", "pay-1", "501", "第一次备注")
+	h.runExpectErr("bill", "pay", "c1", "2026-09", "pay-1", "500", "另一个备注")
+	h.runExpectErr("bill", "pay", "c2", "2026-09", "pay-1", "500", "第一次备注")
+	h.mustRun("usage", "import", h.writeFile("oct.csv", csvHeader+"u-oct,c1,2026-10-01T00:00:00Z,1\n"))
+	h.mustRun("bill", "settle", "c1", "2026-10")
+	h.runExpectErr("bill", "pay", "c1", "2026-10", "pay-1", "500", "第一次备注")
+
+	// 冲突拒绝后实收不变。
+	shown := h.mustRun("bill", "show", "c1", "2026-09")
+	if !strings.Contains(shown, "实收：500 分") {
+		t.Fatal(shown)
+	}
+
+	// 撤销后以相同内容重放：返回已撤销状态，不恢复实收。
+	h.mustRun("bill", "unpay", "pay-1", "录错了")
+	out = h.mustRun("bill", "pay", "c1", "2026-09", "pay-1", "500", "第一次备注")
+	if !strings.Contains(out, "已撤销") || !strings.Contains(out, "实收合计：0 分") {
+		t.Fatal(out)
+	}
+	// 撤销后换内容重放仍拒绝。
+	h.runExpectErr("bill", "pay", "c1", "2026-09", "pay-1", "501", "第一次备注")
+}
+
+func TestPaymentAndAdjustmentIDNamespaceExclusive(t *testing.T) {
+	h := newHarness(t)
+	settleBill(h, "c1", "100", "10") // 总金额 1000
+
+	// 同一标识不能先用于收款再用于调整，反之亦然。
+	h.mustRun("bill", "pay", "c1", "2026-09", "same-id", "100", "收款")
+	h.runExpectErr("bill", "adjust", "c1", "2026-09", "same-id", "10", "补收")
+	h.mustRun("bill", "adjust", "c1", "2026-09", "adj-x", "10", "补收")
+	h.runExpectErr("bill", "pay", "c1", "2026-09", "adj-x", "10", "备注")
+
+	// 撤销收款时若标识属于调整，明确报不存在收款目标。
+	h.runExpectErr("bill", "unpay", "adj-x", "原因")
+	// 撤销调整时若标识属于收款，按调整不存在处理，互不误操作。
+	h.runExpectErr("bill", "revoke", "same-id", "原因")
+}
+
+func TestPayExceedsOutstandingRejected(t *testing.T) {
+	h := newHarness(t)
+	settleBill(h, "c1", "100", "10") // 总金额 1000
+
+	h.mustRun("bill", "pay", "c1", "2026-09", "p1", "600", "第一笔")
+
+	// 超过未收余额 400：拒绝，且 p2 不被占用（改小后同标识可成功）。
+	msg := h.runExpectErr("bill", "pay", "c1", "2026-09", "p2", "401", "超额")
+	if !strings.Contains(msg, "超过未收余额") {
+		t.Fatal(msg)
+	}
+	h.mustRun("bill", "pay", "c1", "2026-09", "p2", "400", "补齐")
+
+	// 已收清后任何正额收款都拒绝。
+	h.runExpectErr("bill", "pay", "c1", "2026-09", "p3", "1", "多付")
+
+	// 撤销一笔后余额恢复，可用新标识补登。
+	h.mustRun("bill", "unpay", "p1", "撤销第一笔")
+	out := h.mustRun("bill", "pay", "c1", "2026-09", "p4", "600", "重新收款")
+	if !strings.Contains(out, "实收 1000 分") || !strings.Contains(out, "未收余额 0 分") {
+		t.Fatal(out)
+	}
+}
+
+func TestZeroPayableBillRejectsPositivePayment(t *testing.T) {
+	h := newHarness(t)
+	settleBill(h, "c1", "100", "1") // 总金额 100
+	h.mustRun("bill", "adjust", "c1", "2026-09", "full", "-100", "全额减免")
+
+	shown := h.mustRun("bill", "show", "c1", "2026-09")
+	if !strings.Contains(shown, "当前应付：0 分") {
+		t.Fatal(shown)
+	}
+	msg := h.runExpectErr("bill", "pay", "c1", "2026-09", "zp", "1", "想付款")
+	if !strings.Contains(msg, "当前应付为 0 分") {
+		t.Fatal(msg)
+	}
+
+	// 补收使应付恢复为正后可以登记。
+	out := h.mustRun("bill", "adjust", "c1", "2026-09", "back", "100", "重新补收")
+	if !strings.Contains(out, "当前应付 100 分") {
+		t.Fatal(out)
+	}
+	h.mustRun("bill", "pay", "c1", "2026-09", "zp", "100", "现在能付了")
+}
+
+func TestUnpayFlowAndHistoryOrder(t *testing.T) {
+	h := newHarness(t)
+	settleBill(h, "c1", "100", "10")                                   // 总金额 1000
+	h.mustRun("bill", "adjust", "c1", "2026-09", "adj-1", "200", "补收") // 应付 1200
+	h.mustRun("bill", "pay", "c1", "2026-09", "pay-1", "500", "首笔")
+	h.mustRun("bill", "pay", "c1", "2026-09", "pay-2", "300", "次笔")
+
+	out := h.mustRun("bill", "unpay", "pay-1", "账号录错")
+	if !strings.Contains(out, "已撤销收款") ||
+		!strings.Contains(out, "实收 300 分") || !strings.Contains(out, "未收余额 900 分") {
+		t.Fatal(out)
+	}
+
+	// 撤销不改变应付与其他收款。
+	shown := h.mustRun("bill", "show", "c1", "2026-09")
+	if !strings.Contains(shown, "当前应付：1200 分") ||
+		!strings.Contains(shown, "实收：300 分") || !strings.Contains(shown, "未收余额：900 分") {
+		t.Fatal(shown)
+	}
+
+	// 相同原因重复撤销幂等成功，不新增历史；不同原因拒绝。
+	out = h.mustRun("bill", "unpay", "pay-1", "账号录错")
+	if !strings.Contains(out, "幂等") {
+		t.Fatal(out)
+	}
+	h.runExpectErr("bill", "unpay", "pay-1", "另一个原因")
+	// 目标不存在、原因为空。
+	h.runExpectErr("bill", "unpay", "ghost", "原因")
+	h.runExpectErr("bill", "unpay", "pay-2", "")
+
+	// 收款历史按成功操作顺序：登记 pay-1、登记 pay-2、撤销 pay-1。
+	i1 := strings.Index(shown, "收款 pay-1：")
+	i2 := strings.Index(shown, "收款 pay-2：")
+	i3 := strings.Index(shown, "撤销收款 pay-1：")
+	if i1 < 0 || i2 < 0 || i3 < 0 || !(i1 < i2 && i2 < i3) {
+		t.Fatalf("收款历史顺序错误:\n%s", shown)
+	}
+	if !strings.Contains(shown, "当前状态：已撤销") ||
+		!strings.Contains(shown, "撤销收款 pay-1：原因：账号录错") ||
+		!strings.Contains(shown, "关联收款 pay-1 的 500 分") {
+		t.Fatal(shown)
+	}
+}
+
+func TestAdjustmentRejectedWhenPayableWouldBeBelowReceived(t *testing.T) {
+	h := newHarness(t)
+	settleBill(h, "c1", "100", "10")                                // 总金额 1000
+	h.mustRun("bill", "adjust", "c1", "2026-09", "up", "200", "补收") // 应付 1200
+	h.mustRun("bill", "pay", "c1", "2026-09", "p1", "1200", "收清")
+
+	// 减免 10 会使应付 1190 < 实收 1200：拒绝且状态不变，up2 不被占用。
+	msg := h.runExpectErr("bill", "adjust", "c1", "2026-09", "up2", "-10", "减免")
+	if !strings.Contains(msg, "低于实收") {
+		t.Fatal(msg)
+	}
+	shown := h.mustRun("bill", "show", "c1", "2026-09")
+	if !strings.Contains(shown, "当前应付：1200 分") || !strings.Contains(shown, "实收：1200 分") {
+		t.Fatal(shown)
+	}
+
+	// 先撤销误登记的部分收款，再重试调整成功。
+	h.mustRun("bill", "unpay", "p1", "录多了")
+	out := h.mustRun("bill", "adjust", "c1", "2026-09", "up2", "-10", "减免")
+	if !strings.Contains(out, "当前应付 1190 分") {
+		t.Fatal(out)
+	}
+
+	// 撤销补收调整同样受实收约束：先恢复一笔收款使撤销不成立，再验证拒绝。
+	h.mustRun("bill", "pay", "c1", "2026-09", "p2", "1190", "再次收清")
+	msg = h.runExpectErr("bill", "revoke", "up", "想撤销补收")
+	if !strings.Contains(msg, "低于实收") {
+		t.Fatal(msg)
+	}
+	// 撤销后应付 990 < 实收 1190：先撤销收款再重试成功。
+	h.mustRun("bill", "unpay", "p2", "先腾退")
+	out = h.mustRun("bill", "revoke", "up", "想撤销补收")
+	if !strings.Contains(out, "当前应付 990 分") {
+		t.Fatal(out)
+	}
+}
+
+func TestPaymentPersistsAcrossInvocations(t *testing.T) {
+	h := newHarness(t)
+	settleBill(h, "c1", "100", "10") // 总金额 1000
+	h.mustRun("bill", "pay", "c1", "2026-09", "pay-1", "300", "首笔")
+	h.mustRun("bill", "pay", "c1", "2026-09", "pay-2", "200", "次笔")
+	h.mustRun("bill", "unpay", "pay-1", "录错")
+
+	// 全新 harness 指向同一目录：余额、顺序、幂等与撤销约束保持。
+	h2 := &harness{t: t, dir: h.dir}
+	prev := stdout
+	stdout = &h2.buf
+	defer func() { stdout = prev }()
+
+	out, err := h2.run("bill", "show", "c1", "2026-09")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "当前应付：1000 分") ||
+		!strings.Contains(out, "实收：200 分") || !strings.Contains(out, "未收余额：800 分") {
+		t.Fatal(out)
+	}
+	// 已撤销收款重放仍返回已撤销状态，不恢复实收。
+	out, err = h2.run("bill", "pay", "c1", "2026-09", "pay-1", "300", "首笔")
+	if err != nil || !strings.Contains(out, "已撤销") || !strings.Contains(out, "实收合计：200 分") {
+		t.Fatalf("out=%s err=%v", out, err)
+	}
+	// 相同原因重复撤销幂等，不同原因拒绝。
+	if _, err = h2.run("bill", "unpay", "pay-1", "录错"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = h2.run("bill", "unpay", "pay-1", "别的原因"); err == nil {
+		t.Fatal("应拒绝不同原因的重复撤销")
+	}
+	// 超额收款在重启后仍被拒绝。
+	if _, err = h2.run("bill", "pay", "c1", "2026-09", "pay-3", "801", "超额"); err == nil {
+		t.Fatal("应拒绝超过未收余额的收款")
+	}
+	// 历史顺序保持：pay-1、pay-2、撤销 pay-1。
+	shown, err := h2.run("bill", "show", "c1", "2026-09")
+	if err != nil {
+		t.Fatal(err)
+	}
+	j1 := strings.Index(shown, "收款 pay-1：")
+	j2 := strings.Index(shown, "收款 pay-2：")
+	j3 := strings.Index(shown, "撤销收款 pay-1：")
+	if j1 < 0 || j2 < 0 || j3 < 0 || !(j1 < j2 && j2 < j3) {
+		t.Fatalf("重启后历史顺序错误:\n%s", shown)
+	}
+}
+
+func TestOldStateFileWithoutPayments(t *testing.T) {
+	h := newHarness(t)
+	// 手工构造无 adjustments/payments/next_seq 字段的旧版数据文件。
+	legacy := `{
+  "version": 1,
+  "customers": {"c1": {"id": "c1", "name": "甲方", "price_fen": 100}},
+  "usage": {"u1": {"id": "u1", "customer_id": "c1", "time": "2026-09-15T10:00:00Z", "quantity": 2}},
+  "bills": {"c1|2026-09": {
+    "id": "BILL-legacy", "customer_id": "c1", "month": "2026-09",
+    "total_quantity": 2, "unit_price_fen": 100, "total_fee_fen": 200,
+    "lines": [{"usage_id": "u1", "time": "2026-09-15T10:00:00Z", "quantity": 2, "line_fee_fen": 200}],
+    "created_at": "2026-10-01T00:00:00Z"
+  }}
+}`
+	if err := os.WriteFile(h.statePath(), []byte(legacy), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// 旧账单缺少收款记录：视为零实收。
+	out := h.mustRun("bill", "show", "c1", "2026-09")
+	if !strings.Contains(out, "实收：0 分") || !strings.Contains(out, "未收余额：200 分") ||
+		!strings.Contains(out, "收款与撤销历史：无") {
+		t.Fatal(out)
+	}
+	// 旧数据上可直接登记收款。
+	out = h.mustRun("bill", "pay", "c1", "2026-09", "pay-1", "150", "补登")
+	if !strings.Contains(out, "实收 150 分") || !strings.Contains(out, "未收余额 50 分") {
+		t.Fatal(out)
+	}
+}
+
+func TestCorruptPaymentDataRejected(t *testing.T) {
+	h := newHarness(t)
+	settleBill(h, "c1", "100", "1") // 总金额 100
+	h.mustRun("bill", "pay", "c1", "2026-09", "pay-1", "50", "备注")
+
+	good, err := os.ReadFile(h.statePath())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 把收款金额改到超过当前应付：实收 > 应付，按损坏处理，原文件不改写。
+	broken := strings.Replace(string(good), `"amount_fen": 50,`, `"amount_fen": 500,`, 1)
+	if broken == string(good) {
+		t.Fatal("替换未生效")
+	}
+	if err := os.WriteFile(h.statePath(), []byte(broken), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	for _, args := range [][]string{
+		{"bill", "show", "c1", "2026-09"},
+		{"bill", "pay", "c1", "2026-09", "p2", "1", "备注"},
+		{"bill", "unpay", "pay-1", "原因"},
+	} {
+		msg := h.runExpectErr(args...)
+		if !strings.Contains(msg, "损坏") {
+			t.Fatalf("args=%v 未报损坏: %s", args, msg)
+		}
+	}
+	got, _ := os.ReadFile(h.statePath())
+	if string(got) != broken {
+		t.Fatal("损坏文件被改写")
+	}
+
+	// 收款引用不存在的账单同样按损坏处理（收款月份在文件中最后出现）。
+	idx := strings.LastIndex(string(good), `"month": "2026-09"`)
+	dangling := string(good)[:idx] + `"month": "2026-11"` + string(good)[idx+len(`"month": "2026-09"`):]
+	if err := os.WriteFile(h.statePath(), []byte(dangling), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	msg := h.runExpectErr("bill", "show", "c1", "2026-09")
+	if !strings.Contains(msg, "损坏") {
+		t.Fatal(msg)
+	}
+	got, _ = os.ReadFile(h.statePath())
+	if string(got) != dangling {
+		t.Fatal("损坏文件被改写")
+	}
+}
