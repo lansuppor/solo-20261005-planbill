@@ -69,21 +69,58 @@ type adjustment struct {
 	RevokedAt    string `json:"revoked_at,omitempty"`
 }
 
-// payment 是对已结算账单的一笔实收登记（正整数分）。
-// 记录一旦写入永不删除；撤销只是追加撤销信息，保留原记录，
-// 撤销后该笔不再计入实收，也不会因重放而恢复。
+// paymentAllocation 是一笔收款在某个已结算月份上的分配（正整数分）。
+type paymentAllocation struct {
+	Month  string `json:"month"`      // YYYY-MM（UTC），须已有账单
+	Amount int64  `json:"amount_fen"` // 正整数分
+}
+
+// payment 是一笔实收登记：同一客户的一笔汇款（总额 Total 分）按分配列表
+// 计入一个或多个已结算月份；单账单收款视为只有一项分配的汇款。
+// 记录一旦写入永不删除；撤销只是追加撤销信息，整笔撤销全部分配并保留
+// 原记录，撤销后该笔不再计入实收，也不会因重放而恢复。
 type payment struct {
-	ID           string `json:"id"`
-	CustomerID   string `json:"customer_id"`
-	Month        string `json:"month"` // YYYY-MM（UTC），与所属账单一致
-	Amount       int64  `json:"amount_fen"`
-	Note         string `json:"note"`
-	Seq          int64  `json:"seq"` // 全局递增操作序号，决定历史展示顺序
-	CreatedAt    string `json:"created_at"`
-	Revoked      bool   `json:"revoked"`
-	RevokeReason string `json:"revoke_reason,omitempty"`
-	RevokeSeq    int64  `json:"revoke_seq,omitempty"`
-	RevokedAt    string `json:"revoked_at,omitempty"`
+	ID           string              `json:"id"`
+	CustomerID   string              `json:"customer_id"`
+	Total        int64               `json:"total_fen"` // 收款总额，正整数分，等于分配合计
+	Note         string              `json:"note"`
+	Allocations  []paymentAllocation `json:"allocations"` // 至少一项，月份不重复，按月份升序保存
+	Seq          int64               `json:"seq"`         // 全局递增操作序号，决定历史展示顺序
+	CreatedAt    string              `json:"created_at"`
+	Revoked      bool                `json:"revoked"`
+	RevokeReason string              `json:"revoke_reason,omitempty"`
+	RevokeSeq    int64               `json:"revoke_seq,omitempty"`
+	RevokedAt    string              `json:"revoked_at,omitempty"`
+}
+
+// UnmarshalJSON 兼容旧版单账单收款格式（month + amount_fen，无 allocations）：
+// 读入时归一化为一项分配，之后一律按新格式写回。
+func (p *payment) UnmarshalJSON(data []byte) error {
+	type plain payment // 去掉方法，避免递归
+	var raw struct {
+		plain
+		Month  string `json:"month"`      // 旧格式：所属账单月份
+		Amount int64  `json:"amount_fen"` // 旧格式：收款金额
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	*p = payment(raw.plain)
+	if len(p.Allocations) == 0 && raw.Month != "" {
+		p.Allocations = []paymentAllocation{{Month: raw.Month, Amount: raw.Amount}}
+		p.Total = raw.Amount
+	}
+	return nil
+}
+
+// amountFor 返回该收款在指定月份的分配金额；无分配时为 0。
+func (p *payment) amountFor(month string) int64 {
+	for _, al := range p.Allocations {
+		if al.Month == month {
+			return al.Amount
+		}
+	}
+	return 0
 }
 
 type state struct {
@@ -92,7 +129,7 @@ type state struct {
 	Usage       map[string]*usageRecord `json:"usage"`       // 全局唯一用量标识 -> 记录
 	Bills       map[string]*bill        `json:"bills"`       // 客户 + "|" + 月份 -> 账单
 	Adjustments map[string]*adjustment  `json:"adjustments"` // 全局唯一调整标识 -> 记录
-	Payments    map[string]*payment     `json:"payments"`    // 全局唯一收款标识 -> 记录（与调整标识互不占用）
+	Payments    map[string]*payment     `json:"payments"`    // 全局唯一收款标识 -> 记录（与调整标识相互独立，可同名）
 	NextSeq     int64                   `json:"next_seq"`    // 已分配的最大操作序号（调整/撤销/收款共用）
 	path        string                  `json:"-"`
 }
@@ -265,15 +302,13 @@ func (s *state) validate() error {
 	}
 
 	// 调整与收款记录：标识、内容、引用与序号都必须自洽。
-	// 调整与收款共用同一个全局操作序号池，标识命名空间也互不占用。
+	// 调整与收款共用同一个全局操作序号池；两者标识命名空间相互独立，
+	// 允许同名，各自判重与撤销。
 	if s.NextSeq < 0 {
 		return fmt.Errorf("操作序号计数器为负: %d", s.NextSeq)
 	}
 	seenSeq := make(map[int64]string) // 全局操作序号（登记与撤销共用同一池）-> 来源描述
 	for id, a := range s.Adjustments {
-		if _, clash := s.Payments[id]; clash {
-			return fmt.Errorf("标识 %q 同时被调整与收款占用", id)
-		}
 		if a == nil {
 			return fmt.Errorf("调整 %q 的数据为空", id)
 		}
@@ -321,9 +356,6 @@ func (s *state) validate() error {
 		}
 	}
 	for id, p := range s.Payments {
-		if _, clash := s.Adjustments[id]; clash {
-			return fmt.Errorf("标识 %q 同时被收款与调整占用", id)
-		}
 		if p == nil {
 			return fmt.Errorf("收款 %q 的数据为空", id)
 		}
@@ -333,20 +365,42 @@ func (s *state) validate() error {
 		if p.ID == "" {
 			return errors.New("存在空的收款标识")
 		}
-		if p.Amount <= 0 {
-			return fmt.Errorf("收款 %q 的金额不是正整数", id)
+		if p.Total <= 0 {
+			return fmt.Errorf("收款 %q 的总额不是正整数", id)
 		}
 		if strings.TrimSpace(p.Note) == "" {
 			return fmt.Errorf("收款 %q 的备注为空", id)
 		}
-		if !validMonth(p.Month) {
-			return fmt.Errorf("收款 %q 的月份无效", id)
-		}
 		if _, ok := s.Customers[p.CustomerID]; !ok {
 			return fmt.Errorf("收款 %q 引用了不存在的客户 %q", id, p.CustomerID)
 		}
-		if _, ok := s.Bills[billKey(p.CustomerID, p.Month)]; !ok {
-			return fmt.Errorf("收款 %q 引用了不存在的账单（客户 %s 月份 %s）", id, p.CustomerID, p.Month)
+		if len(p.Allocations) == 0 {
+			return fmt.Errorf("收款 %q 没有分配", id)
+		}
+		seenMonths := make(map[string]bool)
+		var sum int64
+		for _, al := range p.Allocations {
+			if !validMonth(al.Month) {
+				return fmt.Errorf("收款 %q 的分配月份 %q 无效", id, al.Month)
+			}
+			if seenMonths[al.Month] {
+				return fmt.Errorf("收款 %q 的分配月份 %s 重复", id, al.Month)
+			}
+			seenMonths[al.Month] = true
+			if al.Amount <= 0 {
+				return fmt.Errorf("收款 %q 在 %s 的分配金额不是正整数", id, al.Month)
+			}
+			if _, ok := s.Bills[billKey(p.CustomerID, al.Month)]; !ok {
+				return fmt.Errorf("收款 %q 的分配引用了不存在的账单（客户 %s 月份 %s）", id, p.CustomerID, al.Month)
+			}
+			var err error
+			sum, err = add64(sum, al.Amount)
+			if err != nil {
+				return fmt.Errorf("收款 %q 的分配金额汇总溢出: %w", id, err)
+			}
+		}
+		if sum != p.Total {
+			return fmt.Errorf("收款 %q 的分配合计 %d 分与总额 %d 分不一致", id, sum, p.Total)
 		}
 		if p.Seq < 1 || p.Seq > s.NextSeq {
 			return fmt.Errorf("收款 %q 的操作序号越界", id)
@@ -371,14 +425,14 @@ func (s *state) validate() error {
 		}
 	}
 	// 每张账单：当前应付（原总金额 + 全部未撤销调整净额）必须介于
-	// 0 与有符号 64 位最大值之间；实收（全部未撤销收款之和）必须满足
-	// 0 ≤ 实收 ≤ 当前应付。越界说明金额与记录不一致。
+	// 0 与有符号 64 位最大值之间；实收（全部未撤销收款在该月的分配之和）
+	// 必须满足 0 ≤ 实收 ≤ 当前应付。越界说明金额与记录不一致。
 	for key, b := range s.Bills {
 		_, payable, err := billTotals(b, adjustmentsFor(s, b.CustomerID, b.Month))
 		if err != nil {
 			return fmt.Errorf("账单 %q 的调整金额与记录不一致: %w", key, err)
 		}
-		received, err := paymentReceived(paymentsFor(s, b.CustomerID, b.Month))
+		received, err := paymentReceived(paymentsFor(s, b.CustomerID, b.Month), b.Month)
 		if err != nil {
 			return fmt.Errorf("账单 %q 的收款金额与记录不一致: %w", key, err)
 		}
@@ -453,11 +507,11 @@ func adjustmentsFor(s *state, customerID, month string) []*adjustment {
 	return list
 }
 
-// paymentsFor 返回某客户某月账单的全部收款，按操作序号升序。
+// paymentsFor 返回分配到某客户某月账单的全部收款，按操作序号升序。
 func paymentsFor(s *state, customerID, month string) []*payment {
 	var list []*payment
 	for _, p := range s.Payments {
-		if p.CustomerID == customerID && p.Month == month {
+		if p.CustomerID == customerID && p.amountFor(month) > 0 {
 			list = append(list, p)
 		}
 	}
@@ -465,14 +519,14 @@ func paymentsFor(s *state, customerID, month string) []*payment {
 	return list
 }
 
-// paymentReceived 返回全部未撤销收款之和。各笔金额均为正整数，
-// 用非负 64 位加法累加，溢出时返回错误。
-func paymentReceived(pays []*payment) (int64, error) {
+// paymentReceived 返回全部未撤销收款在指定月份的分配之和。各笔分配均为
+// 正整数，用非负 64 位加法累加，溢出时返回错误。
+func paymentReceived(pays []*payment, month string) (int64, error) {
 	var received int64
 	for _, p := range pays {
 		if !p.Revoked {
 			var err error
-			received, err = add64(received, p.Amount)
+			received, err = add64(received, p.amountFor(month))
 			if err != nil {
 				return 0, err
 			}
