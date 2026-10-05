@@ -58,7 +58,7 @@ func runCmd(args []string, dataDir string) error {
 
 	case "bill":
 		if len(args) < 2 {
-			return usageError("缺少子命令，应为：bill settle|show|adjust|revoke|pay|remit|unpay ...")
+			return usageError("缺少子命令，应为：bill settle|show|ledger|adjust|revoke|pay|remit|unpay ...")
 		}
 		switch args[1] {
 		case "settle":
@@ -71,6 +71,15 @@ func runCmd(args []string, dataDir string) error {
 				return usageError("用法：bill show <客户标识> <YYYY-MM>")
 			}
 			return cmdBillShow(dataDir, args[2], args[3])
+		case "ledger":
+			if len(args) != 4 && len(args) != 5 {
+				return usageError("用法：bill ledger <客户标识> <YYYY-MM> [截止操作序号]")
+			}
+			cutoff := ""
+			if len(args) == 5 {
+				cutoff = args[4]
+			}
+			return cmdBillLedger(dataDir, args[2], args[3], cutoff)
 		case "adjust":
 			if len(args) != 7 {
 				return usageError("用法：bill adjust <客户标识> <YYYY-MM> <调整标识> <金额分> <原因>")
@@ -97,7 +106,7 @@ func runCmd(args []string, dataDir string) error {
 			}
 			return cmdBillUnpay(dataDir, args[2], args[3])
 		default:
-			return usageError("未知 bill 子命令 %q；可用：settle、show、adjust、revoke、pay、remit、unpay", args[1])
+			return usageError("未知 bill 子命令 %q；可用：settle、show、ledger、adjust、revoke、pay、remit、unpay", args[1])
 		}
 
 	default:
