@@ -58,7 +58,7 @@ func runCmd(args []string, dataDir string) error {
 
 	case "bill":
 		if len(args) < 2 {
-			return usageError("缺少子命令，应为：bill settle|show|adjust|revoke|pay|remit|unpay|ledger ...")
+			return usageError("缺少子命令，应为：bill settle|show|adjust|revoke|pay|remit|unpay|correct|ledger ...")
 		}
 		switch args[1] {
 		case "settle":
@@ -96,6 +96,11 @@ func runCmd(args []string, dataDir string) error {
 				return usageError("用法：bill unpay <收款标识> <原因>")
 			}
 			return cmdBillUnpay(dataDir, args[2], args[3])
+		case "correct":
+			if len(args) < 5 {
+				return usageError("用法：bill correct <收款标识> <更正标识> <原因> <YYYY-MM:金额分> [更多 月份:金额 ...]")
+			}
+			return cmdBillCorrect(dataDir, args[2], args[3], args[4], args[5:])
 		case "ledger":
 			if len(args) != 4 && len(args) != 5 {
 				return usageError("用法：bill ledger <客户标识> <YYYY-MM> [截止操作序号]")
@@ -106,7 +111,7 @@ func runCmd(args []string, dataDir string) error {
 			}
 			return cmdBillLedger(dataDir, args[2], args[3], cutoff, hasCutoff)
 		default:
-			return usageError("未知 bill 子命令 %q；可用：settle、show、adjust、revoke、pay、remit、unpay、ledger", args[1])
+			return usageError("未知 bill 子命令 %q；可用：settle、show、adjust、revoke、pay、remit、unpay、correct、ledger", args[1])
 		}
 
 	default:
@@ -383,7 +388,7 @@ func cmdBillSettle(dir, customerID, month string) error {
 		// 幂等：同一客户同一月份重复结算，直接返回原账单，
 		// 不重新计费、不产生新账单或调整、不落盘。
 		fmt.Fprintf(stdout, "客户 %s 的 %s 已结算，返回原账单（幂等，不重新计费）：\n\n", customerID, month)
-		printBill(existing, cust, adjustmentsFor(s, customerID, month), paymentsFor(s, customerID, month))
+		printBill(s, existing, cust)
 		return nil
 	}
 
@@ -440,7 +445,7 @@ func cmdBillSettle(dir, customerID, month string) error {
 		return err
 	}
 	fmt.Fprintf(stdout, "结算完成，客户 %s 的 %s 已封账：\n\n", customerID, month)
-	printBill(b, cust, nil, nil)
+	printBill(s, b, cust)
 	return nil
 }
 
@@ -460,7 +465,7 @@ func cmdBillShow(dir, customerID, month string) error {
 	if !ok {
 		return fmt.Errorf("客户 %s 的 %s 尚无账单（未结算）", customerID, month)
 	}
-	printBill(b, cust, adjustmentsFor(s, customerID, month), paymentsFor(s, customerID, month))
+	printBill(s, b, cust)
 	return nil
 }
 
@@ -483,7 +488,9 @@ func stableBillID(customerID, month string) string {
 	return "BILL-" + hex.EncodeToString(sum[:])[:16]
 }
 
-func printBill(b *bill, cust *customer, adjs []*adjustment, pays []*payment) {
+func printBill(s *state, b *bill, cust *customer) {
+	adjs := adjustmentsFor(s, b.CustomerID, b.Month)
+	pays := paymentsFor(s, b.CustomerID, b.Month)
 	fmt.Fprintf(stdout, "账单标识：%s\n", b.ID)
 	fmt.Fprintf(stdout, "客户：%s（%s）\n", cust.ID, cust.Name)
 	fmt.Fprintf(stdout, "月份：%s（UTC 自然月，左闭右开）\n", b.Month)
@@ -492,7 +499,7 @@ func printBill(b *bill, cust *customer, adjs []*adjustment, pays []*payment) {
 	fmt.Fprintf(stdout, "总金额：%d 分（%s）\n", b.TotalFee, moneyFen(b.TotalFee))
 	// 数据在载入时已校验一致，此处计算不会出错。
 	net, payable, _ := billTotals(b, adjs)
-	received, _ := paymentReceived(pays, b.Month)
+	received, _ := paymentReceived(s, b.CustomerID, b.Month)
 	outstanding := payable - received // 不变量保证 0 ≤ 实收 ≤ 当前应付
 	fmt.Fprintf(stdout, "调整净额：%+d 分（%s）\n", net, moneyFen(net))
 	fmt.Fprintf(stdout, "当前应付：%d 分（%s）\n", payable, moneyFen(payable))
@@ -515,7 +522,7 @@ func printBill(b *bill, cust *customer, adjs []*adjustment, pays []*payment) {
 		fmt.Fprintln(stdout, "收款与撤销历史：无")
 	} else {
 		fmt.Fprintln(stdout, "收款与撤销历史（按成功操作顺序）：")
-		for i, ev := range paymentHistoryEvents(pays, b.Month) {
+		for i, ev := range paymentHistoryEvents(s, pays, b.Month) {
 			fmt.Fprintf(stdout, "  %d. %s\n", i+1, ev)
 		}
 	}
@@ -558,9 +565,10 @@ func adjustStatus(a *adjustment) string {
 	return "生效中"
 }
 
-// paymentHistoryEvents 把收款登记与撤销展开为按操作序号排序的可读历史条目；
-// month 为当前展示账单所在月份，用于给出该收款在本账单的分配。
-func paymentHistoryEvents(pays []*payment, month string) []string {
+// paymentHistoryEvents 把收款登记、更正与撤销展开为按操作序号排序的可读历史
+// 条目；month 为当前展示账单所在月份。收款事件给出登记时（首次）分配，更正
+// 事件给出本账单前后分配，撤销事件给出取消的最新分配。
+func paymentHistoryEvents(s *state, pays []*payment, month string) []string {
 	type event struct {
 		seq  int64
 		text string
@@ -570,9 +578,18 @@ func paymentHistoryEvents(pays []*payment, month string) []string {
 		alloc := p.amountFor(month)
 		events = append(events, event{p.Seq, fmt.Sprintf("收款 %s：总额 %d 分（%s），本账单分配 %d 分（%s），备注：%s，当前状态：%s（客户 %s）",
 			p.ID, p.Total, moneyFen(p.Total), alloc, moneyFen(alloc), p.Note, paymentStatus(p), p.CustomerID)})
+		for _, c := range correctionsForPayment(s, p.ID) {
+			from, to := amountIn(c.From, month), amountIn(c.To, month)
+			if from == 0 && to == 0 {
+				continue // 更正不涉及本账单
+			}
+			events = append(events, event{c.Seq, fmt.Sprintf("更正 %s：原因：%s（关联收款 %s，本账单分配 %d → %d 分）",
+				c.ID, c.Reason, p.ID, from, to)})
+		}
 		if p.Revoked {
+			// 整笔撤销取消的是撤销时最新生效的分配（含全部更正的影响）。
 			events = append(events, event{p.RevokeSeq, fmt.Sprintf("撤销收款 %s：原因：%s（关联收款 %s，总额 %d 分，本账单分配 %d 分）",
-				p.ID, p.RevokeReason, p.ID, p.Total, alloc)})
+				p.ID, p.RevokeReason, p.ID, p.Total, currentAmountFor(s, p, month))})
 		}
 	}
 	sort.Slice(events, func(i, j int) bool { return events[i].seq < events[j].seq })
@@ -650,7 +667,7 @@ func cmdBillAdjust(dir, customerID, month, adjID, amountText, reason string) err
 	if err != nil {
 		return fmt.Errorf("账单当前应付异常，拒绝调整: %w", err)
 	}
-	received, err := paymentReceived(paymentsFor(s, customerID, month), month)
+	received, err := paymentReceived(s, customerID, month)
 	if err != nil {
 		return fmt.Errorf("实收累计异常，拒绝调整: %w", err)
 	}
@@ -727,7 +744,7 @@ func cmdBillRevoke(dir, adjID, reason string) error {
 	if err != nil {
 		return fmt.Errorf("账单当前应付异常，拒绝撤销: %w", err)
 	}
-	received, err := paymentReceived(paymentsFor(s, a.CustomerID, a.Month), a.Month)
+	received, err := paymentReceived(s, a.CustomerID, a.Month)
 	if err != nil {
 		return fmt.Errorf("实收累计异常，拒绝撤销: %w", err)
 	}
@@ -911,7 +928,7 @@ func registerPayment(dir, customerID, payID string, total int64, note string, al
 		if err != nil {
 			return fmt.Errorf("客户 %s 的 %s 当前应付异常，拒绝登记收款: %w", customerID, al.Month, err)
 		}
-		received, err := paymentReceived(paymentsFor(s, customerID, al.Month), al.Month)
+		received, err := paymentReceived(s, customerID, al.Month)
 		if err != nil {
 			return fmt.Errorf("客户 %s 的 %s 实收累计溢出有符号 64 位整数范围，拒绝登记收款: %w", customerID, al.Month, err)
 		}
@@ -976,12 +993,12 @@ func formatAllocations(allocs []paymentAllocation) string {
 	return strings.Join(parts, ",")
 }
 
-// printAllocationBalances 输出该收款每个分配月份当前的实收与未收余额。
+// printAllocationBalances 输出该收款当前生效分配中每个分配月份的实收与未收余额。
 func printAllocationBalances(s *state, p *payment) {
-	for _, al := range p.Allocations {
+	for _, al := range currentAllocations(s, p) {
 		b := s.Bills[billKey(p.CustomerID, al.Month)] // 载入时已校验存在
 		_, payable, _ := billTotals(b, adjustmentsFor(s, p.CustomerID, al.Month))
-		received, _ := paymentReceived(paymentsFor(s, p.CustomerID, al.Month), al.Month)
+		received, _ := paymentReceived(s, p.CustomerID, al.Month)
 		fmt.Fprintf(stdout, "  月份 %s：分配 %d 分，实收 %d 分（%s），未收余额 %d 分（%s）\n",
 			al.Month, al.Amount, received, moneyFen(received), payable-received, moneyFen(payable-received))
 	}
@@ -1039,8 +1056,159 @@ func cmdBillUnpay(dir, payID, reason string) error {
 	return nil
 }
 
-// printPayment 输出单笔收款记录：总额、全部分配与当前状态；
-// 各月应付/实收取自当前库状态。
+// cmdBillCorrect 更正一笔未撤销收款的分配：以当前生效分配为起点，整笔替换为
+// 完整新分配。收款的客户、总额、备注、首次登记分配与应付均不变；全部涉及
+// 月份合法才整笔生效，任何一项不合法都不落盘、不占用更正标识与序号。
+func cmdBillCorrect(dir, payID, corrID, reason string, allocArgs []string) error {
+	if strings.TrimSpace(payID) == "" {
+		return fmt.Errorf("收款标识不能为空")
+	}
+	if strings.TrimSpace(corrID) == "" {
+		return fmt.Errorf("更正标识不能为空")
+	}
+	if strings.TrimSpace(reason) == "" {
+		return fmt.Errorf("更正原因不能为空")
+	}
+	// 新分配：非空、月份合法不重复、各项为正整数分；顺序不影响身份。
+	allocs, err := parseAllocations(allocArgs)
+	if err != nil {
+		return err
+	}
+	sort.Slice(allocs, func(i, j int) bool { return allocs[i].Month < allocs[j].Month })
+	var sum int64
+	for _, al := range allocs {
+		sum, err = add64(sum, al.Amount)
+		if err != nil {
+			return fmt.Errorf("新分配金额合计溢出有符号 64 位整数范围，拒绝更正")
+		}
+	}
+
+	s, err := loadStore(dir)
+	if err != nil {
+		return err
+	}
+	p, ok := s.Payments[payID]
+	if !ok {
+		return fmt.Errorf("收款标识 %q 不存在，无法更正", payID)
+	}
+
+	if existing, ok := s.Corrections[corrID]; ok {
+		// 相同标识按目标收款、原因与新月份-金额对应关系判重（顺序无关）：
+		// 内容相同返回原更正记录，不改变分配、不新增历史；其后的更正或
+		// 收款撤销不影响此规则。内容不同拒绝复用。
+		if existing.PaymentID == payID && existing.Reason == reason && allocationsEqual(existing.To, allocs) {
+			fmt.Fprintf(stdout, "更正 %q 已存在且内容相同，返回原更正记录（不改变分配、不新增历史）：\n\n", corrID)
+			printCorrection(existing, s)
+			return nil
+		}
+		return fmt.Errorf("更正标识 %q 已存在但内容不同（已有：收款=%s 原因=%q 新分配=%s），拒绝复用",
+			corrID, existing.PaymentID, existing.Reason, formatAllocations(existing.To))
+	}
+
+	// 新增更正只允许未撤销收款。
+	if p.Revoked {
+		return fmt.Errorf("收款 %q 已撤销（撤销原因 %q），不能新增更正", payID, p.RevokeReason)
+	}
+	if sum != p.Total {
+		return fmt.Errorf("新分配合计 %d 分与收款 %q 的总额 %d 分不一致，拒绝更正", sum, payID, p.Total)
+	}
+	for _, al := range allocs {
+		if _, ok := s.Bills[billKey(p.CustomerID, al.Month)]; !ok {
+			return fmt.Errorf("客户 %s 的 %s 尚无账单（未结算），更正只能分配到原客户已结算账单", p.CustomerID, al.Month)
+		}
+	}
+
+	// 以当前生效分配为起点，撤去旧分配再计入新分配；前后分配涉及的每个
+	// 月份都须满足 0 ≤ 实收 ≤ 当前应付，其他收款不变，全部合法才整笔生效。
+	from := currentAllocations(s, p)
+	for _, m := range unionMonths(from, allocs) {
+		b := s.Bills[billKey(p.CustomerID, m)] // 前后月份均已确认有账单
+		_, payable, err := billTotals(b, adjustmentsFor(s, p.CustomerID, m))
+		if err != nil {
+			return fmt.Errorf("客户 %s 的 %s 当前应付异常，拒绝更正: %w", p.CustomerID, m, err)
+		}
+		received, err := paymentReceived(s, p.CustomerID, m)
+		if err != nil {
+			return fmt.Errorf("客户 %s 的 %s 实收累计异常，拒绝更正: %w", p.CustomerID, m, err)
+		}
+		// 两项金额均非负且不超过收款总额，差值不会溢出。
+		delta := amountIn(allocs, m) - amountIn(from, m)
+		newReceived, err := addSigned64(received, delta)
+		if err != nil {
+			return fmt.Errorf("客户 %s 的 %s 更正后实收越出有符号 64 位整数范围，拒绝更正", p.CustomerID, m)
+		}
+		if newReceived < 0 {
+			return fmt.Errorf("客户 %s 的 %s 更正后实收将为 %d 分（小于 0），数据异常，拒绝更正", p.CustomerID, m, newReceived)
+		}
+		if newReceived > payable {
+			return fmt.Errorf("更正后客户 %s 的 %s 实收 %d 分将超过当前应付 %d 分（当前实收 %d 分，本账单分配 %d → %d 分），拒绝更正",
+				p.CustomerID, m, newReceived, payable, received, amountIn(from, m), amountIn(allocs, m))
+		}
+	}
+
+	c := &correction{
+		ID:        corrID,
+		PaymentID: payID,
+		Reason:    reason,
+		From:      from,
+		To:        allocs,
+		CreatedAt: time.Now().UTC().Format(time.RFC3339),
+	}
+	s.NextSeq++
+	c.Seq = s.NextSeq
+	s.Corrections[corrID] = c
+
+	// 更正记录、序号与余额状态在同一次原子保存中持久化；保存失败则一切
+	// 不生效，该更正标识与序号不被占用，可重试。
+	if err := s.save(); err != nil {
+		delete(s.Corrections, corrID)
+		s.NextSeq--
+		return err
+	}
+	fmt.Fprintf(stdout, "已登记更正 %q（关联收款 %q）：\n\n", corrID, payID)
+	printCorrection(c, s)
+	return nil
+}
+
+// unionMonths 返回两条分配列表涉及月份的并集，按月份升序。
+func unionMonths(a, b []paymentAllocation) []string {
+	seen := make(map[string]bool)
+	var months []string
+	for _, allocs := range [][]paymentAllocation{a, b} {
+		for _, al := range allocs {
+			if !seen[al.Month] {
+				seen[al.Month] = true
+				months = append(months, al.Month)
+			}
+		}
+	}
+	sort.Strings(months)
+	return months
+}
+
+// printCorrection 输出单笔更正记录：关联收款、标识、原因、完整前后分配，
+// 以及前后分配涉及月份的当前余额。
+func printCorrection(c *correction, s *state) {
+	p := s.Payments[c.PaymentID] // 载入时已校验存在
+	fmt.Fprintf(stdout, "更正标识：%s\n", c.ID)
+	fmt.Fprintf(stdout, "关联收款：%s（客户 %s，总额 %d 分（%s），备注：%s）\n",
+		p.ID, p.CustomerID, p.Total, moneyFen(p.Total), p.Note)
+	fmt.Fprintf(stdout, "原因：%s\n", c.Reason)
+	fmt.Fprintf(stdout, "更正前分配：%s\n", formatAllocations(c.From))
+	fmt.Fprintf(stdout, "更正后分配：%s\n", formatAllocations(c.To))
+	fmt.Fprintln(stdout, "涉及月份当前余额：")
+	for _, m := range unionMonths(c.From, c.To) {
+		b := s.Bills[billKey(p.CustomerID, m)] // 载入时已校验存在
+		_, payable, _ := billTotals(b, adjustmentsFor(s, p.CustomerID, m))
+		received, _ := paymentReceived(s, p.CustomerID, m)
+		fmt.Fprintf(stdout, "  月份 %s：本账单分配 %d → %d 分；当前应付 %d 分，实收 %d 分（%s），未收余额 %d 分（%s）\n",
+			m, amountIn(c.From, m), amountIn(c.To, m), payable, received, moneyFen(received),
+			payable-received, moneyFen(payable-received))
+	}
+}
+
+// printPayment 输出单笔收款记录：总额、当前生效分配与当前状态，以及全部
+// 更正历史；各月应付/实收取自当前库状态。
 func printPayment(p *payment, s *state) {
 	fmt.Fprintf(stdout, "收款标识：%s\n", p.ID)
 	fmt.Fprintf(stdout, "客户：%s\n", p.CustomerID)
@@ -1051,38 +1219,48 @@ func printPayment(p *payment, s *state) {
 	} else {
 		fmt.Fprintf(stdout, "当前状态：实收中\n")
 	}
-	fmt.Fprintln(stdout, "分配明细：")
-	for i, al := range p.Allocations {
+	fmt.Fprintln(stdout, "分配明细（当前生效）：")
+	for i, al := range currentAllocations(s, p) {
 		b := s.Bills[billKey(p.CustomerID, al.Month)] // 载入时已校验存在
 		_, payable, _ := billTotals(b, adjustmentsFor(s, p.CustomerID, al.Month))
-		received, _ := paymentReceived(paymentsFor(s, p.CustomerID, al.Month), al.Month)
+		received, _ := paymentReceived(s, p.CustomerID, al.Month)
 		fmt.Fprintf(stdout, "  %d. 月份 %s：分配 %d 分（%s）；当前应付 %d 分，实收合计 %d 分，未收余额 %d 分\n",
 			i+1, al.Month, al.Amount, moneyFen(al.Amount), payable, received, payable-received)
+	}
+	if corrs := correctionsForPayment(s, p.ID); len(corrs) > 0 {
+		fmt.Fprintln(stdout, "更正历史（按成功操作顺序）：")
+		for i, c := range corrs {
+			fmt.Fprintf(stdout, "  %d. 更正 %s：%s → %s，原因：%s\n",
+				i+1, c.ID, formatAllocations(c.From), formatAllocations(c.To), c.Reason)
+		}
 	}
 }
 
 // --- 账后对账流水 ---
 
-// ledgerEvent 是某张已结算账单账后流水中的一个事件：调整、撤销调整、收款
-// 或撤销收款。事件按全局操作序号升序回放；撤销在其发生序号抵消对应原操作，
-// 已撤销记录在撤销之前仍计入，不按当前撤销状态删除原事件。
+// ledgerEvent 是某张已结算账单账后流水中的一个事件：调整、撤销调整、收款、
+// 收款更正或撤销收款。事件按全局操作序号升序回放；撤销在其发生序号抵消对应
+// 原操作，已撤销记录在撤销之前仍计入，不按当前撤销状态删除原事件。
 type ledgerEvent struct {
-	seq           int64  // 全局操作序号（调整/收款及其撤销共用）
-	kind          string // 事件类型：调整 / 撤销调整 / 收款 / 撤销收款
-	refID         string // 原记录标识（调整标识或收款标识）
+	seq           int64  // 全局操作序号（调整/收款/更正及其撤销共用）
+	kind          string // 事件类型：调整 / 撤销调整 / 收款 / 更正 / 撤销收款
+	refID         string // 原记录标识（调整标识、收款标识或更正标识）
 	deltaPayable  int64  // 对当前应付的影响（分，带符号）
 	deltaReceived int64  // 对实收的影响（分，带符号）
-	note          string // 原因（调整类）或备注（收款类）
+	note          string // 原因（调整/更正类）或备注（收款类）
 	linkSeq       int64  // 撤销事件关联的原操作序号；非撤销事件为 0
 	payTotal      int64  // 收款类事件：汇款总额
 	payAlloc      int64  // 收款类事件：本账单分配
+	corrPayID     string // 更正事件：关联收款标识
+	corrFrom      int64  // 更正事件：本账单更正前分配
+	corrTo        int64  // 更正事件：本账单更正后分配
 	afterPayable  int64  // 事件后的应付（回放时填充）
 	afterReceived int64  // 事件后的实收（回放时填充）
 }
 
-// billLedger 把目标账单的调整、调整撤销、收款与收款撤销合并为一条按操作
-// 序号升序的流水，并以原总金额为初始应付、零实收为起点逐步回放，填充每个
-// 事件之后的三项余额。回放覆盖完整流水（不受查询截止序号限制）：序号重复、
+// billLedger 把目标账单的调整、调整撤销、收款、收款更正与收款撤销合并为一条
+// 按操作序号升序的流水，并以原总金额为初始应付、零实收为起点逐步回放，填充
+// 每个事件之后的三项余额。回放覆盖完整流水（不受查询截止序号限制）：序号重复、
 // 撤销先于原操作，或任一事件之后不满足 0 ≤ 实收 ≤ 应付 ≤ 有符号 64 位
 // 最大值，都视为数据异常并拒绝——只检查最终余额会放过中间越界的存档。
 // 只读：不修改库、不占用序号、不新增记录。
@@ -1111,22 +1289,39 @@ func billLedger(s *state, b *bill) ([]ledgerEvent, error) {
 		if p.CustomerID != b.CustomerID {
 			continue
 		}
-		// 多月汇款只以本账单分配改变实收；整笔撤销在同一序号取消该分配。
+		// 按当时分配回放：收款事件计入首次登记分配，每次更正在其发生序号
+		// 用前后分配差额调整实收，整笔撤销取消撤销时最新生效的分配。
 		alloc := p.amountFor(b.Month)
-		if alloc <= 0 {
-			continue
-		}
-		events = append(events, ledgerEvent{
-			seq: p.Seq, kind: "收款", refID: p.ID,
-			deltaReceived: alloc, note: p.Note,
-			payTotal: p.Total, payAlloc: alloc,
-		})
-		if p.Revoked {
+		if alloc > 0 {
 			events = append(events, ledgerEvent{
-				seq: p.RevokeSeq, kind: "撤销收款", refID: p.ID,
-				deltaReceived: -alloc, note: p.RevokeReason, linkSeq: p.Seq,
+				seq: p.Seq, kind: "收款", refID: p.ID,
+				deltaReceived: alloc, note: p.Note,
 				payTotal: p.Total, payAlloc: alloc,
 			})
+		}
+		for _, c := range correctionsForPayment(s, p.ID) {
+			from, to := amountIn(c.From, b.Month), amountIn(c.To, b.Month)
+			if from == 0 && to == 0 {
+				continue // 更正不涉及本账单
+			}
+			// 前后金额均非负且不超过收款总额，差额不会溢出。
+			events = append(events, ledgerEvent{
+				seq: c.Seq, kind: "更正", refID: c.ID,
+				deltaReceived: to - from, note: c.Reason,
+				corrPayID: p.ID, corrFrom: from, corrTo: to,
+			})
+		}
+		if p.Revoked {
+			// 撤销取消的是撤销时最新生效的分配；更正只允许未撤销收款，
+			// 因此当前生效分配即撤销时分配。
+			cur := currentAmountFor(s, p, b.Month)
+			if cur > 0 {
+				events = append(events, ledgerEvent{
+					seq: p.RevokeSeq, kind: "撤销收款", refID: p.ID,
+					deltaReceived: -cur, note: p.RevokeReason, linkSeq: p.Seq,
+					payTotal: p.Total, payAlloc: cur,
+				})
+			}
 		}
 	}
 	sort.Slice(events, func(i, j int) bool { return events[i].seq < events[j].seq })
@@ -1264,6 +1459,9 @@ func formatLedgerEvent(ev ledgerEvent) string {
 	case "收款":
 		return fmt.Sprintf("序号 %d 收款 %s：实收 %+d 分（%s，汇款总额 %d 分，本账单分配 %d 分），备注：%s → %s",
 			ev.seq, ev.refID, ev.deltaReceived, moneyFen(ev.deltaReceived), ev.payTotal, ev.payAlloc, ev.note, after)
+	case "更正":
+		return fmt.Sprintf("序号 %d 更正 %s：实收 %+d 分（%s，关联收款 %s，本账单分配 %d → %d 分），原因：%s → %s",
+			ev.seq, ev.refID, ev.deltaReceived, moneyFen(ev.deltaReceived), ev.corrPayID, ev.corrFrom, ev.corrTo, ev.note, after)
 	default: // 撤销收款
 		return fmt.Sprintf("序号 %d 撤销收款 %s：实收 %+d 分（%s，关联序号 %d 的收款 %s，汇款总额 %d 分，取消本账单分配 %d 分），原因：%s → %s",
 			ev.seq, ev.refID, ev.deltaReceived, moneyFen(ev.deltaReceived), ev.linkSeq, ev.refID, ev.payTotal, ev.payAlloc, ev.note, after)
