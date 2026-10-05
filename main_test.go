@@ -886,20 +886,38 @@ func TestPayIdempotentAndConflict(t *testing.T) {
 	h.runExpectErr("bill", "pay", "c1", "2026-09", "pay-1", "501", "第一次备注")
 }
 
-func TestPaymentAndAdjustmentIDNamespaceExclusive(t *testing.T) {
+func TestPaymentAndAdjustmentMayShareID(t *testing.T) {
 	h := newHarness(t)
 	settleBill(h, "c1", "100", "10") // 总金额 1000
 
-	// 同一标识不能先用于收款再用于调整，反之亦然。
+	// 收款与调整允许同名，各自判重与撤销。
 	h.mustRun("bill", "pay", "c1", "2026-09", "same-id", "100", "收款")
-	h.runExpectErr("bill", "adjust", "c1", "2026-09", "same-id", "10", "补收")
-	h.mustRun("bill", "adjust", "c1", "2026-09", "adj-x", "10", "补收")
-	h.runExpectErr("bill", "pay", "c1", "2026-09", "adj-x", "10", "备注")
+	out := h.mustRun("bill", "adjust", "c1", "2026-09", "same-id", "10", "补收")
+	if !strings.Contains(out, "当前应付 1010 分") {
+		t.Fatal(out)
+	}
 
-	// 撤销收款时若标识属于调整，明确报不存在收款目标。
-	h.runExpectErr("bill", "unpay", "adj-x", "原因")
-	// 撤销调整时若标识属于收款，按调整不存在处理，互不误操作。
-	h.runExpectErr("bill", "revoke", "same-id", "原因")
+	// 撤销收款只取消实收，同名调整仍生效。
+	h.mustRun("bill", "unpay", "same-id", "收款录错")
+	shown := h.mustRun("bill", "show", "c1", "2026-09")
+	if !strings.Contains(shown, "当前应付：1010 分") || !strings.Contains(shown, "实收：0 分") {
+		t.Fatal(shown)
+	}
+	// 撤销调整只取消调整，互不影响。
+	h.mustRun("bill", "revoke", "same-id", "调整录错")
+	shown = h.mustRun("bill", "show", "c1", "2026-09")
+	if !strings.Contains(shown, "当前应付：1000 分") {
+		t.Fatal(shown)
+	}
+
+	// 各自命名空间内判重：同名收款重放按收款内容判断。
+	out = h.mustRun("bill", "pay", "c1", "2026-09", "same-id", "100", "收款")
+	if !strings.Contains(out, "已撤销") {
+		t.Fatal(out)
+	}
+	// 撤销目标不存在仍拒绝。
+	h.runExpectErr("bill", "unpay", "ghost", "原因")
+	h.runExpectErr("bill", "revoke", "ghost", "原因")
 }
 
 func TestPayExceedsOutstandingRejected(t *testing.T) {
@@ -1155,6 +1173,350 @@ func TestCorruptPaymentDataRejected(t *testing.T) {
 	}
 	got, _ = os.ReadFile(h.statePath())
 	if string(got) != dangling {
+		t.Fatal("损坏文件被改写")
+	}
+}
+
+// --- 多月份汇款（bill remit） ---
+
+// settleMonth 是测试辅助：为已登记客户导入一条指定月份的用量并结算。
+func settleMonth(h *harness, customerID, month, qty string) {
+	h.t.Helper()
+	f := h.writeFile("u-"+customerID+"-"+month+".csv", csvHeader+
+		"u-"+customerID+"-"+month+","+customerID+","+month+"-15T10:00:00Z,"+qty+"\n")
+	h.mustRun("usage", "import", f)
+	h.mustRun("bill", "settle", customerID, month)
+}
+
+func TestRemitHappyPathAndShow(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("customer", "add", "c1", "甲方", "100")
+	settleMonth(h, "c1", "2026-09", "6") // 应付 600
+	settleMonth(h, "c1", "2026-10", "4") // 应付 400
+
+	out := h.mustRun("bill", "remit", "c1", "remit-1", "500", "季度汇款",
+		"2026-09", "300", "2026-10", "200")
+	for _, want := range []string{
+		"已登记收款", "收款总额 500 分", "共 2 项分配",
+		"月份 2026-09：300 分", "月份 2026-10：200 分", "实收中",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("登记输出缺少 %q:\n%s", want, out)
+		}
+	}
+
+	// 各月实收按分配计入，未收 = 应付 - 实收。
+	shown9 := h.mustRun("bill", "show", "c1", "2026-09")
+	for _, want := range []string{
+		"当前应付：600 分", "实收：300 分", "未收余额：300 分",
+		"收款 remit-1：本账单分配 300 分", "收款总额 500 分", "季度汇款", "实收中",
+		"分配：2026-09:300 分、2026-10:200 分",
+	} {
+		if !strings.Contains(shown9, want) {
+			t.Fatalf("9 月账单展示缺少 %q:\n%s", want, shown9)
+		}
+	}
+	shown10 := h.mustRun("bill", "show", "c1", "2026-10")
+	if !strings.Contains(shown10, "实收：200 分") || !strings.Contains(shown10, "未收余额：200 分") ||
+		!strings.Contains(shown10, "收款 remit-1：本账单分配 200 分") {
+		t.Fatal(shown10)
+	}
+
+	// 重复结算不产生收款，返回含汇款历史的原账单。
+	again := h.mustRun("bill", "settle", "c1", "2026-09")
+	if !strings.Contains(again, "幂等") || !strings.Contains(again, "实收：300 分") ||
+		!strings.Contains(again, "收款 remit-1") {
+		t.Fatal(again)
+	}
+}
+
+func TestRemitValidation(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("customer", "add", "c1", "甲方", "100")
+	settleMonth(h, "c1", "2026-09", "6")
+	settleMonth(h, "c1", "2026-10", "4")
+
+	// 参数数量不对（用法错误）。
+	for _, args := range [][]string{
+		{"bill", "remit", "c1", "r1", "500", "备注"},
+		{"bill", "remit", "c1", "r1", "500", "备注", "2026-09"},
+		{"bill", "remit", "c1", "r1", "500", "备注", "2026-09", "300", "2026-10"},
+	} {
+		if _, err := h.run(args...); err == nil {
+			t.Fatalf("args=%v 应失败", args)
+		}
+	}
+	// 收款标识为空、备注为空、客户不存在。
+	h.runExpectErr("bill", "remit", "c1", "", "500", "备注", "2026-09", "500")
+	h.runExpectErr("bill", "remit", "c1", "r1", "500", "", "2026-09", "500")
+	h.runExpectErr("bill", "remit", "ghost", "r1", "500", "备注", "2026-09", "500")
+	// 总额：零、负数、非整数、超范围。
+	h.runExpectErr("bill", "remit", "c1", "r1", "0", "备注", "2026-09", "500")
+	h.runExpectErr("bill", "remit", "c1", "r1", "-5", "备注", "2026-09", "500")
+	h.runExpectErr("bill", "remit", "c1", "r1", "abc", "备注", "2026-09", "500")
+	h.runExpectErr("bill", "remit", "c1", "r1", "99999999999999999999999", "备注", "2026-09", "500")
+	// 分配月份非法、重复、无账单。
+	h.runExpectErr("bill", "remit", "c1", "r1", "500", "备注", "2026-9", "500")
+	h.runExpectErr("bill", "remit", "c1", "r1", "600", "备注", "2026-09", "300", "2026-09", "300")
+	h.runExpectErr("bill", "remit", "c1", "r1", "500", "备注", "2026-11", "500")
+	// 分配金额非正。
+	h.runExpectErr("bill", "remit", "c1", "r1", "500", "备注", "2026-09", "0", "2026-10", "500")
+	h.runExpectErr("bill", "remit", "c1", "r1", "500", "备注", "2026-09", "-1", "2026-10", "501")
+	// 分配合计与总额不一致。
+	h.runExpectErr("bill", "remit", "c1", "r1", "500", "备注", "2026-09", "300", "2026-10", "100")
+	// 分配合计溢出。
+	msg := h.runExpectErr("bill", "remit", "c1", "r1", "9223372036854775807", "备注",
+		"2026-09", "9223372036854775807", "2026-10", "1")
+	if !strings.Contains(msg, "溢出") {
+		t.Fatal(msg)
+	}
+
+	// 全部失败后 r1 未被占用：首次合法登记照常进行。
+	out := h.mustRun("bill", "remit", "c1", "r1", "500", "首次汇款", "2026-09", "300", "2026-10", "200")
+	if !strings.Contains(out, "收款总额 500 分") {
+		t.Fatal(out)
+	}
+}
+
+func TestRemitExceedsOutstandingRejectedAtomically(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("customer", "add", "c1", "甲方", "100")
+	settleMonth(h, "c1", "2026-09", "6") // 应付 600
+	settleMonth(h, "c1", "2026-10", "4") // 应付 400
+
+	// 其中一项超过对应未收余额：整笔拒绝，任何月份都不计入实收。
+	msg := h.runExpectErr("bill", "remit", "c1", "r1", "1001", "超额汇款", "2026-09", "600", "2026-10", "401")
+	if !strings.Contains(msg, "超过该月未收余额") {
+		t.Fatal(msg)
+	}
+	for _, m := range []string{"2026-09", "2026-10"} {
+		shown := h.mustRun("bill", "show", "c1", m)
+		if !strings.Contains(shown, "实收：0 分") {
+			t.Fatalf("%s 不应计入实收:\n%s", m, shown)
+		}
+	}
+	// 失败的登记不占用标识：改小后同标识可成功。
+	h.mustRun("bill", "remit", "c1", "r1", "900", "超额汇款", "2026-09", "600", "2026-10", "300")
+
+	// 已收清的月份不能再接受任何正额分配。
+	h.runExpectErr("bill", "remit", "c1", "r2", "101", "再汇", "2026-09", "1", "2026-10", "100")
+}
+
+func TestRemitIdempotentOrderIndependentAndCrossEntry(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("customer", "add", "c1", "甲方", "100")
+	settleMonth(h, "c1", "2026-09", "6") // 应付 600
+	settleMonth(h, "c1", "2026-10", "4") // 应付 400
+
+	h.mustRun("bill", "remit", "c1", "r1", "500", "季度汇款", "2026-09", "300", "2026-10", "200")
+
+	// 分配顺序不影响身份：相同内容换序重放返回原记录，不重复计入实收。
+	out := h.mustRun("bill", "remit", "c1", "r1", "500", "季度汇款", "2026-10", "200", "2026-09", "300")
+	if !strings.Contains(out, "不重复计入实收") {
+		t.Fatal(out)
+	}
+	shown := h.mustRun("bill", "show", "c1", "2026-09")
+	if !strings.Contains(shown, "实收：300 分") {
+		t.Fatal(shown)
+	}
+
+	// 任一内容不同均拒绝：总额、备注、分配拆分、月份组合。
+	h.runExpectErr("bill", "remit", "c1", "r1", "400", "季度汇款", "2026-09", "200", "2026-10", "200")
+	h.runExpectErr("bill", "remit", "c1", "r1", "500", "另一个备注", "2026-09", "300", "2026-10", "200")
+	h.runExpectErr("bill", "remit", "c1", "r1", "500", "季度汇款", "2026-09", "200", "2026-10", "300")
+	h.runExpectErr("bill", "remit", "c1", "r1", "500", "季度汇款", "2026-09", "500")
+	h.runExpectErr("bill", "pay", "c1", "2026-09", "r1", "500", "季度汇款")
+
+	// 两个入口的相同重放返回原记录：bill pay 登记后 remit 单项重放。
+	h.mustRun("bill", "pay", "c1", "2026-09", "pay-x", "100", "转账")
+	out = h.mustRun("bill", "remit", "c1", "pay-x", "100", "转账", "2026-09", "100")
+	if !strings.Contains(out, "不重复计入实收") {
+		t.Fatal(out)
+	}
+	// 反向：remit 单项登记后 bill pay 重放。
+	h.mustRun("bill", "remit", "c1", "pay-y", "100", "汇款", "2026-10", "100")
+	out = h.mustRun("bill", "pay", "c1", "2026-10", "pay-y", "100", "汇款")
+	if !strings.Contains(out, "不重复计入实收") {
+		t.Fatal(out)
+	}
+
+	// 余额变化后重放仍返回原记录。
+	h.mustRun("bill", "unpay", "pay-x", "录错")
+	out = h.mustRun("bill", "remit", "c1", "r1", "500", "季度汇款", "2026-09", "300", "2026-10", "200")
+	if !strings.Contains(out, "不重复计入实收") || !strings.Contains(out, "实收中") {
+		t.Fatal(out)
+	}
+}
+
+func TestRemitUnpayWholeAndReplay(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("customer", "add", "c1", "甲方", "100")
+	settleMonth(h, "c1", "2026-09", "6")
+	settleMonth(h, "c1", "2026-10", "4")
+	h.mustRun("bill", "remit", "c1", "r1", "500", "季度汇款", "2026-09", "300", "2026-10", "200")
+
+	out := h.mustRun("bill", "unpay", "r1", "汇款账号错误")
+	for _, want := range []string{"已撤销收款", "总额 500 分", "2 项分配全部撤销", "已撤销（撤销原因：汇款账号错误）"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("撤销输出缺少 %q:\n%s", want, out)
+		}
+	}
+
+	// 全部分配同时取消：各月实收归零，应付不变。
+	shown9 := h.mustRun("bill", "show", "c1", "2026-09")
+	if !strings.Contains(shown9, "当前应付：600 分") || !strings.Contains(shown9, "实收：0 分") {
+		t.Fatal(shown9)
+	}
+	shown10 := h.mustRun("bill", "show", "c1", "2026-10")
+	if !strings.Contains(shown10, "当前应付：400 分") || !strings.Contains(shown10, "实收：0 分") {
+		t.Fatal(shown10)
+	}
+	// 历史含撤销关联与原因，按成功操作排序。
+	i1 := strings.Index(shown9, "收款 r1：")
+	i2 := strings.Index(shown9, "撤销收款 r1：原因：汇款账号错误")
+	if i1 < 0 || i2 < 0 || i1 >= i2 {
+		t.Fatalf("历史顺序错误:\n%s", shown9)
+	}
+	if !strings.Contains(shown9, "关联收款 r1：本账单分配 300 分，收款总额 500 分") {
+		t.Fatal(shown9)
+	}
+
+	// 相同原因重复撤销幂等成功，不新增历史；不同原因、目标不存在拒绝。
+	out = h.mustRun("bill", "unpay", "r1", "汇款账号错误")
+	if !strings.Contains(out, "幂等") {
+		t.Fatal(out)
+	}
+	h.runExpectErr("bill", "unpay", "r1", "另一个原因")
+	h.runExpectErr("bill", "unpay", "ghost", "原因")
+	h.runExpectErr("bill", "unpay", "r1", "")
+	// 不接受部分撤销（多余参数属于用法错误）。
+	if _, err := h.run("bill", "unpay", "r1", "原因", "2026-09"); err == nil {
+		t.Fatal("部分撤销应被拒绝")
+	}
+
+	// 撤销后重放不恢复实收，仍返回已撤销状态。
+	out = h.mustRun("bill", "remit", "c1", "r1", "500", "季度汇款", "2026-09", "300", "2026-10", "200")
+	if !strings.Contains(out, "已撤销") {
+		t.Fatal(out)
+	}
+	shown9 = h.mustRun("bill", "show", "c1", "2026-09")
+	if !strings.Contains(shown9, "实收：0 分") {
+		t.Fatal(shown9)
+	}
+}
+
+func TestRemitAdjustmentCountsAllocationsAsReceived(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("customer", "add", "c1", "甲方", "100")
+	settleMonth(h, "c1", "2026-09", "6") // 应付 600
+	settleMonth(h, "c1", "2026-10", "4") // 应付 400
+	h.mustRun("bill", "remit", "c1", "r1", "500", "季度汇款", "2026-09", "300", "2026-10", "200")
+
+	// 减免使 9 月应付低于实收（含汇款分配）：拒绝。
+	msg := h.runExpectErr("bill", "adjust", "c1", "2026-09", "adj-1", "-301", "减免")
+	if !strings.Contains(msg, "低于实收") {
+		t.Fatal(msg)
+	}
+	// 减到恰好等于实收合法。
+	h.mustRun("bill", "adjust", "c1", "2026-09", "adj-1", "-300", "减免")
+	// 撤销该减免会使应付回升，合法；先收款再撤销另一笔补收也受分配约束。
+	h.mustRun("bill", "adjust", "c1", "2026-10", "adj-2", "100", "补收") // 10 月应付 500，实收 200
+	msg = h.runExpectErr("bill", "adjust", "c1", "2026-10", "adj-3", "-301", "减免")
+	if !strings.Contains(msg, "低于实收") {
+		t.Fatal(msg)
+	}
+}
+
+func TestRemitPersistsAcrossInvocations(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("customer", "add", "c1", "甲方", "100")
+	settleMonth(h, "c1", "2026-09", "6")
+	settleMonth(h, "c1", "2026-10", "4")
+	h.mustRun("bill", "remit", "c1", "r1", "500", "季度汇款", "2026-09", "300", "2026-10", "200")
+	h.mustRun("bill", "remit", "c1", "r2", "100", "补充汇款", "2026-09", "100")
+	h.mustRun("bill", "unpay", "r2", "录错")
+
+	// 全新 harness 指向同一目录：余额、历史顺序、幂等与撤销约束保持。
+	h2 := &harness{t: t, dir: h.dir}
+	prev := stdout
+	stdout = &h2.buf
+	defer func() { stdout = prev }()
+
+	out, err := h2.run("bill", "show", "c1", "2026-09")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "实收：300 分") || !strings.Contains(out, "未收余额：300 分") {
+		t.Fatal(out)
+	}
+	j1 := strings.Index(out, "收款 r1：")
+	j2 := strings.Index(out, "收款 r2：")
+	j3 := strings.Index(out, "撤销收款 r2：")
+	if j1 < 0 || j2 < 0 || j3 < 0 || !(j1 < j2 && j2 < j3) {
+		t.Fatalf("重启后历史顺序错误:\n%s", out)
+	}
+	// 已撤销汇款重放仍返回已撤销状态，不恢复实收。
+	out, err = h2.run("bill", "remit", "c1", "r2", "100", "补充汇款", "2026-09", "100")
+	if err != nil || !strings.Contains(out, "已撤销") {
+		t.Fatalf("out=%s err=%v", out, err)
+	}
+	// 相同原因重复撤销幂等，不同原因拒绝。
+	if _, err = h2.run("bill", "unpay", "r2", "录错"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = h2.run("bill", "unpay", "r2", "别的原因"); err == nil {
+		t.Fatal("应拒绝不同原因的重复撤销")
+	}
+	// 超额分配在重启后仍被拒绝。
+	if _, err = h2.run("bill", "remit", "c1", "r3", "301", "超额", "2026-09", "301"); err == nil {
+		t.Fatal("应拒绝超过未收余额的分配")
+	}
+}
+
+func TestRemitCorruptDataRejected(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("customer", "add", "c1", "甲方", "100")
+	settleMonth(h, "c1", "2026-09", "6")
+	settleMonth(h, "c1", "2026-10", "4")
+	h.mustRun("bill", "remit", "c1", "r1", "500", "季度汇款", "2026-09", "300", "2026-10", "200")
+
+	good, err := os.ReadFile(h.statePath())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 分配引用失效：把分配月份改到无账单的月份（收款记录在文件末尾）。
+	idx := strings.LastIndex(string(good), `"month": "2026-10"`)
+	if idx < 0 {
+		t.Fatal("未找到分配月份")
+	}
+	dangling := string(good)[:idx] + `"month": "2026-11"` + string(good)[idx+len(`"month": "2026-10"`):]
+	if err := os.WriteFile(h.statePath(), []byte(dangling), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	msg := h.runExpectErr("bill", "show", "c1", "2026-09")
+	if !strings.Contains(msg, "损坏") {
+		t.Fatal(msg)
+	}
+	got, _ := os.ReadFile(h.statePath())
+	if string(got) != dangling {
+		t.Fatal("损坏文件被改写")
+	}
+
+	// 金额不一致：分配合计与总额不符。
+	broken := strings.Replace(string(good), `"amount_fen": 200`, `"amount_fen": 201`, 1)
+	if broken == string(good) {
+		t.Fatal("替换未生效")
+	}
+	if err := os.WriteFile(h.statePath(), []byte(broken), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	msg = h.runExpectErr("bill", "show", "c1", "2026-09")
+	if !strings.Contains(msg, "损坏") {
+		t.Fatal(msg)
+	}
+	got, _ = os.ReadFile(h.statePath())
+	if string(got) != broken {
 		t.Fatal("损坏文件被改写")
 	}
 }
