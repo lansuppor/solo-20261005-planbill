@@ -1,16 +1,88 @@
 package main
 
 import (
+	"errors"
+	"flag"
 	"fmt"
+	"io"
 	"os"
 )
 
+const appName = "planbill"
+
+const defaultDataDir = "planbill-data"
+
+const helpText = appName + ` — 离线按量月结账单管理
+
+用法:
+  go run . [选项]
+  go run . [选项] <命令> [命令参数]
+
+选项:
+      --data-dir <目录>   本地数据目录（默认: ./` + defaultDataDir + `）
+  -h, --help              显示本帮助
+
+命令:
+  customer add <标识> <名称> <单价分>
+                          登记客户；单价为非负整数人民币分，创建后不可修改
+  usage import <文件>     整批导入用量记录（CSV，UTF-8；- 表示标准输入）
+  bill settle <客户标识> <YYYY-MM>
+                          按 UTC 自然月（左闭右开）月结并封账；
+                          再次结算同一客户月份返回原账单，不重新计费
+  bill show <客户标识> <YYYY-MM>
+                          查询账单：稳定账单标识、客户、月份、总数量、
+                          单价、总金额及每条用量明细与小计
+
+说明:
+  - 所有数据保存在数据目录的 state.json，原子写入，跨进程持久化，不依赖外部服务。
+  - 数量、单价、金额均为有符号 64 位整数（金额单位：分），全程整数运算。
+  - 用量文件格式与更多示例见 README.md。
+`
+
+// stdout 是全部正常输出的目的地；测试中会临时替换以捕获输出。
+var stdout io.Writer = os.Stdout
+
 func main() {
-	const name = "planbill"
-	args := os.Args[1:]
-	if len(args) > 0 && !(len(args) == 1 && (args[0] == "--help" || args[0] == "-h")) {
-		fmt.Fprintln(os.Stderr, name+": unknown arguments; use --help")
-		os.Exit(2)
+	if err := run(os.Args[1:]); err != nil {
+		fmt.Fprintln(os.Stderr, appName+":", err)
+		os.Exit(exitCode(err))
 	}
-	fmt.Printf("%s\n\nUsage: go run . [--help]\n\n订阅与用量账单管理。当前仅提供帮助信息。\n", name)
+}
+
+// exitCode 区分用法错误（2）与业务错误（1），成功为 0。
+func exitCode(err error) int {
+	var ue usageErrorf
+	if errors.As(err, &ue) {
+		return 2
+	}
+	return 1
+}
+
+func run(args []string) error {
+	if len(args) == 0 {
+		// 保留无参数入口：输出应用名与帮助。
+		fmt.Fprint(stdout, helpText)
+		return nil
+	}
+
+	fs := flag.NewFlagSet(appName, flag.ContinueOnError)
+	fs.SetOutput(io.Discard)
+	dataDir := fs.String("data-dir", defaultDataDir, "本地数据目录")
+	helpShort := fs.Bool("h", false, "显示帮助")
+	helpLong := fs.Bool("help", false, "显示帮助")
+	if err := fs.Parse(args); err != nil {
+		return usageError("参数错误：%v；用 --help 查看用法", err)
+	}
+	if *helpShort || *helpLong {
+		if fs.NArg() > 0 {
+			return usageError("--help 不能与命令同时使用")
+		}
+		fmt.Fprint(stdout, helpText)
+		return nil
+	}
+	if fs.NArg() == 0 {
+		fmt.Fprint(stdout, helpText)
+		return nil
+	}
+	return runCmd(fs.Args(), *dataDir)
 }
