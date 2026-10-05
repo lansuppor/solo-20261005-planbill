@@ -1550,3 +1550,319 @@ func TestCorruptRemitDataRejected(t *testing.T) {
 		t.Fatal("损坏文件被改写")
 	}
 }
+
+// --- 账后对账流水 ---
+
+func TestLedgerHappyPathAndCutoff(t *testing.T) {
+	h := newHarness(t)
+	settleBill(h, "c1", "100", "10") // c1 2026-09 总金额 1000
+	settleBill(h, "c2", "100", "5")  // c2 2026-09 总金额 500
+	// 其他客户的操作制造序号空档（1、4），对本账单流水合法。
+	h.mustRun("bill", "adjust", "c2", "2026-09", "adj-c2", "50", "其他客户调整") // 序号 1
+	h.mustRun("bill", "adjust", "c1", "2026-09", "adj-1", "200", "漏算用量")     // 序号 2
+	h.mustRun("bill", "pay", "c1", "2026-09", "pay-1", "300", "银行转账")        // 序号 3
+	h.mustRun("bill", "pay", "c2", "2026-09", "pay-c2", "100", "其他客户收款")   // 序号 4
+	h.mustRun("bill", "revoke", "adj-1", "录入错误")                              // 序号 5
+	h.mustRun("bill", "unpay", "pay-1", "账号登记错误")                           // 序号 6
+
+	before, err := os.ReadFile(h.statePath())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 省略截止序号 = 最新：完整流水按序号升序，撤销在其发生序号抵消原操作。
+	out := h.mustRun("bill", "ledger", "c1", "2026-09")
+	for _, want := range []string{
+		"客户：c1", "月份：2026-09", "原总金额：1000 分",
+		"存档全局序号上限：6", "截止操作序号：6（省略，按最新）",
+		"初始余额：应付 1000 分",
+		"序号 2 调整 adj-1：应付 +200 分", "原因：漏算用量",
+		"事后：应付 1200 分，实收 0 分，未收余额 1200 分",
+		"序号 3 收款 pay-1：实收 +300 分", "汇款总额 300 分，本账单分配 300 分", "备注：银行转账",
+		"事后：应付 1200 分，实收 300 分，未收余额 900 分",
+		"序号 5 撤销调整 adj-1：应付 -200 分", "关联序号 2 的调整 adj-1", "原因：录入错误",
+		"事后：应付 1000 分，实收 300 分，未收余额 700 分",
+		"序号 6 撤销收款 pay-1：实收 -300 分", "关联序号 3 的收款 pay-1", "取消本账单分配 300 分",
+		"截止时余额：应付 1000 分（10.00 元），实收 0 分（0.00 元），未收余额 1000 分（10.00 元）",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("流水缺少 %q:\n%s", want, out)
+		}
+	}
+	// 其他客户的事件不混入本账单流水。
+	if strings.Contains(out, "adj-c2") || strings.Contains(out, "pay-c2") {
+		t.Fatal(out)
+	}
+	// 最新余额与 bill show 一致。
+	shown := h.mustRun("bill", "show", "c1", "2026-09")
+	for _, want := range []string{"当前应付：1000 分", "实收：0 分", "未收余额：1000 分"} {
+		if !strings.Contains(shown, want) {
+			t.Fatalf("bill show 缺少 %q:\n%s", want, shown)
+		}
+	}
+	// 重启（重新载入）后顺序与历史余额一致。
+	if again := h.mustRun("bill", "ledger", "c1", "2026-09"); again != out {
+		t.Fatalf("两次流水输出不一致:\n%s\n---\n%s", out, again)
+	}
+
+	// 截止 3：只含序号 2、3；截止之后的撤销不影响历史余额也不混入流水。
+	out = h.mustRun("bill", "ledger", "c1", "2026-09", "3")
+	if !strings.Contains(out, "截止操作序号：3（指定）") ||
+		!strings.Contains(out, "序号 3 收款 pay-1") ||
+		!strings.Contains(out, "截止时余额：应付 1200 分（12.00 元），实收 300 分（3.00 元），未收余额 900 分（9.00 元）") {
+		t.Fatal(out)
+	}
+	if strings.Contains(out, "撤销") {
+		t.Fatalf("截止之后的撤销混入流水:\n%s", out)
+	}
+	// 截止 4：序号空档合法，流水与截止 3 相同。
+	out = h.mustRun("bill", "ledger", "c1", "2026-09", "4")
+	if !strings.Contains(out, "截止时余额：应付 1200 分（12.00 元），实收 300 分（3.00 元），未收余额 900 分（9.00 元）") {
+		t.Fatal(out)
+	}
+	// 截止 0：只返回初始余额，明确空流水。
+	out = h.mustRun("bill", "ledger", "c1", "2026-09", "0")
+	if !strings.Contains(out, "流水：无") ||
+		!strings.Contains(out, "截止时余额：应付 1000 分（10.00 元），实收 0 分（0.00 元），未收余额 1000 分（10.00 元）") {
+		t.Fatal(out)
+	}
+
+	// 查询不改写存档、不占用序号：文件逐字节一致，后续操作序号照常递增。
+	after, err := os.ReadFile(h.statePath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(before) != string(after) {
+		t.Fatal("只读查询改写了数据文件")
+	}
+	h.mustRun("bill", "adjust", "c1", "2026-09", "adj-2", "10", "后续调整") // 应占序号 7
+	out = h.mustRun("bill", "ledger", "c1", "2026-09")
+	if !strings.Contains(out, "存档全局序号上限：7") || !strings.Contains(out, "序号 7 调整 adj-2") {
+		t.Fatal(out)
+	}
+}
+
+func TestLedgerCutoffValidation(t *testing.T) {
+	h := newHarness(t)
+	settleBill(h, "c1", "100", "1")
+	h.mustRun("bill", "adjust", "c1", "2026-09", "adj-1", "10", "补收") // 序号 1，上限为 1
+
+	// 负数、非整数、超过存档全局序号上限均拒绝。
+	for _, bad := range []string{"-1", "abc", "1.5", "", "  ", "2", "99999999999999999999999"} {
+		msg := h.runExpectErr("bill", "ledger", "c1", "2026-09", bad)
+		if !strings.Contains(msg, "截止操作序号") {
+			t.Fatalf("cutoff=%q 错误信息异常: %s", bad, msg)
+		}
+	}
+	// 参数数量不对：用法错误。
+	h.runExpectErr("bill", "ledger", "c1")
+	h.runExpectErr("bill", "ledger", "c1", "2026-09", "1", "extra")
+	// 失败后状态不变，合法查询照常。
+	out := h.mustRun("bill", "ledger", "c1", "2026-09", "1")
+	if !strings.Contains(out, "序号 1 调整 adj-1") {
+		t.Fatal(out)
+	}
+}
+
+func TestLedgerEmptyAndErrors(t *testing.T) {
+	h := newHarness(t)
+	settleBill(h, "c1", "150", "6") // 总金额 900，无任何账后操作
+
+	out := h.mustRun("bill", "ledger", "c1", "2026-09")
+	for _, want := range []string{
+		"存档全局序号上限：0", "截止操作序号：0",
+		"初始余额：应付 900 分", "流水：无",
+		"截止时余额：应付 900 分（9.00 元），实收 0 分（0.00 元），未收余额 900 分（9.00 元）",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("空流水缺少 %q:\n%s", want, out)
+		}
+	}
+	// 上限为 0 时截止 0 合法，截止 1 拒绝。
+	h.mustRun("bill", "ledger", "c1", "2026-09", "0")
+	h.runExpectErr("bill", "ledger", "c1", "2026-09", "1")
+
+	// 客户不存在、账单不存在、月份非法均非零退出。
+	h.runExpectErr("bill", "ledger", "ghost", "2026-09")
+	h.runExpectErr("bill", "ledger", "c1", "2026-10")
+	h.runExpectErr("bill", "ledger", "c1", "2026-9")
+}
+
+func TestLedgerRemitAcrossMonths(t *testing.T) {
+	h := newHarness(t)
+	settleTwoMonths(h, "c1", "100", "5", "3") // 2026-09: 500，2026-10: 300
+	h.mustRun("bill", "remit", "c1", "r1", "700", "季度汇款", "2026-09:400", "2026-10:300") // 序号 1
+	h.mustRun("bill", "adjust", "c1", "2026-10", "adj-o", "100", "补收")                  // 序号 2
+
+	// 多月汇款只以本账单分配改变各月实收。
+	out := h.mustRun("bill", "ledger", "c1", "2026-09")
+	if !strings.Contains(out, "序号 1 收款 r1：实收 +400 分") ||
+		!strings.Contains(out, "汇款总额 700 分，本账单分配 400 分") ||
+		!strings.Contains(out, "截止时余额：应付 500 分（5.00 元），实收 400 分（4.00 元），未收余额 100 分（1.00 元）") {
+		t.Fatal(out)
+	}
+	out = h.mustRun("bill", "ledger", "c1", "2026-10")
+	if !strings.Contains(out, "序号 1 收款 r1：实收 +300 分") ||
+		!strings.Contains(out, "本账单分配 300 分") ||
+		!strings.Contains(out, "序号 2 调整 adj-o：应付 +100 分") ||
+		!strings.Contains(out, "截止时余额：应付 400 分（4.00 元），实收 300 分（3.00 元），未收余额 100 分（1.00 元）") {
+		t.Fatal(out)
+	}
+
+	// 整笔撤销在同一序号取消本账单分配；截止在撤销之前不受影响。
+	h.mustRun("bill", "unpay", "r1", "汇错账户") // 序号 3
+	out = h.mustRun("bill", "ledger", "c1", "2026-09")
+	if !strings.Contains(out, "序号 3 撤销收款 r1：实收 -400 分") ||
+		!strings.Contains(out, "取消本账单分配 400 分") ||
+		!strings.Contains(out, "截止时余额：应付 500 分（5.00 元），实收 0 分（0.00 元），未收余额 500 分（5.00 元）") {
+		t.Fatal(out)
+	}
+	out = h.mustRun("bill", "ledger", "c1", "2026-10", "2")
+	if !strings.Contains(out, "截止时余额：应付 400 分（4.00 元），实收 300 分（3.00 元），未收余额 100 分（1.00 元）") {
+		t.Fatal(out)
+	}
+	if strings.Contains(out, "撤销收款") {
+		t.Fatalf("截止之后的撤销混入流水:\n%s", out)
+	}
+}
+
+func TestLedgerSameNameAdjustAndPayment(t *testing.T) {
+	h := newHarness(t)
+	settleBill(h, "c1", "100", "10") // 总金额 1000
+	h.mustRun("bill", "pay", "c1", "2026-09", "same-id", "100", "同名收款")   // 序号 1
+	h.mustRun("bill", "adjust", "c1", "2026-09", "same-id", "10", "同名调整") // 序号 2
+	h.mustRun("bill", "revoke", "same-id", "撤销调整")                        // 序号 3：只撤销调整
+
+	// 同名调整与收款按类型分别关联：撤销调整不影响同名收款。
+	out := h.mustRun("bill", "ledger", "c1", "2026-09")
+	if !strings.Contains(out, "序号 1 收款 same-id：实收 +100 分") ||
+		!strings.Contains(out, "序号 2 调整 same-id：应付 +10 分") ||
+		!strings.Contains(out, "序号 3 撤销调整 same-id：应付 -10 分") ||
+		!strings.Contains(out, "关联序号 2 的调整 same-id") ||
+		!strings.Contains(out, "截止时余额：应付 1000 分（10.00 元），实收 100 分（1.00 元），未收余额 900 分（9.00 元）") {
+		t.Fatal(out)
+	}
+	if strings.Contains(out, "撤销收款") {
+		t.Fatalf("同名收款被误关联撤销:\n%s", out)
+	}
+}
+
+func TestLedgerRejectsCorruptHistory(t *testing.T) {
+	h := newHarness(t)
+	// 手工构造：中间步骤实收超过应付（序号 2 之后 1000 > 500），但最终余额
+	// 合法（应付 1500 ≥ 实收 1000），载入校验可通过；流水查询必须逐步核验
+	// 并拒绝，即使截止序号在异常之前。
+	corrupt := `{
+  "version": 1,
+  "customers": {"c1": {"id": "c1", "name": "甲方", "price_fen": 100}},
+  "usage": {"u1": {"id": "u1", "customer_id": "c1", "time": "2026-09-15T10:00:00Z", "quantity": 10}},
+  "bills": {"c1|2026-09": {
+    "id": "BILL-x", "customer_id": "c1", "month": "2026-09",
+    "total_quantity": 10, "unit_price_fen": 100, "total_fee_fen": 1000,
+    "lines": [{"usage_id": "u1", "time": "2026-09-15T10:00:00Z", "quantity": 10, "line_fee_fen": 1000}],
+    "created_at": "2026-10-01T00:00:00Z"
+  }},
+  "adjustments": {
+    "adj-1": {"id": "adj-1", "customer_id": "c1", "month": "2026-09", "amount_fen": -500,
+      "reason": "减免", "seq": 1, "created_at": "2026-10-02T00:00:00Z"},
+    "adj-2": {"id": "adj-2", "customer_id": "c1", "month": "2026-09", "amount_fen": 1000,
+      "reason": "补收", "seq": 3, "created_at": "2026-10-02T00:00:00Z"}
+  },
+  "payments": {"pay-1": {
+    "id": "pay-1", "customer_id": "c1", "total_fen": 1000, "note": "转账",
+    "allocations": [{"month": "2026-09", "amount_fen": 1000}],
+    "seq": 2, "created_at": "2026-10-02T00:00:00Z"
+  }},
+  "next_seq": 3
+}`
+	if err := os.WriteFile(h.statePath(), []byte(corrupt), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// 最终余额合法，bill show 不受影响。
+	h.mustRun("bill", "show", "c1", "2026-09")
+	// 完整流水核验失败：无截止、截止在异常之前都拒绝，不输出部分正常报告。
+	for _, args := range [][]string{
+		{"bill", "ledger", "c1", "2026-09"},
+		{"bill", "ledger", "c1", "2026-09", "1"},
+		{"bill", "ledger", "c1", "2026-09", "0"},
+	} {
+		msg := h.runExpectErr(args...)
+		if !strings.Contains(msg, "数据异常") {
+			t.Fatalf("args=%v 错误信息异常: %s", args, msg)
+		}
+	}
+	got, _ := os.ReadFile(h.statePath())
+	if string(got) != corrupt {
+		t.Fatal("查询失败后数据文件被改写")
+	}
+
+	// 中间步骤应付越出有符号 64 位最大值（最终净额为 0、余额合法）：同样拒绝。
+	overflow := `{
+  "version": 1,
+  "customers": {"c1": {"id": "c1", "name": "甲方", "price_fen": 1}},
+  "usage": {"u1": {"id": "u1", "customer_id": "c1", "time": "2026-09-15T10:00:00Z", "quantity": 9223372036854775807}},
+  "bills": {"c1|2026-09": {
+    "id": "BILL-y", "customer_id": "c1", "month": "2026-09",
+    "total_quantity": 9223372036854775807, "unit_price_fen": 1, "total_fee_fen": 9223372036854775807,
+    "lines": [{"usage_id": "u1", "time": "2026-09-15T10:00:00Z", "quantity": 9223372036854775807, "line_fee_fen": 9223372036854775807}],
+    "created_at": "2026-10-01T00:00:00Z"
+  }},
+  "adjustments": {
+    "adj-1": {"id": "adj-1", "customer_id": "c1", "month": "2026-09", "amount_fen": 1,
+      "reason": "补收", "seq": 1, "created_at": "2026-10-02T00:00:00Z"},
+    "adj-2": {"id": "adj-2", "customer_id": "c1", "month": "2026-09", "amount_fen": -1,
+      "reason": "减免", "seq": 2, "created_at": "2026-10-02T00:00:00Z"}
+  },
+  "payments": {},
+  "next_seq": 2
+}`
+	if err := os.WriteFile(h.statePath(), []byte(overflow), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	msg := h.runExpectErr("bill", "ledger", "c1", "2026-09")
+	if !strings.Contains(msg, "数据异常") {
+		t.Fatal(msg)
+	}
+	got, _ = os.ReadFile(h.statePath())
+	if string(got) != overflow {
+		t.Fatal("查询失败后数据文件被改写")
+	}
+}
+
+func TestLedgerCumulativeOccurrenceOverflowStillSucceeds(t *testing.T) {
+	h := newHarness(t)
+	// 单价 0：原总金额为 0，允许极大调整与收款往返。累计补收/收款发生额
+	// 远超有符号 64 位上限，但每步余额都合法，查询必须成功。
+	h.mustRun("customer", "add", "c1", "零价客户", "0")
+	f := h.writeFile("u.csv", csvHeader+"u1,c1,2026-09-15T10:00:00Z,5\n")
+	h.mustRun("usage", "import", f)
+	h.mustRun("bill", "settle", "c1", "2026-09")
+
+	const max = "9223372036854775807"
+	h.mustRun("bill", "adjust", "c1", "2026-09", "adj-1", max, "巨额补收") // 序号 1
+	h.mustRun("bill", "pay", "c1", "2026-09", "pay-1", max, "巨额收款")    // 序号 2
+	h.mustRun("bill", "unpay", "pay-1", "退回")                           // 序号 3
+	h.mustRun("bill", "revoke", "adj-1", "撤回")                          // 序号 4
+	h.mustRun("bill", "adjust", "c1", "2026-09", "adj-2", max, "再次补收") // 序号 5
+	h.mustRun("bill", "pay", "c1", "2026-09", "pay-2", max, "再次收款")    // 序号 6
+
+	out := h.mustRun("bill", "ledger", "c1", "2026-09")
+	if !strings.Contains(out, "截止时余额：应付 9223372036854775807 分") ||
+		!strings.Contains(out, "实收 9223372036854775807 分") ||
+		!strings.Contains(out, "未收余额 0 分") {
+		t.Fatal(out)
+	}
+	// 与 bill show 一致。
+	shown := h.mustRun("bill", "show", "c1", "2026-09")
+	if !strings.Contains(shown, "当前应付：9223372036854775807 分") ||
+		!strings.Contains(shown, "实收：9223372036854775807 分") ||
+		!strings.Contains(shown, "未收余额：0 分") {
+		t.Fatal(shown)
+	}
+	// 截止 0：初始余额为原总金额 0。
+	out = h.mustRun("bill", "ledger", "c1", "2026-09", "0")
+	if !strings.Contains(out, "流水：无") ||
+		!strings.Contains(out, "截止时余额：应付 0 分（0.00 元），实收 0 分（0.00 元），未收余额 0 分（0.00 元）") {
+		t.Fatal(out)
+	}
+}

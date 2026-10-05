@@ -58,7 +58,7 @@ func runCmd(args []string, dataDir string) error {
 
 	case "bill":
 		if len(args) < 2 {
-			return usageError("缺少子命令，应为：bill settle|show|adjust|revoke|pay|remit|unpay ...")
+			return usageError("缺少子命令，应为：bill settle|show|adjust|revoke|pay|remit|unpay|ledger ...")
 		}
 		switch args[1] {
 		case "settle":
@@ -96,8 +96,17 @@ func runCmd(args []string, dataDir string) error {
 				return usageError("用法：bill unpay <收款标识> <原因>")
 			}
 			return cmdBillUnpay(dataDir, args[2], args[3])
+		case "ledger":
+			if len(args) != 4 && len(args) != 5 {
+				return usageError("用法：bill ledger <客户标识> <YYYY-MM> [截止操作序号]")
+			}
+			cutoff, hasCutoff := "", false
+			if len(args) == 5 {
+				cutoff, hasCutoff = args[4], true
+			}
+			return cmdBillLedger(dataDir, args[2], args[3], cutoff, hasCutoff)
 		default:
-			return usageError("未知 bill 子命令 %q；可用：settle、show、adjust、revoke、pay、remit、unpay", args[1])
+			return usageError("未知 bill 子命令 %q；可用：settle、show、adjust、revoke、pay、remit、unpay、ledger", args[1])
 		}
 
 	default:
@@ -1049,5 +1058,214 @@ func printPayment(p *payment, s *state) {
 		received, _ := paymentReceived(paymentsFor(s, p.CustomerID, al.Month), al.Month)
 		fmt.Fprintf(stdout, "  %d. 月份 %s：分配 %d 分（%s）；当前应付 %d 分，实收合计 %d 分，未收余额 %d 分\n",
 			i+1, al.Month, al.Amount, moneyFen(al.Amount), payable, received, payable-received)
+	}
+}
+
+// --- 账后对账流水 ---
+
+// ledgerEvent 是某张已结算账单账后流水中的一个事件：调整、撤销调整、收款
+// 或撤销收款。事件按全局操作序号升序回放；撤销在其发生序号抵消对应原操作，
+// 已撤销记录在撤销之前仍计入，不按当前撤销状态删除原事件。
+type ledgerEvent struct {
+	seq           int64  // 全局操作序号（调整/收款及其撤销共用）
+	kind          string // 事件类型：调整 / 撤销调整 / 收款 / 撤销收款
+	refID         string // 原记录标识（调整标识或收款标识）
+	deltaPayable  int64  // 对当前应付的影响（分，带符号）
+	deltaReceived int64  // 对实收的影响（分，带符号）
+	note          string // 原因（调整类）或备注（收款类）
+	linkSeq       int64  // 撤销事件关联的原操作序号；非撤销事件为 0
+	payTotal      int64  // 收款类事件：汇款总额
+	payAlloc      int64  // 收款类事件：本账单分配
+	afterPayable  int64  // 事件后的应付（回放时填充）
+	afterReceived int64  // 事件后的实收（回放时填充）
+}
+
+// billLedger 把目标账单的调整、调整撤销、收款与收款撤销合并为一条按操作
+// 序号升序的流水，并以原总金额为初始应付、零实收为起点逐步回放，填充每个
+// 事件之后的三项余额。回放覆盖完整流水（不受查询截止序号限制）：序号重复、
+// 撤销先于原操作，或任一事件之后不满足 0 ≤ 实收 ≤ 应付 ≤ 有符号 64 位
+// 最大值，都视为数据异常并拒绝——只检查最终余额会放过中间越界的存档。
+// 只读：不修改库、不占用序号、不新增记录。
+func billLedger(s *state, b *bill) ([]ledgerEvent, error) {
+	var events []ledgerEvent
+	for _, a := range s.Adjustments {
+		if a.CustomerID != b.CustomerID || a.Month != b.Month {
+			continue
+		}
+		events = append(events, ledgerEvent{
+			seq: a.Seq, kind: "调整", refID: a.ID,
+			deltaPayable: a.Amount, note: a.Reason,
+		})
+		if a.Revoked {
+			neg, err := neg64(a.Amount)
+			if err != nil {
+				return nil, fmt.Errorf("调整 %q 的金额 %d 分无法抵消（越界），数据异常，拒绝输出流水", a.ID, a.Amount)
+			}
+			events = append(events, ledgerEvent{
+				seq: a.RevokeSeq, kind: "撤销调整", refID: a.ID,
+				deltaPayable: neg, note: a.RevokeReason, linkSeq: a.Seq,
+			})
+		}
+	}
+	for _, p := range s.Payments {
+		if p.CustomerID != b.CustomerID {
+			continue
+		}
+		// 多月汇款只以本账单分配改变实收；整笔撤销在同一序号取消该分配。
+		alloc := p.amountFor(b.Month)
+		if alloc <= 0 {
+			continue
+		}
+		events = append(events, ledgerEvent{
+			seq: p.Seq, kind: "收款", refID: p.ID,
+			deltaReceived: alloc, note: p.Note,
+			payTotal: p.Total, payAlloc: alloc,
+		})
+		if p.Revoked {
+			events = append(events, ledgerEvent{
+				seq: p.RevokeSeq, kind: "撤销收款", refID: p.ID,
+				deltaReceived: -alloc, note: p.RevokeReason, linkSeq: p.Seq,
+				payTotal: p.Total, payAlloc: alloc,
+			})
+		}
+	}
+	sort.Slice(events, func(i, j int) bool { return events[i].seq < events[j].seq })
+
+	// 逐步回放并核验：只把每个事件的金额影响加到运行余额上，不对发生额
+	// 做累计求和，因此累计补收/收款发生额超过 64 位上限但每步余额合法时
+	// 仍能成功。
+	payable := b.TotalFee
+	var received int64
+	seen := make(map[int64]string, len(events))
+	for i := range events {
+		ev := &events[i]
+		desc := ev.kind + " " + ev.refID
+		if prev, dup := seen[ev.seq]; dup {
+			return nil, fmt.Errorf("流水序号 %d 重复（%s 与 %s），数据异常，拒绝输出流水", ev.seq, prev, desc)
+		}
+		seen[ev.seq] = desc
+		if ev.linkSeq != 0 && ev.linkSeq >= ev.seq {
+			return nil, fmt.Errorf("%s 的撤销序号 %d 不晚于原操作序号 %d，数据异常，拒绝输出流水", desc, ev.seq, ev.linkSeq)
+		}
+		var err error
+		if payable, err = addSigned64(payable, ev.deltaPayable); err != nil {
+			return nil, fmt.Errorf("序号 %d（%s）之后应付越出有符号 64 位整数范围，数据异常，拒绝输出流水", ev.seq, desc)
+		}
+		if received, err = addSigned64(received, ev.deltaReceived); err != nil {
+			return nil, fmt.Errorf("序号 %d（%s）之后实收越出有符号 64 位整数范围，数据异常，拒绝输出流水", ev.seq, desc)
+		}
+		if payable < 0 {
+			return nil, fmt.Errorf("序号 %d（%s）之后应付为 %d 分（小于 0），数据异常，拒绝输出流水", ev.seq, desc, payable)
+		}
+		if received < 0 {
+			return nil, fmt.Errorf("序号 %d（%s）之后实收为 %d 分（小于 0），数据异常，拒绝输出流水", ev.seq, desc, received)
+		}
+		if received > payable {
+			return nil, fmt.Errorf("序号 %d（%s）之后实收 %d 分超过应付 %d 分，数据异常，拒绝输出流水", ev.seq, desc, received, payable)
+		}
+		ev.afterPayable = payable
+		ev.afterReceived = received
+	}
+	return events, nil
+}
+
+func cmdBillLedger(dir, customerID, month, cutoffText string, hasCutoff bool) error {
+	if !validMonth(month) {
+		return fmt.Errorf("月份 %q 无效，必须是 YYYY-MM 形式（如 2026-09）", month)
+	}
+	s, err := loadStore(dir)
+	if err != nil {
+		return err
+	}
+	cust, ok := s.Customers[customerID]
+	if !ok {
+		return fmt.Errorf("客户标识 %q 不存在", customerID)
+	}
+	b, ok := s.Bills[billKey(customerID, month)]
+	if !ok {
+		return fmt.Errorf("客户 %s 的 %s 尚无账单（未结算）", customerID, month)
+	}
+
+	// 截止序号使用调整/收款及其撤销共用的已保存全局序号：省略表示最新，
+	// 0 只返回初始余额，截止包含该序号；因其他客户或月份操作造成的序号
+	// 空档合法。负数、非整数或超过存档全局序号上限一律拒绝。
+	cutoff := s.NextSeq
+	cutoffDesc := "省略，按最新"
+	if hasCutoff {
+		v, perr := strconv.ParseInt(strings.TrimSpace(cutoffText), 10, 64)
+		if perr != nil {
+			return fmt.Errorf("截止操作序号 %q 不是非负整数: %w", cutoffText, perr)
+		}
+		if v < 0 {
+			return fmt.Errorf("截止操作序号不能为负数，收到 %d", v)
+		}
+		if v > s.NextSeq {
+			return fmt.Errorf("截止操作序号 %d 超过存档全局序号上限 %d", v, s.NextSeq)
+		}
+		cutoff = v
+		cutoffDesc = "指定"
+	}
+
+	// 先核验目标账单的完整流水：任何异常（即使发生在截止序号之后）都
+	// 拒绝，不输出部分正常的报告。
+	events, err := billLedger(s, b)
+	if err != nil {
+		return err
+	}
+	printBillLedger(b, cust, s.NextSeq, cutoff, cutoffDesc, events)
+	return nil
+}
+
+func printBillLedger(b *bill, cust *customer, nextSeq, cutoff int64, cutoffDesc string, events []ledgerEvent) {
+	fmt.Fprintf(stdout, "账单标识：%s\n", b.ID)
+	fmt.Fprintf(stdout, "客户：%s（%s）\n", cust.ID, cust.Name)
+	fmt.Fprintf(stdout, "月份：%s（UTC 自然月，左闭右开）\n", b.Month)
+	fmt.Fprintf(stdout, "原总金额：%d 分（%s）\n", b.TotalFee, moneyFen(b.TotalFee))
+	fmt.Fprintf(stdout, "存档全局序号上限：%d\n", nextSeq)
+	fmt.Fprintf(stdout, "截止操作序号：%d（%s）\n", cutoff, cutoffDesc)
+	fmt.Fprintf(stdout, "初始余额：应付 %d 分（%s），实收 0 分（%s），未收余额 %d 分（%s）\n",
+		b.TotalFee, moneyFen(b.TotalFee), moneyFen(0), b.TotalFee, moneyFen(b.TotalFee))
+
+	// 截止包含该序号；截止之后的事件（含撤销）既不出现也不影响历史余额。
+	payable, received := b.TotalFee, int64(0)
+	var shown []ledgerEvent
+	for _, ev := range events {
+		if ev.seq > cutoff {
+			continue
+		}
+		shown = append(shown, ev)
+		payable, received = ev.afterPayable, ev.afterReceived
+	}
+	if len(shown) == 0 {
+		fmt.Fprintln(stdout, "流水：无（截止序号以内该账单无账后事件）")
+	} else {
+		fmt.Fprintln(stdout, "流水（按操作序号升序）：")
+		for i, ev := range shown {
+			fmt.Fprintf(stdout, "  %d. %s\n", i+1, formatLedgerEvent(ev))
+		}
+	}
+	fmt.Fprintf(stdout, "截止时余额：应付 %d 分（%s），实收 %d 分（%s），未收余额 %d 分（%s）\n",
+		payable, moneyFen(payable), received, moneyFen(received), payable-received, moneyFen(payable-received))
+}
+
+// formatLedgerEvent 渲染一条流水事件：序号、类型、原记录标识、金额影响、
+// 原因或备注、撤销关联，以及事件后的应付、实收、未收余额；收款类事件同时
+// 说明汇款总额与本账单分配。
+func formatLedgerEvent(ev ledgerEvent) string {
+	after := fmt.Sprintf("事后：应付 %d 分，实收 %d 分，未收余额 %d 分",
+		ev.afterPayable, ev.afterReceived, ev.afterPayable-ev.afterReceived)
+	switch ev.kind {
+	case "调整":
+		return fmt.Sprintf("序号 %d 调整 %s：应付 %+d 分（%s，%s），原因：%s → %s",
+			ev.seq, ev.refID, ev.deltaPayable, moneyFen(ev.deltaPayable), adjustKind(ev.deltaPayable), ev.note, after)
+	case "撤销调整":
+		return fmt.Sprintf("序号 %d 撤销调整 %s：应付 %+d 分（%s，关联序号 %d 的调整 %s），原因：%s → %s",
+			ev.seq, ev.refID, ev.deltaPayable, moneyFen(ev.deltaPayable), ev.linkSeq, ev.refID, ev.note, after)
+	case "收款":
+		return fmt.Sprintf("序号 %d 收款 %s：实收 %+d 分（%s，汇款总额 %d 分，本账单分配 %d 分），备注：%s → %s",
+			ev.seq, ev.refID, ev.deltaReceived, moneyFen(ev.deltaReceived), ev.payTotal, ev.payAlloc, ev.note, after)
+	default: // 撤销收款
+		return fmt.Sprintf("序号 %d 撤销收款 %s：实收 %+d 分（%s，关联序号 %d 的收款 %s，汇款总额 %d 分，取消本账单分配 %d 分），原因：%s → %s",
+			ev.seq, ev.refID, ev.deltaReceived, moneyFen(ev.deltaReceived), ev.linkSeq, ev.refID, ev.payTotal, ev.payAlloc, ev.note, after)
 	}
 }
