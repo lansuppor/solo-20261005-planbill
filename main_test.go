@@ -496,3 +496,317 @@ func extractBillID(out string) string {
 	}
 	return ""
 }
+
+// settleOne 是调整相关用例的公共准备：导入一条用量并结算，
+// 得到数量 qty、单价为登记价的账单（客户须已登记）。
+func settleOne(h *harness, cust, month, qty string) {
+	h.t.Helper()
+	f := h.writeFile("seed-"+cust+month+".csv", csvHeader+
+		"u-"+cust+month+","+cust+","+month+"-15T10:00:00Z,"+qty+"\n")
+	h.mustRun("usage", "import", f)
+	h.mustRun("bill", "settle", cust, month)
+}
+
+func TestAdjustHappyPathAndShow(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("customer", "add", "c1", "甲方", "150")
+	settleOne(h, "c1", "2026-09", "6") // 总金额 900
+
+	out := h.mustRun("bill", "adjust", "c1", "2026-09", "adj-1", "500", "补录最低消费")
+	if !strings.Contains(out, "补收") || !strings.Contains(out, "当前应付 1400 分") {
+		t.Fatal(out)
+	}
+	out = h.mustRun("bill", "adjust", "c1", "2026-09", "adj-2", "-200", "服务补偿")
+	if !strings.Contains(out, "减免") || !strings.Contains(out, "当前应付 1200 分") {
+		t.Fatal(out)
+	}
+
+	// bill show：原字段保留，补充调整净额、当前应付与按顺序排列的历史。
+	shown := h.mustRun("bill", "show", "c1", "2026-09")
+	for _, want := range []string{
+		"总金额：900 分", "总数量：6", "单价：150 分",
+		"调整净额：300 分", "当前应付：1200 分",
+		"调整标识=adj-1", "金额=+500 分", "补录最低消费", "状态=生效中",
+		"调整标识=adj-2", "金额=-200 分", "服务补偿",
+	} {
+		if !strings.Contains(shown, want) {
+			t.Fatalf("账单展示缺少 %q:\n%s", want, shown)
+		}
+	}
+	// 历史按成功操作顺序排列：adj-1 在 adj-2 之前。
+	if strings.Index(shown, "adj-1") > strings.Index(shown, "adj-2") {
+		t.Fatalf("调整历史顺序错误:\n%s", shown)
+	}
+
+	// 重复结算返回原账单并展示调整，不创建新账单或调整。
+	again := h.mustRun("bill", "settle", "c1", "2026-09")
+	if !strings.Contains(again, "幂等") || !strings.Contains(again, "当前应付：1200 分") {
+		t.Fatal(again)
+	}
+}
+
+func TestAdjustRequiresExistingBillAndCustomer(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("customer", "add", "c1", "甲方", "100")
+
+	// 未结算月份不得调整。
+	msg := h.runExpectErr("bill", "adjust", "c1", "2026-09", "adj-1", "100", "原因")
+	if !strings.Contains(msg, "尚无账单") {
+		t.Fatal(msg)
+	}
+	// 客户不存在。
+	h.runExpectErr("bill", "adjust", "ghost", "2026-09", "adj-1", "100", "原因")
+
+	// 失败的首次新增不占用调整标识：结算后同一标识可正常登记。
+	settleOne(h, "c1", "2026-09", "1")
+	h.mustRun("bill", "adjust", "c1", "2026-09", "adj-1", "100", "原因")
+}
+
+func TestAdjustInputValidation(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("customer", "add", "c1", "甲方", "100")
+	settleOne(h, "c1", "2026-09", "2") // 总金额 200
+
+	h.runExpectErr("bill", "adjust", "c1", "2026-9", "a1", "100", "原因")                      // 月份格式
+	h.runExpectErr("bill", "adjust", "c1", "2026-09", "", "100", "原因")                       // 空标识
+	h.runExpectErr("bill", "adjust", "c1", "2026-09", "  ", "100", "原因")                     // 纯空白标识
+	h.runExpectErr("bill", "adjust", "c1", "2026-09", "a1", "0", "原因")                       // 零金额
+	h.runExpectErr("bill", "adjust", "c1", "2026-09", "a1", "1.5", "原因")                     // 非整数
+	h.runExpectErr("bill", "adjust", "c1", "2026-09", "a1", "abc", "原因")                     // 非数字
+	h.runExpectErr("bill", "adjust", "c1", "2026-09", "a1", "99999999999999999999999", "原因") // 超 int64
+	h.runExpectErr("bill", "adjust", "c1", "2026-09", "a1", "100", "")                       // 空原因
+	h.runExpectErr("bill", "adjust", "c1", "2026-09", "a1", "100", "   ")                    // 纯空白原因
+
+	// 全部失败后标识 a1 未被占用，应付不变。
+	h.mustRun("bill", "adjust", "c1", "2026-09", "a1", "50", "首次成功")
+	out := h.mustRun("bill", "show", "c1", "2026-09")
+	if !strings.Contains(out, "当前应付：250 分") {
+		t.Fatal(out)
+	}
+}
+
+func TestAdjustIdempotentReplayAndConflict(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("customer", "add", "c1", "甲方", "100")
+	settleOne(h, "c1", "2026-09", "2") // 总金额 200
+	h.mustRun("customer", "add", "c2", "乙方", "100")
+	settleOne(h, "c2", "2026-09", "10") // 另一客户
+
+	h.mustRun("bill", "adjust", "c1", "2026-09", "adj-1", "500", "补录")
+
+	// 内容完全相同的重放：幂等成功，不重复计入。
+	out := h.mustRun("bill", "adjust", "c1", "2026-09", "adj-1", "500", "补录")
+	if !strings.Contains(out, "幂等") || !strings.Contains(out, "状态=生效中") {
+		t.Fatal(out)
+	}
+	shown := h.mustRun("bill", "show", "c1", "2026-09")
+	if !strings.Contains(shown, "当前应付：700 分") {
+		t.Fatalf("重放导致重复计入:\n%s", shown)
+	}
+
+	// 任一字段不同均拒绝：金额、原因、跨客户、跨月份。
+	h.runExpectErr("bill", "adjust", "c1", "2026-09", "adj-1", "600", "补录")
+	h.runExpectErr("bill", "adjust", "c1", "2026-09", "adj-1", "500", "其他原因")
+	h.runExpectErr("bill", "adjust", "c2", "2026-09", "adj-1", "500", "补录")
+	settleOne(h, "c1", "2026-10", "1")
+	h.runExpectErr("bill", "adjust", "c1", "2026-10", "adj-1", "500", "补录")
+}
+
+func TestAdjustPayableBounds(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("customer", "add", "c1", "甲方", "100")
+	settleOne(h, "c1", "2026-09", "2") // 总金额 200
+
+	// 减免使应付变负：拒绝，且不占用标识。
+	msg := h.runExpectErr("bill", "adjust", "c1", "2026-09", "adj-neg", "-201", "超额减免")
+	if !strings.Contains(msg, "小于 0") {
+		t.Fatal(msg)
+	}
+	h.mustRun("bill", "adjust", "c1", "2026-09", "adj-neg", "-200", "全额减免") // 恰好为 0 合法
+	out := h.mustRun("bill", "show", "c1", "2026-09")
+	if !strings.Contains(out, "当前应付：0 分") {
+		t.Fatal(out)
+	}
+
+	// 补收使应付溢出 int64：拒绝。
+	h.mustRun("customer", "add", "rich", "巨款客户", "9223372036854775800")
+	settleOne(h, "rich", "2026-09", "1")
+	msg = h.runExpectErr("bill", "adjust", "rich", "2026-09", "adj-big", "100", "补收")
+	if !strings.Contains(msg, "溢出") {
+		t.Fatal(msg)
+	}
+	// 界内最大补收合法。
+	h.mustRun("bill", "adjust", "rich", "2026-09", "adj-big", "7", "补收")
+	out = h.mustRun("bill", "show", "rich", "2026-09")
+	if !strings.Contains(out, "当前应付：9223372036854775807 分") {
+		t.Fatal(out)
+	}
+}
+
+func TestRevokeFlow(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("customer", "add", "c1", "甲方", "100")
+	settleOne(h, "c1", "2026-09", "10") // 总金额 1000
+	h.mustRun("bill", "adjust", "c1", "2026-09", "adj-1", "500", "补录")
+	h.mustRun("bill", "adjust", "c1", "2026-09", "adj-2", "-100", "补偿")
+
+	// 撤销目标不存在。
+	h.runExpectErr("bill", "revoke", "adj-ghost", "原因")
+	// 空撤销原因。
+	h.runExpectErr("bill", "revoke", "adj-1", "")
+	h.runExpectErr("bill", "revoke", "adj-1", "  ")
+
+	// 撤销 adj-1：应付 1500 -> 900，其他调整不受影响。
+	out := h.mustRun("bill", "revoke", "adj-1", "重复录入")
+	if !strings.Contains(out, "当前应付 900 分") {
+		t.Fatal(out)
+	}
+	shown := h.mustRun("bill", "show", "c1", "2026-09")
+	for _, want := range []string{
+		"调整净额：-100 分", "当前应付：900 分",
+		"调整标识=adj-1", "状态=已撤销（撤销原因=\"重复录入\"）",
+		"调整标识=adj-2", "状态=生效中",
+	} {
+		if !strings.Contains(shown, want) {
+			t.Fatalf("账单展示缺少 %q:\n%s", want, shown)
+		}
+	}
+
+	// 相同标识 + 相同原因重复撤销：幂等成功，不新增记录。
+	out = h.mustRun("bill", "revoke", "adj-1", "重复录入")
+	if !strings.Contains(out, "幂等") {
+		t.Fatal(out)
+	}
+	// 改用其他原因：拒绝。
+	h.runExpectErr("bill", "revoke", "adj-1", "换个理由")
+
+	// 撤销后重放原调整：返回已撤销状态，不重新生效。
+	out = h.mustRun("bill", "adjust", "c1", "2026-09", "adj-1", "500", "补录")
+	if !strings.Contains(out, "幂等") || !strings.Contains(out, "状态=已撤销") {
+		t.Fatal(out)
+	}
+	shown = h.mustRun("bill", "show", "c1", "2026-09")
+	if !strings.Contains(shown, "当前应付：900 分") {
+		t.Fatalf("已撤销调整被重新生效:\n%s", shown)
+	}
+}
+
+func TestRevokeOutOfBoundsRejectedAndRetryable(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("customer", "add", "c1", "甲方", "1")
+	settleOne(h, "c1", "2026-09", "100")                                // 总金额 100
+	h.mustRun("bill", "adjust", "c1", "2026-09", "adj-a", "50", "补收")   // 应付 150
+	h.mustRun("bill", "adjust", "c1", "2026-09", "adj-b", "-120", "减免") // 应付 30
+
+	// 撤销 adj-a 后应付将为 -20：拒绝，adj-a 保持有效。
+	msg := h.runExpectErr("bill", "revoke", "adj-a", "撤销补收")
+	if !strings.Contains(msg, "越界") || !strings.Contains(msg, "仍有效") {
+		t.Fatal(msg)
+	}
+	shown := h.mustRun("bill", "show", "c1", "2026-09")
+	if !strings.Contains(shown, "当前应付：30 分") {
+		t.Fatalf("被拒的撤销改变了应付:\n%s", shown)
+	}
+
+	// 其他合法调整改变余额后可重试：+100 后应付 130，撤销 adj-a 得 80。
+	h.mustRun("bill", "adjust", "c1", "2026-09", "adj-c", "100", "补收")
+	out := h.mustRun("bill", "revoke", "adj-a", "撤销补收")
+	if !strings.Contains(out, "当前应付 80 分") {
+		t.Fatal(out)
+	}
+}
+
+func TestAdjustPersistenceAcrossInvocations(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("customer", "add", "c1", "甲方", "100")
+	settleOne(h, "c1", "2026-09", "10")
+	h.mustRun("bill", "adjust", "c1", "2026-09", "adj-1", "500", "补录")
+	h.mustRun("bill", "revoke", "adj-1", "录入错误")
+
+	// 全新 harness 指向同一目录：记录、顺序、重复判断与撤销约束保持。
+	h2 := &harness{t: t, dir: h.dir}
+	prev := stdout
+	stdout = &h2.buf
+	defer func() { stdout = prev }()
+
+	out, err := h2.run("bill", "show", "c1", "2026-09")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "状态=已撤销") || !strings.Contains(out, "当前应付：1000 分") {
+		t.Fatal(out)
+	}
+	// 跨“进程”重复判断仍生效。
+	if _, err := h2.run("bill", "adjust", "c1", "2026-09", "adj-1", "600", "补录"); err == nil {
+		t.Fatal("跨进程标识冲突未被拒绝")
+	}
+	if _, err := h2.run("bill", "revoke", "adj-1", "其他原因"); err == nil {
+		t.Fatal("跨进程撤销原因冲突未被拒绝")
+	}
+}
+
+func TestOldStateFileWithoutAdjustmentsLoads(t *testing.T) {
+	h := newHarness(t)
+	// 手写一份不含调整字段的旧格式数据文件（一次完整结算后的状态）。
+	old := `{
+  "version": 1,
+  "customers": {"c1": {"id": "c1", "name": "甲方", "price_fen": 100}},
+  "usage": {"u1": {"id": "u1", "customer_id": "c1", "time": "2026-09-15T10:00:00Z", "quantity": 2}},
+  "bills": {"c1|2026-09": {
+    "id": "BILL-old", "customer_id": "c1", "month": "2026-09",
+    "total_quantity": 2, "unit_price_fen": 100, "total_fee_fen": 200,
+    "lines": [{"usage_id": "u1", "time": "2026-09-15T10:00:00Z", "quantity": 2, "line_fee_fen": 200}],
+    "created_at": "2026-10-01T00:00:00Z"
+  }}
+}
+`
+	if err := os.WriteFile(h.statePath(), []byte(old), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	// 旧数据直接可读：视为零调整。
+	out := h.mustRun("bill", "show", "c1", "2026-09")
+	if !strings.Contains(out, "调整净额：0 分") ||
+		!strings.Contains(out, "当前应付：200 分") ||
+		!strings.Contains(out, "调整记录：无") {
+		t.Fatal(out)
+	}
+
+	// 旧库上可正常登记调整并持久化。
+	h.mustRun("bill", "adjust", "c1", "2026-09", "adj-1", "50", "补录")
+	out = h.mustRun("bill", "show", "c1", "2026-09")
+	if !strings.Contains(out, "当前应付：250 分") {
+		t.Fatal(out)
+	}
+}
+
+func TestCorruptAdjustmentDataRejected(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("customer", "add", "c1", "甲方", "100")
+	settleOne(h, "c1", "2026-09", "2")
+	h.mustRun("bill", "adjust", "c1", "2026-09", "adj-1", "50", "补录")
+	good, err := os.ReadFile(h.statePath())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// 调整引用失效（指向不存在的账单）：按损坏处理，原文件保留。
+	broken := strings.Replace(string(good), `"month": "2026-09"`, `"month": "2027-01"`, 1)
+	if broken == string(good) {
+		t.Fatal("替换未生效")
+	}
+	if err := os.WriteFile(h.statePath(), []byte(broken), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	msg := h.runExpectErr("bill", "show", "c1", "2026-09")
+	if !strings.Contains(msg, "损坏") {
+		t.Fatal(msg)
+	}
+	got, err := os.ReadFile(h.statePath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != broken {
+		t.Fatal("损坏文件被改写")
+	}
+}

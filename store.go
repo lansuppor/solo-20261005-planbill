@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"time"
 )
 
@@ -51,12 +52,30 @@ type bill struct {
 	CreatedAt  string     `json:"created_at"`
 }
 
+// adjustment 是作用于已结算账单的一笔费用调整：
+// 正数金额为补收，负数为减免。撤销只取消金额影响，记录永久保留。
+type adjustment struct {
+	ID           string `json:"id"`          // 全局唯一调整标识，非空
+	CustomerID   string `json:"customer_id"` // 所属账单的客户与月份
+	Month        string `json:"month"`
+	Amount       int64  `json:"amount_fen"` // 非零；正补收、负减免
+	Reason       string `json:"reason"`     // 非空
+	Seq          int64  `json:"seq"`        // 成功操作顺序号（全局递增）
+	CreatedAt    string `json:"created_at"`
+	Revoked      bool   `json:"revoked"`
+	RevokeReason string `json:"revoke_reason,omitempty"` // 撤销时必填
+	RevokeSeq    int64  `json:"revoke_seq,omitempty"`
+	RevokedAt    string `json:"revoked_at,omitempty"`
+}
+
 type state struct {
-	Version   int                     `json:"version"`
-	Customers map[string]*customer    `json:"customers"`
-	Usage     map[string]*usageRecord `json:"usage"` // 全局唯一用量标识 -> 记录
-	Bills     map[string]*bill        `json:"bills"` // 客户 + "|" + 月份 -> 账单
-	path      string                  `json:"-"`
+	Version     int                     `json:"version"`
+	Customers   map[string]*customer    `json:"customers"`
+	Usage       map[string]*usageRecord `json:"usage"`       // 全局唯一用量标识 -> 记录
+	Bills       map[string]*bill        `json:"bills"`       // 客户 + "|" + 月份 -> 账单
+	Adjustments map[string]*adjustment  `json:"adjustments"` // 全局唯一调整标识 -> 记录
+	NextSeq     int64                   `json:"next_seq"`    // 已发放的最大操作顺序号
+	path        string                  `json:"-"`
 }
 
 // loadStore 读取数据目录；目录不存在时按需创建并视为空库。
@@ -83,6 +102,10 @@ func loadStore(dir string) (*state, error) {
 	if dec.More() {
 		return nil, fmt.Errorf("数据文件已损坏（JSON 之后存在多余内容）: %s", p)
 	}
+	// 旧数据文件可能不含调整相关字段：视为零调整，顺序号从零开始。
+	if s.Adjustments == nil {
+		s.Adjustments = map[string]*adjustment{}
+	}
 	if err := s.validate(); err != nil {
 		return nil, fmt.Errorf("数据文件已损坏: %w", err)
 	}
@@ -92,11 +115,12 @@ func loadStore(dir string) (*state, error) {
 
 func newState(p string) *state {
 	return &state{
-		Version:   stateVersion,
-		Customers: map[string]*customer{},
-		Usage:     map[string]*usageRecord{},
-		Bills:     map[string]*bill{},
-		path:      p,
+		Version:     stateVersion,
+		Customers:   map[string]*customer{},
+		Usage:       map[string]*usageRecord{},
+		Bills:       map[string]*bill{},
+		Adjustments: map[string]*adjustment{},
+		path:        p,
 	}
 }
 
@@ -216,6 +240,50 @@ func (s *state) validate() error {
 			}
 		}
 	}
+	for id, a := range s.Adjustments {
+		if a == nil {
+			return fmt.Errorf("调整 %q 的数据为空", id)
+		}
+		if a.ID != id {
+			return fmt.Errorf("调整标识不一致: 键 %q / 记录 %q", id, a.ID)
+		}
+		if a.ID == "" {
+			return errors.New("存在空的调整标识")
+		}
+		if _, ok := s.Customers[a.CustomerID]; !ok {
+			return fmt.Errorf("调整 %q 引用了不存在的客户 %q", a.ID, a.CustomerID)
+		}
+		if !validMonth(a.Month) {
+			return fmt.Errorf("调整 %q 的月份无效", a.ID)
+		}
+		if _, ok := s.Bills[billKey(a.CustomerID, a.Month)]; !ok {
+			return fmt.Errorf("调整 %q 引用了不存在的账单（客户 %s 月份 %s）", a.ID, a.CustomerID, a.Month)
+		}
+		if a.Amount == 0 {
+			return fmt.Errorf("调整 %q 的金额为零", a.ID)
+		}
+		if a.Reason == "" {
+			return fmt.Errorf("调整 %q 的原因为空", a.ID)
+		}
+		if a.Seq <= 0 {
+			return fmt.Errorf("调整 %q 的操作顺序号无效", a.ID)
+		}
+		if a.Revoked {
+			if a.RevokeReason == "" {
+				return fmt.Errorf("调整 %q 已撤销但撤销原因为空", a.ID)
+			}
+			if a.RevokeSeq <= 0 {
+				return fmt.Errorf("调整 %q 的撤销顺序号无效", a.ID)
+			}
+		}
+	}
+	// 每张账单的当前应付（原总金额 + 全部未撤销调整）必须可由记录
+	// 重算且介于 0 与有符号 64 位最大值之间，否则视为金额与记录不一致。
+	for key, b := range s.Bills {
+		if _, err := currentPayable(b, adjustmentsFor(s, b.CustomerID, b.Month)); err != nil {
+			return fmt.Errorf("账单 %q 的金额与调整记录不一致: %w", key, err)
+		}
+	}
 	return nil
 }
 
@@ -269,4 +337,56 @@ func billKey(customerID, month string) string {
 func (s *state) sealed(customerID, month string) bool {
 	_, ok := s.Bills[billKey(customerID, month)]
 	return ok
+}
+
+// adjustmentsFor 返回某客户某月份账单名下的全部调整（含已撤销），
+// 按成功操作顺序号升序排列。
+func adjustmentsFor(s *state, customerID, month string) []*adjustment {
+	var out []*adjustment
+	for _, a := range s.Adjustments {
+		if a.CustomerID == customerID && a.Month == month {
+			out = append(out, a)
+		}
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].Seq < out[j].Seq })
+	return out
+}
+
+// netAdjustments 汇总全部未撤销调整的净额（分）。正、负分别累加再做
+// 一次有符号合并，避免求和顺序引入虚假溢出；任何一步真溢出都报错。
+func netAdjustments(adjs []*adjustment) (int64, error) {
+	var pos, neg int64
+	for _, a := range adjs {
+		if a.Revoked {
+			continue
+		}
+		var err error
+		if a.Amount > 0 {
+			pos, err = add64(pos, a.Amount)
+		} else {
+			neg, err = addSigned64(neg, a.Amount)
+		}
+		if err != nil {
+			return 0, err
+		}
+	}
+	// pos ∈ [0, MaxInt64]，neg ∈ [MinInt64, 0]，二者之和不会溢出。
+	return pos + neg, nil
+}
+
+// currentPayable 计算账单的当前应付：原总金额 + 全部未撤销调整金额。
+// 结果必须介于 0 与有符号 64 位最大值之间，否则报错；全程整数运算。
+func currentPayable(b *bill, adjs []*adjustment) (int64, error) {
+	net, err := netAdjustments(adjs)
+	if err != nil {
+		return 0, err
+	}
+	pay, err := addSigned64(b.TotalFee, net)
+	if err != nil {
+		return 0, err
+	}
+	if pay < 0 {
+		return 0, fmt.Errorf("当前应付 %d 分小于 0", pay)
+	}
+	return pay, nil
 }

@@ -58,7 +58,7 @@ func runCmd(args []string, dataDir string) error {
 
 	case "bill":
 		if len(args) < 2 {
-			return usageError("缺少子命令，应为：bill settle|show <客户标识> <YYYY-MM>")
+			return usageError("缺少子命令，应为：bill settle|show <客户标识> <YYYY-MM>、bill adjust <客户标识> <YYYY-MM> <调整标识> <金额分> <原因>、bill revoke <调整标识> <原因>")
 		}
 		switch args[1] {
 		case "settle":
@@ -71,8 +71,18 @@ func runCmd(args []string, dataDir string) error {
 				return usageError("用法：bill show <客户标识> <YYYY-MM>")
 			}
 			return cmdBillShow(dataDir, args[2], args[3])
+		case "adjust":
+			if len(args) != 7 {
+				return usageError("用法：bill adjust <客户标识> <YYYY-MM> <调整标识> <金额分> <原因>")
+			}
+			return cmdBillAdjust(dataDir, args[2], args[3], args[4], args[5], args[6])
+		case "revoke":
+			if len(args) != 4 {
+				return usageError("用法：bill revoke <调整标识> <原因>")
+			}
+			return cmdBillRevoke(dataDir, args[2], args[3])
 		default:
-			return usageError("未知 bill 子命令 %q；可用：settle、show", args[1])
+			return usageError("未知 bill 子命令 %q；可用：settle、show、adjust、revoke", args[1])
 		}
 
 	default:
@@ -347,9 +357,9 @@ func cmdBillSettle(dir, customerID, month string) error {
 	key := billKey(customerID, month)
 	if existing, ok := s.Bills[key]; ok {
 		// 幂等：同一客户同一月份重复结算，直接返回原账单，
-		// 不重新计费、不产生新账单、不落盘。
+		// 不重新计费、不产生新账单或调整、不落盘。
 		fmt.Fprintf(stdout, "客户 %s 的 %s 已结算，返回原账单（幂等，不重新计费）：\n\n", customerID, month)
-		printBill(existing, cust)
+		printBill(existing, cust, adjustmentsFor(s, customerID, month))
 		return nil
 	}
 
@@ -406,7 +416,7 @@ func cmdBillSettle(dir, customerID, month string) error {
 		return err
 	}
 	fmt.Fprintf(stdout, "结算完成，客户 %s 的 %s 已封账：\n\n", customerID, month)
-	printBill(b, cust)
+	printBill(b, cust, nil)
 	return nil
 }
 
@@ -426,7 +436,169 @@ func cmdBillShow(dir, customerID, month string) error {
 	if !ok {
 		return fmt.Errorf("客户 %s 的 %s 尚无账单（未结算）", customerID, month)
 	}
-	printBill(b, cust)
+	printBill(b, cust, adjustmentsFor(s, customerID, month))
+	return nil
+}
+
+// parseAmount 解析调整金额：有符号 64 位整数分，非零（正数补收、负数减免）。
+func parseAmount(text string) (int64, error) {
+	text = strings.TrimSpace(text)
+	amount, err := strconv.ParseInt(text, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("调整金额 %q 不是有符号 64 位整数范围内的整数: %w", text, err)
+	}
+	if amount == 0 {
+		return 0, fmt.Errorf("调整金额必须是非零整数分（正数补收、负数减免）")
+	}
+	return amount, nil
+}
+
+// adjustKind 返回调整方向的中文描述。
+func adjustKind(amount int64) string {
+	if amount < 0 {
+		return "减免"
+	}
+	return "补收"
+}
+
+func cmdBillAdjust(dir, customerID, month, adjID, amountText, reason string) error {
+	if !validMonth(month) {
+		return fmt.Errorf("月份 %q 无效，必须是 YYYY-MM 形式（如 2026-09）", month)
+	}
+	if strings.TrimSpace(adjID) == "" {
+		return fmt.Errorf("调整标识不能为空")
+	}
+	amount, err := parseAmount(amountText)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(reason) == "" {
+		return fmt.Errorf("调整原因不能为空")
+	}
+
+	s, err := loadStore(dir)
+	if err != nil {
+		return err
+	}
+	if _, ok := s.Customers[customerID]; !ok {
+		return fmt.Errorf("客户标识 %q 不存在", customerID)
+	}
+	b, ok := s.Bills[billKey(customerID, month)]
+	if !ok {
+		return fmt.Errorf("客户 %s 的 %s 尚无账单（未结算），费用调整只能作用于已存在账单", customerID, month)
+	}
+
+	// 调整标识全局唯一：按（客户、月份、金额、原因）判定内容是否相同。
+	if existing, ok := s.Adjustments[adjID]; ok {
+		if existing.CustomerID == customerID && existing.Month == month &&
+			existing.Amount == amount && existing.Reason == reason {
+			// 内容完全相同的重放：返回已保存记录，不再增减应付；
+			// 已撤销的调整保持已撤销状态，不会重新生效。
+			fmt.Fprintf(stdout, "调整标识 %q 已存在且内容相同，返回已保存记录（幂等，不重复计入）：\n\n", adjID)
+			fmt.Fprintln(stdout, formatAdjustment(existing))
+			return nil
+		}
+		return fmt.Errorf("调整标识 %q 已存在但内容不同（已有客户=%s 月份=%s 金额=%d 原因=%q），拒绝复用",
+			adjID, existing.CustomerID, existing.Month, existing.Amount, existing.Reason)
+	}
+
+	// 应付可行性预检：原总金额 + 全部未撤销调整 + 本笔，必须落在
+	// [0, MaxInt64]；任何失败都不占用该调整标识。
+	adjs := adjustmentsFor(s, customerID, month)
+	pay, err := currentPayable(b, adjs)
+	if err != nil {
+		return fmt.Errorf("账单当前应付异常，拒绝登记调整: %w", err)
+	}
+	newPay, err := addSigned64(pay, amount)
+	switch {
+	case err != nil:
+		return fmt.Errorf("调整后当前应付溢出有符号 64 位整数范围（当前 %d + 本笔 %d），拒绝登记", pay, amount)
+	case newPay < 0:
+		return fmt.Errorf("调整后当前应付将为 %d 分（小于 0），拒绝登记", newPay)
+	}
+
+	s.NextSeq++
+	adj := &adjustment{
+		ID:         adjID,
+		CustomerID: customerID,
+		Month:      month,
+		Amount:     amount,
+		Reason:     reason,
+		Seq:        s.NextSeq,
+		CreatedAt:  time.Now().UTC().Format(time.RFC3339),
+	}
+	s.Adjustments[adjID] = adj
+
+	// 调整记录与金额状态在同一次原子保存中持久化；保存失败则一切不生效。
+	if err := s.save(); err != nil {
+		delete(s.Adjustments, adjID)
+		s.NextSeq--
+		return err
+	}
+	fmt.Fprintf(stdout, "已登记费用调整（%s）：账单 %s 调整标识=%s 金额=%+d 分（%s）原因=%q\n",
+		adjustKind(amount), b.ID, adjID, amount, moneyFen(amount), reason)
+	fmt.Fprintf(stdout, "当前应付 %d 分（%s）\n", newPay, moneyFen(newPay))
+	return nil
+}
+
+func cmdBillRevoke(dir, adjID, reason string) error {
+	if strings.TrimSpace(adjID) == "" {
+		return fmt.Errorf("调整标识不能为空")
+	}
+	if strings.TrimSpace(reason) == "" {
+		return fmt.Errorf("撤销原因不能为空")
+	}
+
+	s, err := loadStore(dir)
+	if err != nil {
+		return err
+	}
+	adj, ok := s.Adjustments[adjID]
+	if !ok {
+		return fmt.Errorf("撤销目标不存在：调整标识 %q 没有记录", adjID)
+	}
+
+	if adj.Revoked {
+		if adj.RevokeReason == reason {
+			// 相同标识 + 相同原因的重复撤销：幂等成功，不新增记录。
+			fmt.Fprintf(stdout, "调整 %q 已撤销且撤销原因相同，返回原记录（幂等，不新增记录）：\n\n", adjID)
+			fmt.Fprintln(stdout, formatAdjustment(adj))
+			return nil
+		}
+		return fmt.Errorf("调整 %q 已撤销（撤销原因 %q），改用其他原因 %q 重复撤销被拒绝", adjID, adj.RevokeReason, reason)
+	}
+
+	// 模拟撤销本笔后的应付：越界则拒绝，该调整保持有效，
+	// 可在其他合法调整改变余额后重试。
+	b := s.Bills[billKey(adj.CustomerID, adj.Month)] // 载入校验保证存在
+	var remaining []*adjustment
+	for _, a := range adjustmentsFor(s, adj.CustomerID, adj.Month) {
+		if a.ID != adjID {
+			remaining = append(remaining, a)
+		}
+	}
+	pay, err := currentPayable(b, remaining)
+	if err != nil {
+		return fmt.Errorf("撤销后当前应付将越界（须介于 0 与有符号 64 位最大值之间），拒绝撤销，该调整仍有效: %w", err)
+	}
+
+	s.NextSeq++
+	adj.Revoked = true
+	adj.RevokeReason = reason
+	adj.RevokeSeq = s.NextSeq
+	adj.RevokedAt = time.Now().UTC().Format(time.RFC3339)
+
+	// 撤销标记与原记录在同一次原子保存中持久化；保存失败则一切不生效。
+	if err := s.save(); err != nil {
+		adj.Revoked = false
+		adj.RevokeReason = ""
+		adj.RevokeSeq = 0
+		adj.RevokedAt = ""
+		s.NextSeq--
+		return err
+	}
+	fmt.Fprintf(stdout, "已撤销调整 %q（账单 %s，撤销原因 %q）：仅取消该笔金额影响，原记录保留\n", adjID, b.ID, reason)
+	fmt.Fprintf(stdout, "当前应付 %d 分（%s）\n", pay, moneyFen(pay))
 	return nil
 }
 
@@ -449,16 +621,43 @@ func stableBillID(customerID, month string) string {
 	return "BILL-" + hex.EncodeToString(sum[:])[:16]
 }
 
-func printBill(b *bill, cust *customer) {
+// printBill 输出账单：原账单字段（标识、客户、月份、单价、总数量、总金额、
+// 明细）保持不变，随后补充调整净额、当前应付与按成功操作顺序排列的
+// 调整/撤销历史。adjs 须已由 adjustmentsFor 按顺序取出。
+func printBill(b *bill, cust *customer, adjs []*adjustment) {
 	fmt.Fprintf(stdout, "账单标识：%s\n", b.ID)
 	fmt.Fprintf(stdout, "客户：%s（%s）\n", cust.ID, cust.Name)
 	fmt.Fprintf(stdout, "月份：%s（UTC 自然月，左闭右开）\n", b.Month)
 	fmt.Fprintf(stdout, "单价：%d 分（%s）\n", b.UnitPrice, moneyFen(b.UnitPrice))
 	fmt.Fprintf(stdout, "总数量：%d\n", b.TotalQty)
 	fmt.Fprintf(stdout, "总金额：%d 分（%s）\n", b.TotalFee, moneyFen(b.TotalFee))
-	fmt.Println("明细：")
+	fmt.Fprintln(stdout, "明细：")
 	for i, ln := range b.Lines {
 		fmt.Fprintf(stdout, "  %d. 用量标识=%s 时间=%s 数量=%d 小计=%d 分（%s）\n",
 			i+1, ln.UsageID, ln.Time, ln.Quantity, ln.LineFee, moneyFen(ln.LineFee))
 	}
+
+	// 载入校验已保证可重算且在界内，这里忽略错误仅作展示。
+	net, _ := netAdjustments(adjs)
+	pay, _ := currentPayable(b, adjs)
+	fmt.Fprintf(stdout, "调整净额：%d 分（%s）\n", net, moneyFen(net))
+	fmt.Fprintf(stdout, "当前应付：%d 分（%s）\n", pay, moneyFen(pay))
+	if len(adjs) == 0 {
+		fmt.Fprintln(stdout, "调整记录：无")
+		return
+	}
+	fmt.Fprintln(stdout, "调整记录（按成功操作顺序）：")
+	for i, a := range adjs {
+		fmt.Fprintf(stdout, "  %d. %s\n", i+1, formatAdjustment(a))
+	}
+}
+
+// formatAdjustment 渲染一笔调整的标识、金额、原因、当前状态及撤销关联。
+func formatAdjustment(a *adjustment) string {
+	status := "生效中"
+	if a.Revoked {
+		status = fmt.Sprintf("已撤销（撤销原因=%q）", a.RevokeReason)
+	}
+	return fmt.Sprintf("调整标识=%s 金额=%+d 分（%s，%s） 原因=%q 状态=%s",
+		a.ID, a.Amount, moneyFen(a.Amount), adjustKind(a.Amount), a.Reason, status)
 }
