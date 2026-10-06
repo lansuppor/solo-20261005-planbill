@@ -187,17 +187,31 @@ type planChange struct {
 	CreatedAt  string `json:"created_at"`
 }
 
+// suspension 是阶梯客户的一段按月暂停区间：自起月（UTC 自然月，含）起
+// 暂停服务，直到结束月（不含），即 [StartMonth, EndMonth) 覆盖的自然月。
+// 暂停月不接收用量、不产生月费账单；区间可相接（相接视为连续暂停）但不得
+// 重叠。记录一旦写入永不修改或删除；暂停不产生账后流水事件，也不占用全局
+// 操作序号。固定单价客户不适用暂停。
+type suspension struct {
+	CustomerID string `json:"customer_id"`
+	StartMonth string `json:"start_month"` // YYYY-MM（UTC），暂停起月（含）
+	EndMonth   string `json:"end_month"`   // YYYY-MM（UTC），结束月（不含），严格晚于起月
+	Reason     string `json:"reason"`
+	CreatedAt  string `json:"created_at"`
+}
+
 type state struct {
 	Version     int                     `json:"version"`
 	Customers   map[string]*customer    `json:"customers"`
-	Plans       map[string]*plan        `json:"plans"`        // 全局唯一方案标识 -> 阶梯计费方案
-	Usage       map[string]*usageRecord `json:"usage"`        // 全局唯一用量标识 -> 记录
-	Bills       map[string]*bill        `json:"bills"`        // 客户 + "|" + 月份 -> 账单
-	Adjustments map[string]*adjustment  `json:"adjustments"`  // 全局唯一调整标识 -> 记录
-	Payments    map[string]*payment     `json:"payments"`     // 全局唯一收款标识 -> 记录（与调整标识相互独立，可同名）
-	Corrections map[string]*correction  `json:"corrections"`  // 全局唯一更正标识 -> 记录（与收款、调整标识相互独立，可同名）
-	PlanChanges map[string]*planChange  `json:"plan_changes"` // 客户 + "|" + 生效月 -> 方案变更（按生效月递增追加，不可改写）
-	NextSeq     int64                   `json:"next_seq"`     // 已分配的最大操作序号（调整/收款/更正及其撤销共用；方案变更不占用）
+	Plans       map[string]*plan        `json:"plans"`                 // 全局唯一方案标识 -> 阶梯计费方案
+	Usage       map[string]*usageRecord `json:"usage"`                 // 全局唯一用量标识 -> 记录
+	Bills       map[string]*bill        `json:"bills"`                 // 客户 + "|" + 月份 -> 账单
+	Adjustments map[string]*adjustment  `json:"adjustments"`           // 全局唯一调整标识 -> 记录
+	Payments    map[string]*payment     `json:"payments"`              // 全局唯一收款标识 -> 记录（与调整标识相互独立，可同名）
+	Corrections map[string]*correction  `json:"corrections"`           // 全局唯一更正标识 -> 记录（与收款、调整标识相互独立，可同名）
+	PlanChanges map[string]*planChange  `json:"plan_changes"`          // 客户 + "|" + 生效月 -> 方案变更（按生效月递增追加，不可改写）
+	Suspensions map[string]*suspension  `json:"suspensions,omitempty"` // 客户 + "|" + 起月 -> 暂停区间（不可改写）
+	NextSeq     int64                   `json:"next_seq"`              // 已分配的最大操作序号（调整/收款/更正及其撤销共用；方案变更与暂停不占用）
 	path        string                  `json:"-"`
 }
 
@@ -232,7 +246,8 @@ func loadStore(dir string) (*state, error) {
 		return nil, fmt.Errorf("数据文件已损坏: %w", err)
 	}
 	// 旧版本数据文件没有 plans/adjustments/payments/corrections/plan_changes/
-	// next_seq 字段：视为零方案、零调整、零实收、零更正、零方案变更。
+	// suspensions/next_seq 字段：视为零方案、零调整、零实收、零更正、
+	// 零方案变更、零暂停。
 	if s.Plans == nil {
 		s.Plans = map[string]*plan{}
 	}
@@ -247,6 +262,9 @@ func loadStore(dir string) (*state, error) {
 	}
 	if s.PlanChanges == nil {
 		s.PlanChanges = map[string]*planChange{}
+	}
+	if s.Suspensions == nil {
+		s.Suspensions = map[string]*suspension{}
 	}
 	s.path = p
 	return &s, nil
@@ -263,6 +281,7 @@ func newState(p string) *state {
 		Payments:    map[string]*payment{},
 		Corrections: map[string]*correction{},
 		PlanChanges: map[string]*planChange{},
+		Suspensions: map[string]*suspension{},
 		path:        p,
 	}
 }
@@ -449,6 +468,57 @@ func (s *state) validate() error {
 				}
 				if !found {
 					return fmt.Errorf("客户 %s 的 %s 已封账，但用量 %q 未计入账单", b.CustomerID, b.Month, u.ID)
+				}
+			}
+		}
+	}
+
+	// 暂停区间：键、客户（须为绑定阶梯方案的客户）、区间与原因都必须自洽；
+	// 同一客户的区间不得重叠（可以相接）；暂停月内不得存在用量或账单。
+	// 旧文件缺少暂停记录视为正常服务（Suspensions 已在载入时补为空表）。
+	for key, su := range s.Suspensions {
+		if su == nil {
+			return fmt.Errorf("暂停区间 %q 的数据为空", key)
+		}
+		if suspensionKey(su.CustomerID, su.StartMonth) != key {
+			return fmt.Errorf("暂停区间键不一致: 键 %q / 客户起月 %s|%s", key, su.CustomerID, su.StartMonth)
+		}
+		c, ok := s.Customers[su.CustomerID]
+		if !ok {
+			return fmt.Errorf("暂停区间 %q 引用了不存在的客户 %q", key, su.CustomerID)
+		}
+		if c.PlanID == "" {
+			return fmt.Errorf("暂停区间 %q 的客户 %q 未绑定阶梯方案（固定单价客户不适用暂停）", key, su.CustomerID)
+		}
+		if !validMonth(su.StartMonth) {
+			return fmt.Errorf("暂停区间 %q 的起月无效", key)
+		}
+		if !validMonth(su.EndMonth) || su.EndMonth <= su.StartMonth {
+			return fmt.Errorf("暂停区间 %q 的结束月无效（结束月必须是晚于起月 %s 的 YYYY-MM）", key, su.StartMonth)
+		}
+		if strings.TrimSpace(su.Reason) == "" {
+			return fmt.Errorf("暂停区间 %q 的原因为空", key)
+		}
+	}
+	for customerID := range s.Customers {
+		list := s.suspensionsFor(customerID)
+		for i := 1; i < len(list); i++ {
+			if list[i].StartMonth < list[i-1].EndMonth {
+				return fmt.Errorf("客户 %s 的暂停区间 %s..%s 与 %s..%s 重叠（区间可以相接但不得重叠）",
+					customerID, list[i-1].StartMonth, list[i-1].EndMonth, list[i].StartMonth, list[i].EndMonth)
+			}
+		}
+		for _, su := range list {
+			for _, u := range s.Usage {
+				if u.CustomerID == customerID && monthInRange(utcMonth(u.Time), su.StartMonth, su.EndMonth) {
+					return fmt.Errorf("客户 %s 在暂停区间 %s..%s（不含结束月）内存在用量 %q（%s）",
+						customerID, su.StartMonth, su.EndMonth, u.ID, utcMonth(u.Time))
+				}
+			}
+			for _, b := range s.Bills {
+				if b.CustomerID == customerID && monthInRange(b.Month, su.StartMonth, su.EndMonth) {
+					return fmt.Errorf("客户 %s 在暂停区间 %s..%s（不含结束月）内存在账单（月份 %s），暂停月不得封账",
+						customerID, su.StartMonth, su.EndMonth, b.Month)
 				}
 			}
 		}
@@ -841,6 +911,39 @@ func billKey(customerID, month string) string {
 
 func planChangeKey(customerID, month string) string {
 	return customerID + "|" + month
+}
+
+func suspensionKey(customerID, startMonth string) string {
+	return customerID + "|" + startMonth
+}
+
+// monthInRange 判定月份 m 是否落在左闭右开区间 [start, end) 内。
+// 月份均为已校验的 YYYY-MM，字典序即时间序。
+func monthInRange(m, start, end string) bool {
+	return m >= start && m < end
+}
+
+// suspensionsFor 返回某客户的全部暂停区间，按起月升序。
+func (s *state) suspensionsFor(customerID string) []*suspension {
+	var list []*suspension
+	for _, su := range s.Suspensions {
+		if su.CustomerID == customerID {
+			list = append(list, su)
+		}
+	}
+	sort.Slice(list, func(i, j int) bool { return list[i].StartMonth < list[j].StartMonth })
+	return list
+}
+
+// isSuspendedMonth 报告某客户的指定 UTC 自然月是否处于任一暂停区间内
+// （区间包含起月、不包含结束月；相接区间视为连续暂停）。
+func (s *state) isSuspendedMonth(customerID, month string) bool {
+	for _, su := range s.Suspensions {
+		if su.CustomerID == customerID && monthInRange(month, su.StartMonth, su.EndMonth) {
+			return true
+		}
+	}
+	return false
 }
 
 // planChangesFor 返回某客户的全部方案变更，按生效月升序。

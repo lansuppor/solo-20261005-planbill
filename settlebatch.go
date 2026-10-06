@@ -76,6 +76,13 @@ func cmdBillSettleBatch(dir string, args []string) error {
 		}
 		seen[key] = pos
 
+		// 暂停月无论方案月费多少都不能结算：清单中任一项落入暂停区间，
+		// 整份清单即拒绝，不生成任何新账单或封账，也不输出部分成功报告。
+		if s.isSuspendedMonth(customerID, month) {
+			problems = append(problems, fmt.Sprintf("%s：该月处于客户的暂停区间（%s），暂停服务期间不产生月费账单",
+				where, describeSuspension(s, customerID, month)))
+			continue
+		}
 		if existing, ok := s.Bills[key]; ok {
 			// 已结算项返回原账单，不重新计费；已有账单的标识、快照、金额与
 			// 账后历史均不改变。
