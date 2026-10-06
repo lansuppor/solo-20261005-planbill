@@ -101,7 +101,7 @@ func runCmd(args []string, dataDir string) error {
 
 	case "bill":
 		if len(args) < 2 {
-			return usageError("缺少子命令，应为：bill settle|show|adjust|revoke|pay|remit|correct|unpay|ledger ...")
+			return usageError("缺少子命令，应为：bill settle|settle-batch|show|adjust|revoke|pay|remit|correct|unpay|ledger ...")
 		}
 		switch args[1] {
 		case "settle":
@@ -109,6 +109,8 @@ func runCmd(args []string, dataDir string) error {
 				return usageError("用法：bill settle <客户标识> <YYYY-MM>")
 			}
 			return cmdBillSettle(dataDir, args[2], args[3])
+		case "settle-batch":
+			return cmdBillSettleBatch(dataDir, args[2:])
 		case "show":
 			if len(args) != 4 {
 				return usageError("用法：bill show <客户标识> <YYYY-MM>")
@@ -154,7 +156,7 @@ func runCmd(args []string, dataDir string) error {
 			}
 			return cmdBillLedger(dataDir, args[2], args[3], cutoff, hasCutoff)
 		default:
-			return usageError("未知 bill 子命令 %q；可用：settle、show、adjust、revoke、pay、remit、correct、unpay、ledger", args[1])
+			return usageError("未知 bill 子命令 %q；可用：settle、settle-batch、show、adjust、revoke、pay、remit、correct、unpay、ledger", args[1])
 		}
 
 	default:
@@ -455,54 +457,19 @@ func cmdBillSettle(dir, customerID, month string) error {
 	}
 
 	// 归集该客户 UTC 自然月内的全部用量，区间为左闭右开 [月初, 下月初)。
-	var inMonthRecs []*usageRecord
-	for _, u := range s.Usage {
-		if u.CustomerID == customerID && inMonth(u.Time, month) {
-			inMonthRecs = append(inMonthRecs, u)
-		}
-	}
+	inMonthRecs := monthUsage(s, customerID, month)
 	if len(inMonthRecs) == 0 {
 		return fmt.Errorf("客户 %s 在 %s 没有用量，拒绝结算且不封账", customerID, month)
 	}
-	sortByInstant(inMonthRecs)
 
 	// 绑定阶梯方案的客户走按月累计分档计价；固定单价客户保持原路径。
 	if cust.PlanID != "" {
 		return settleTiered(s, cust, month, inMonthRecs)
 	}
 
-	lines := make([]billLine, 0, len(inMonthRecs))
-	var totalQty, totalFee int64
-	for _, u := range inMonthRecs {
-		lineFee, err := mul64(u.Quantity, cust.Price)
-		if err != nil {
-			return fmt.Errorf("用量 %s：数量 %d × 单价 %d 金额溢出，拒绝结算且不封账", u.ID, u.Quantity, cust.Price)
-		}
-		totalQty, err = add64(totalQty, u.Quantity)
-		if err != nil {
-			return fmt.Errorf("汇总数量溢出有符号 64 位整数范围，拒绝结算且不封账")
-		}
-		totalFee, err = add64(totalFee, lineFee)
-		if err != nil {
-			return fmt.Errorf("汇总金额溢出有符号 64 位整数范围，拒绝结算且不封账")
-		}
-		lines = append(lines, billLine{
-			UsageID:  u.ID,
-			Time:     u.Time,
-			Quantity: u.Quantity,
-			LineFee:  lineFee,
-		})
-	}
-
-	b := &bill{
-		ID:         stableBillID(customerID, month),
-		CustomerID: customerID,
-		Month:      month,
-		TotalQty:   totalQty,
-		UnitPrice:  cust.Price,
-		TotalFee:   totalFee,
-		Lines:      lines,
-		CreatedAt:  time.Now().UTC().Format(time.RFC3339),
+	b, err := buildFixedBill(cust, month, inMonthRecs)
+	if err != nil {
+		return fmt.Errorf("%v，拒绝结算且不封账", err)
 	}
 	s.Bills[key] = b
 
@@ -534,6 +501,54 @@ func cmdBillShow(dir, customerID, month string) error {
 	}
 	printBill(b, cust, s)
 	return nil
+}
+
+// monthUsage 归集客户在某 UTC 自然月（左闭右开 [月初, 下月初)）内的全部
+// 用量，并按计价顺序（解析后的时间点升序、同一时间按标识字典序）排列。
+func monthUsage(s *state, customerID, month string) []*usageRecord {
+	var recs []*usageRecord
+	for _, u := range s.Usage {
+		if u.CustomerID == customerID && inMonth(u.Time, month) {
+			recs = append(recs, u)
+		}
+	}
+	sortByInstant(recs)
+	return recs
+}
+
+// buildFixedBill 为固定单价客户构造账单（不落盘）：逐条 数量×单价 并汇总，
+// 全程整数运算，任何一步溢出都返回错误。recs 须已按计价顺序排列。
+func buildFixedBill(cust *customer, month string, recs []*usageRecord) (*bill, error) {
+	lines := make([]billLine, 0, len(recs))
+	var totalQty, totalFee int64
+	for _, u := range recs {
+		lineFee, err := mul64(u.Quantity, cust.Price)
+		if err != nil {
+			return nil, fmt.Errorf("用量 %s：数量 %d × 单价 %d 金额溢出", u.ID, u.Quantity, cust.Price)
+		}
+		if totalQty, err = add64(totalQty, u.Quantity); err != nil {
+			return nil, fmt.Errorf("汇总数量溢出有符号 64 位整数范围")
+		}
+		if totalFee, err = add64(totalFee, lineFee); err != nil {
+			return nil, fmt.Errorf("汇总金额溢出有符号 64 位整数范围")
+		}
+		lines = append(lines, billLine{
+			UsageID:  u.ID,
+			Time:     u.Time,
+			Quantity: u.Quantity,
+			LineFee:  lineFee,
+		})
+	}
+	return &bill{
+		ID:         stableBillID(cust.ID, month),
+		CustomerID: cust.ID,
+		Month:      month,
+		TotalQty:   totalQty,
+		UnitPrice:  cust.Price,
+		TotalFee:   totalFee,
+		Lines:      lines,
+		CreatedAt:  time.Now().UTC().Format(time.RFC3339),
+	}, nil
 }
 
 func sortByInstant(us []*usageRecord) {
