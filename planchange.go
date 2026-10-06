@@ -109,7 +109,7 @@ func printPlanChange(ch *planChange, s *state) {
 	p := s.Plans[ch.PlanID] // 载入时已校验存在
 	fmt.Fprintf(stdout, "客户：%s\n", ch.CustomerID)
 	fmt.Fprintf(stdout, "生效月：%s（UTC 自然月，含；之前月份不受影响）\n", ch.Month)
-	fmt.Fprintf(stdout, "目标方案：%s（%s）：规则 %s\n", p.ID, p.Name, formatTiers(p.Tiers))
+	fmt.Fprintf(stdout, "目标方案：%s（%s）：规则 %s，月费 %d 分\n", p.ID, p.Name, formatTiers(p.Tiers), p.MonthlyFee)
 	fmt.Fprintf(stdout, "原因：%s\n", ch.Reason)
 }
 
@@ -135,8 +135,8 @@ func cmdPlanSchedule(dir, customerID, month string, hasMonth bool) error {
 	}
 	initial := s.Plans[cust.PlanID] // 载入时已校验存在
 	fmt.Fprintf(stdout, "客户：%s（%s）\n", cust.ID, cust.Name)
-	fmt.Fprintf(stdout, "初始方案：%s（%s）：规则 %s（创建时绑定，永久保留）\n",
-		initial.ID, initial.Name, formatTiers(initial.Tiers))
+	fmt.Fprintf(stdout, "初始方案：%s（%s）：规则 %s，月费 %d 分（创建时绑定，永久保留）\n",
+		initial.ID, initial.Name, formatTiers(initial.Tiers), initial.MonthlyFee)
 	changes := s.planChangesFor(customerID)
 	if len(changes) == 0 {
 		fmt.Fprintln(stdout, "方案变更：无")
@@ -144,13 +144,13 @@ func cmdPlanSchedule(dir, customerID, month string, hasMonth bool) error {
 		fmt.Fprintln(stdout, "方案变更（按生效月升序）：")
 		for i, ch := range changes {
 			p := s.Plans[ch.PlanID] // 载入时已校验存在
-			fmt.Fprintf(stdout, "  %d. 自 %s 起改用 %s（%s）：规则 %s，原因：%s\n",
-				i+1, ch.Month, p.ID, p.Name, formatTiers(p.Tiers), ch.Reason)
+			fmt.Fprintf(stdout, "  %d. 自 %s 起改用 %s（%s）：规则 %s，月费 %d 分，原因：%s\n",
+				i+1, ch.Month, p.ID, p.Name, formatTiers(p.Tiers), p.MonthlyFee, ch.Reason)
 		}
 	}
 	if hasMonth {
 		p := s.Plans[s.effectivePlanID(cust, month)] // 载入时已校验存在
-		fmt.Fprintf(stdout, "月份 %s 的有效方案：%s（%s）：规则 %s\n", month, p.ID, p.Name, formatTiers(p.Tiers))
+		fmt.Fprintf(stdout, "月份 %s 的有效方案：%s（%s）：规则 %s，月费 %d 分\n", month, p.ID, p.Name, formatTiers(p.Tiers), p.MonthlyFee)
 	}
 	return nil
 }

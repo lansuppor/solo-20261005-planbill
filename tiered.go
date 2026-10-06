@@ -148,6 +148,7 @@ func formatTiers(tiers []tier) string {
 func printPlan(p *plan) {
 	fmt.Fprintf(stdout, "方案标识：%s\n", p.ID)
 	fmt.Fprintf(stdout, "方案名称：%s\n", p.Name)
+	fmt.Fprintf(stdout, "月费：%d 分（%s，每个账期按有效方案收取一次整月月费，不按天折算）\n", p.MonthlyFee, moneyFen(p.MonthlyFee))
 	fmt.Fprintln(stdout, "阶梯规则（按 UTC 自然月累计用量分档计价，每月从零累计）：")
 	for i, t := range p.Tiers {
 		if t.Limit == 0 {
@@ -159,6 +160,38 @@ func printPlan(p *plan) {
 }
 
 func cmdPlanAdd(dir, id, name string, tierArgs []string) error {
+	return addPlan(dir, id, name, 0, tierArgs)
+}
+
+// cmdPlanAddMonthly 登记含固定月费的阶梯计费方案：月费为非负整数人民币分，
+// 省略视为 0。月费参数位于名称之后、阶梯档之前（阶梯档必含冒号，据此区分）。
+func cmdPlanAddMonthly(dir, id, name string, args []string) error {
+	var fee int64
+	if len(args) > 0 && !strings.Contains(args[0], ":") {
+		f, err := parseMonthlyFee(args[0])
+		if err != nil {
+			return err
+		}
+		fee = f
+		args = args[1:]
+	}
+	return addPlan(dir, id, name, fee, args)
+}
+
+// parseMonthlyFee 解析月费：非负整数人民币分（有符号 64 位范围内）。
+func parseMonthlyFee(text string) (int64, error) {
+	text = strings.TrimSpace(text)
+	fee, err := strconv.ParseInt(text, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("月费 %q 不是有符号 64 位整数范围内的整数: %w", text, err)
+	}
+	if fee < 0 {
+		return 0, fmt.Errorf("月费必须是非负整数分，收到 %d", fee)
+	}
+	return fee, nil
+}
+
+func addPlan(dir, id, name string, monthlyFee int64, tierArgs []string) error {
 	if strings.TrimSpace(id) == "" {
 		return fmt.Errorf("方案标识不能为空")
 	}
@@ -177,7 +210,7 @@ func cmdPlanAdd(dir, id, name string, tierArgs []string) error {
 	if _, exists := s.Plans[id]; exists {
 		return fmt.Errorf("方案标识 %q 已存在，方案创建后不可修改", id)
 	}
-	p := &plan{ID: id, Name: name, Tiers: tiers}
+	p := &plan{ID: id, Name: name, Tiers: tiers, MonthlyFee: monthlyFee}
 	s.Plans[id] = p
 
 	// 方案整体原子落盘；保存失败则一切不生效，该方案标识不被占用。
@@ -220,7 +253,7 @@ func cmdPlanList(dir string) error {
 	fmt.Fprintf(stdout, "已登记阶梯计费方案 %d 个：\n", len(ids))
 	for i, id := range ids {
 		p := s.Plans[id]
-		fmt.Fprintf(stdout, "  %d. %s（%s）：%d 档，规则 %s\n", i+1, p.ID, p.Name, len(p.Tiers), formatTiers(p.Tiers))
+		fmt.Fprintf(stdout, "  %d. %s（%s）：%d 档，规则 %s，月费 %d 分\n", i+1, p.ID, p.Name, len(p.Tiers), formatTiers(p.Tiers), p.MonthlyFee)
 	}
 	return nil
 }
@@ -281,13 +314,20 @@ func settleTiered(s *state, cust *customer, month string, recs []*usageRecord) e
 
 // buildTieredBill 为绑定阶梯方案的客户构造阶梯账单（不落盘）：采用账期月的
 // 有效方案（初始绑定被生效月不晚于账期月的最后一次变更替换）从零累计分档
-// 计价，账单保存方案标识、名称与完整规则快照。recs 须已按计价顺序排列。
-// 月累计数量、分档金额或总额溢出时返回错误。
+// 计价，账单保存方案标识、名称、完整规则与实际月费快照；原总金额等于月费加
+// 全月用量费。recs 须已按计价顺序排列，可为空（月费大于 0 时仍出账）。
+// 月累计数量、分档金额、用量费或月费加用量费溢出时返回错误。
 func buildTieredBill(s *state, cust *customer, month string, recs []*usageRecord) (*bill, error) {
 	p := s.Plans[s.effectivePlanID(cust, month)] // 载入时已校验存在
 	priced, err := tieredPrice(p.Tiers, recs)
 	if err != nil {
 		return nil, err
+	}
+	// 月费按账期有效方案收取一次整月，不按天折算；月费加全月用量费溢出
+	// 时拒绝结算。
+	total, err := add64(p.MonthlyFee, priced.totalFee)
+	if err != nil {
+		return nil, fmt.Errorf("月费 %d 分加全月用量费 %d 分溢出有符号 64 位整数范围", p.MonthlyFee, priced.totalFee)
 	}
 
 	lines := make([]billLine, len(recs))
@@ -304,7 +344,8 @@ func buildTieredBill(s *state, cust *customer, month string, recs []*usageRecord
 	for i := range p.Tiers {
 		tierTotals[i] = tierTotal{Quantity: priced.tierQty[i], Fee: priced.tierFee[i]}
 	}
-	// 账单保存方案标识、名称与完整规则快照，之后计价与校验只依赖账单自身。
+	// 账单保存方案标识、名称、完整规则与实际月费快照，之后计价与校验只
+	// 依赖账单自身。
 	tiersCopy := make([]tier, len(p.Tiers))
 	copy(tiersCopy, p.Tiers)
 	return &bill{
@@ -317,7 +358,8 @@ func buildTieredBill(s *state, cust *customer, month string, recs []*usageRecord
 		PlanTiers:  tiersCopy,
 		TierTotals: tierTotals,
 		TotalQty:   priced.totalQty,
-		TotalFee:   priced.totalFee,
+		MonthlyFee: p.MonthlyFee,
+		TotalFee:   total,
 		Lines:      lines,
 		CreatedAt:  time.Now().UTC().Format(time.RFC3339),
 	}, nil

@@ -49,7 +49,7 @@ func runCmd(args []string, dataDir string) error {
 
 	case "plan":
 		if len(args) < 2 {
-			return usageError("缺少子命令，应为：plan add|show|list|change|schedule ...")
+			return usageError("缺少子命令，应为：plan add|add-monthly|show|list|change|schedule ...")
 		}
 		switch args[1] {
 		case "add":
@@ -57,6 +57,11 @@ func runCmd(args []string, dataDir string) error {
 				return usageError("用法：plan add <标识> <名称> <上限:单价分>... <-:单价分>")
 			}
 			return cmdPlanAdd(dataDir, args[2], args[3], args[4:])
+		case "add-monthly":
+			if len(args) < 5 {
+				return usageError("用法：plan add-monthly <标识> <名称> [月费分] <上限:单价分>... <-:单价分>（月费为非负整数分，省略视为 0）")
+			}
+			return cmdPlanAddMonthly(dataDir, args[2], args[3], args[4:])
 		case "show":
 			if len(args) != 3 {
 				return usageError("用法：plan show <标识>")
@@ -82,7 +87,7 @@ func runCmd(args []string, dataDir string) error {
 			}
 			return cmdPlanSchedule(dataDir, args[2], month, hasMonth)
 		default:
-			return usageError("未知 plan 子命令 %q；可用：add、show、list、change、schedule", args[1])
+			return usageError("未知 plan 子命令 %q；可用：add、add-monthly、show、list、change、schedule", args[1])
 		}
 
 	case "usage":
@@ -458,13 +463,21 @@ func cmdBillSettle(dir, customerID, month string) error {
 
 	// 归集该客户 UTC 自然月内的全部用量，区间为左闭右开 [月初, 下月初)。
 	inMonthRecs := monthUsage(s, customerID, month)
+
+	// 绑定阶梯方案的客户走按月累计分档计价；月费大于 0 的有效方案即使
+	// 当月无用量也生成账单并封账（仅收取整月月费），月费为 0 时仍在无
+	// 用量时拒绝。固定单价客户保持原路径。
+	if cust.PlanID != "" {
+		if len(inMonthRecs) == 0 {
+			p := s.Plans[s.effectivePlanID(cust, month)] // 载入时已校验存在
+			if p.MonthlyFee == 0 {
+				return fmt.Errorf("客户 %s 在 %s 没有用量，且有效方案 %q 月费为 0，拒绝结算且不封账", customerID, month, p.ID)
+			}
+		}
+		return settleTiered(s, cust, month, inMonthRecs)
+	}
 	if len(inMonthRecs) == 0 {
 		return fmt.Errorf("客户 %s 在 %s 没有用量，拒绝结算且不封账", customerID, month)
-	}
-
-	// 绑定阶梯方案的客户走按月累计分档计价；固定单价客户保持原路径。
-	if cust.PlanID != "" {
-		return settleTiered(s, cust, month, inMonthRecs)
 	}
 
 	b, err := buildFixedBill(cust, month, inMonthRecs)
@@ -583,6 +596,9 @@ func printBill(b *bill, cust *customer, s *state) {
 		// 阶梯账单明确计价类型并展示方案与完整规则，不伪造统一单价。
 		fmt.Fprintf(stdout, "计价类型：阶梯计费（按 UTC 自然月累计用量分档计价，每月从零累计）\n")
 		fmt.Fprintf(stdout, "方案：%s（%s）\n", b.PlanID, b.PlanName)
+		if b.MonthlyFee > 0 {
+			fmt.Fprintf(stdout, "月费：%d 分（%s，按账期有效方案收取一次整月，不按天折算）\n", b.MonthlyFee, moneyFen(b.MonthlyFee))
+		}
 		fmt.Fprintln(stdout, "阶梯规则：")
 		for i, t := range b.PlanTiers {
 			if t.Limit == 0 {
@@ -595,7 +611,14 @@ func printBill(b *bill, cust *customer, s *state) {
 		fmt.Fprintf(stdout, "单价：%d 分（%s）\n", b.UnitPrice, moneyFen(b.UnitPrice))
 	}
 	fmt.Fprintf(stdout, "总数量：%d\n", b.TotalQty)
-	fmt.Fprintf(stdout, "总金额：%d 分（%s）\n", b.TotalFee, moneyFen(b.TotalFee))
+	if tiered && b.MonthlyFee > 0 {
+		// 含月费账单分别展示月费、用量费与二者之和（原总金额）。
+		usageFee := b.TotalFee - b.MonthlyFee // 载入时已校验非负
+		fmt.Fprintf(stdout, "用量费：%d 分（%s）\n", usageFee, moneyFen(usageFee))
+		fmt.Fprintf(stdout, "原总金额：%d 分（%s，月费 %d 分 + 用量费 %d 分）\n", b.TotalFee, moneyFen(b.TotalFee), b.MonthlyFee, usageFee)
+	} else {
+		fmt.Fprintf(stdout, "总金额：%d 分（%s）\n", b.TotalFee, moneyFen(b.TotalFee))
+	}
 	if tiered {
 		fmt.Fprintln(stdout, "各档合计：")
 		for i, tt := range b.TierTotals {
@@ -611,7 +634,12 @@ func printBill(b *bill, cust *customer, s *state) {
 	fmt.Fprintf(stdout, "当前应付：%d 分（%s）\n", payable, moneyFen(payable))
 	fmt.Fprintf(stdout, "实收：%d 分（%s）\n", received, moneyFen(received))
 	fmt.Fprintf(stdout, "未收余额：%d 分（%s）\n", outstanding, moneyFen(outstanding))
-	fmt.Fprintln(stdout, "明细：")
+	if len(b.Lines) == 0 {
+		// 月费大于 0 的方案允许无用量出账：总数量 0、无用量明细、用量费 0。
+		fmt.Fprintln(stdout, "明细：无（该账期无用量，仅收取整月月费）")
+	} else {
+		fmt.Fprintln(stdout, "明细：")
+	}
 	for i, ln := range b.Lines {
 		fmt.Fprintf(stdout, "  %d. 用量标识=%s 时间=%s 数量=%d 小计=%d 分（%s）\n",
 			i+1, ln.UsageID, ln.Time, ln.Quantity, ln.LineFee, moneyFen(ln.LineFee))

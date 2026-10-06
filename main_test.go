@@ -3308,3 +3308,406 @@ func TestTrailingContentAfterJSONRejected(t *testing.T) {
 	}
 	h.mustRun("plan", "list")
 }
+
+// --- 阶梯方案固定月费 ---
+
+func TestMonthlyPlanAddShowListAndSchedule(t *testing.T) {
+	h := newHarness(t)
+	// 创建含月费方案：标识、名称、阶梯规则沿用 plan add，月费为非负整数分。
+	out := h.mustRun("plan", "add-monthly", "pm", "订阅阶梯", "10000", "100:10", "-:5")
+	for _, want := range []string{"方案标识：pm", "方案名称：订阅阶梯", "月费：10000 分", "第 1 档：累计上限 100，单价 10 分", "第 2 档：累计数量无上限，单价 5 分"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("plan add-monthly 输出缺少 %q:\n%s", want, out)
+		}
+	}
+	// 省略月费视为 0。
+	h.mustRun("plan", "add-monthly", "pz", "零月费阶梯", "-:3")
+	show := h.mustRun("plan", "show", "pz")
+	if !strings.Contains(show, "月费：0 分") {
+		t.Fatalf("省略月费未按 0 处理:\n%s", show)
+	}
+	// 方案查询与列表展示月费；旧入口 plan add 创建的方案月费为 0。
+	h.mustRun("plan", "add", "p0", "旧阶梯", "-:7")
+	show = h.mustRun("plan", "show", "pm")
+	if !strings.Contains(show, "月费：10000 分") {
+		t.Fatalf("plan show 未展示月费:\n%s", show)
+	}
+	list := h.mustRun("plan", "list")
+	for _, want := range []string{"pm（订阅阶梯）：2 档，规则 100:10 -:5，月费 10000 分", "pz（零月费阶梯）：1 档，规则 -:3，月费 0 分", "p0（旧阶梯）：1 档，规则 -:7，月费 0 分"} {
+		if !strings.Contains(list, want) {
+			t.Fatalf("plan list 缺少 %q:\n%s", want, list)
+		}
+	}
+	// 客户方案安排展示月费。
+	h.mustRun("customer", "add-plan", "c1", "客户一", "pm")
+	sched := h.mustRun("plan", "schedule", "c1", "2026-09")
+	if !strings.Contains(sched, "初始方案：pm（订阅阶梯）") || !strings.Contains(sched, "月费 10000 分") {
+		t.Fatalf("方案安排未展示月费:\n%s", sched)
+	}
+}
+
+func TestMonthlyPlanAddValidation(t *testing.T) {
+	h := newHarness(t)
+	cases := [][]string{
+		{"plan", "add-monthly", "p1", "名称"},                     // 缺少阶梯（用法错误）
+		{"plan", "add-monthly", "p1", "名称", "500"},              // 只有月费没有阶梯
+		{"plan", "add-monthly", "p1", "名称", "-5", "-:3"},        // 月费为负
+		{"plan", "add-monthly", "p1", "名称", "abc", "-:3"},       // 月费非整数
+		{"plan", "add-monthly", "p1", "名称", "1.5", "-:3"},       // 月费非整数
+		{"plan", "add-monthly", "p1", "名称", "100", "0:1", "-:2"},  // 阶梯上限非正
+		{"plan", "add-monthly", "p1", "名称", "100", "100:1"},       // 最后一档有上限
+		{"plan", "add-monthly", "", "名称", "100", "-:2"},           // 空标识
+		{"plan", "add-monthly", "p1", "", "100", "-:2"},             // 空名称
+	}
+	for _, args := range cases {
+		h.runExpectErr(args...)
+	}
+	// 失败的新增不占标识：同一标识随后可正常登记。
+	if msg := h.runExpectErr("plan", "show", "p1"); !strings.Contains(msg, "不存在") {
+		t.Fatal(msg)
+	}
+	h.mustRun("plan", "add-monthly", "p1", "名称", "100", "-:2")
+	// 重复方案标识拒绝（两个入口都不可复用），月费与规则创建后不可修改。
+	h.runExpectErr("plan", "add-monthly", "p1", "另一个", "200", "-:9")
+	h.runExpectErr("plan", "add", "p1", "另一个", "-:9")
+	show := h.mustRun("plan", "show", "p1")
+	if !strings.Contains(show, "月费：100 分") || !strings.Contains(show, "单价 2 分") {
+		t.Fatalf("方案被重复登记改写:\n%s", show)
+	}
+}
+
+func TestMonthlySettleWithUsage(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("plan", "add-monthly", "pm", "订阅阶梯", "1000", "100:10", "-:5")
+	h.mustRun("customer", "add-plan", "c1", "客户一", "pm")
+	f := h.writeFile("u.csv", csvHeader+"u1,c1,2026-09-05T00:00:00Z,60\n")
+	h.mustRun("usage", "import", f)
+
+	// 原总金额 = 月费 1000 + 用量费 60×10=600 = 1600；月费不计入总数量与各档金额。
+	out := h.mustRun("bill", "settle", "c1", "2026-09")
+	for _, want := range []string{"已封账", "月费：1000 分", "总数量：60", "用量费：600 分", "原总金额：1600 分", "第 1 档：数量 60，单价 10 分，金额 600 分"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("结算输出缺少 %q:\n%s", want, out)
+		}
+	}
+	// 重复结算返回原账单，不重复收费；bill show 展示相同信息（跨进程重新载入）。
+	again := h.mustRun("bill", "settle", "c1", "2026-09")
+	if !strings.Contains(again, "已结算，返回原账单") || !strings.Contains(again, "原总金额：1600 分") {
+		t.Fatalf("重复结算异常:\n%s", again)
+	}
+	show := h.mustRun("bill", "show", "c1", "2026-09")
+	for _, want := range []string{"月费：1000 分", "用量费：600 分", "原总金额：1600 分"} {
+		if !strings.Contains(show, want) {
+			t.Fatalf("bill show 缺少 %q:\n%s", want, show)
+		}
+	}
+	// 调整、收款与流水以包含月费的原总金额为基础，仍满足 0 ≤ 实收 ≤ 应付。
+	h.mustRun("bill", "adjust", "c1", "2026-09", "adj-1", "400", "补收")
+	h.mustRun("bill", "pay", "c1", "2026-09", "pay-1", "2000", "转账")
+	show = h.mustRun("bill", "show", "c1", "2026-09")
+	for _, want := range []string{"当前应付：2000 分", "实收：2000 分", "未收余额：0 分"} {
+		if !strings.Contains(show, want) {
+			t.Fatalf("账后展示缺少 %q:\n%s", want, show)
+		}
+	}
+	ledger := h.mustRun("bill", "ledger", "c1", "2026-09")
+	if !strings.Contains(ledger, "原总金额：1600 分") || !strings.Contains(ledger, "截止时余额：应付 2000 分") || !strings.Contains(ledger, "实收 2000 分") {
+		t.Fatalf("含月费账单流水异常:\n%s", ledger)
+	}
+	// 超额收款拒绝：应付已包含月费。
+	h.runExpectErr("bill", "pay", "c1", "2026-09", "pay-2", "1", "超额")
+}
+
+func TestMonthlySettleNoUsageStillBills(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("plan", "add-monthly", "pm", "订阅阶梯", "500", "100:10", "-:5")
+	h.mustRun("customer", "add-plan", "c1", "客户一", "pm")
+
+	// 月费大于 0：无用量也生成账单并封账，总数量 0、空用量明细、用量费 0。
+	out := h.mustRun("bill", "settle", "c1", "2026-09")
+	for _, want := range []string{"已封账", "总数量：0", "月费：500 分", "用量费：0 分", "原总金额：500 分", "明细：无"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("无用量月费账单输出缺少 %q:\n%s", want, out)
+		}
+	}
+	// 重复结算返回原账单，不重复收费。
+	again := h.mustRun("bill", "settle", "c1", "2026-09")
+	if !strings.Contains(again, "已结算，返回原账单") || !strings.Contains(again, "原总金额：500 分") {
+		t.Fatalf("无用量月费账单重复结算异常:\n%s", again)
+	}
+	// 封账后新用量不得进入该月。
+	f := h.writeFile("u.csv", csvHeader+"u1,c1,2026-09-10T00:00:00Z,5\n")
+	if msg := h.runExpectErr("usage", "import", f); !strings.Contains(msg, "已封账") {
+		t.Fatalf("封账后新用量未拒绝: %s", msg)
+	}
+	// 收款以包含月费的原总金额为基础：可收足月费，超额拒绝。
+	h.mustRun("bill", "pay", "c1", "2026-09", "pay-1", "500", "转账")
+	show := h.mustRun("bill", "show", "c1", "2026-09")
+	if !strings.Contains(show, "实收：500 分") || !strings.Contains(show, "未收余额：0 分") {
+		t.Fatalf("无用量月费账单收款展示异常:\n%s", show)
+	}
+	h.runExpectErr("bill", "pay", "c1", "2026-09", "pay-2", "1", "超额")
+	// 流水以包含月费的原总金额为初始应付。
+	ledger := h.mustRun("bill", "ledger", "c1", "2026-09")
+	if !strings.Contains(ledger, "原总金额：500 分") || !strings.Contains(ledger, "截止时余额：应付 500 分") || !strings.Contains(ledger, "实收 500 分") {
+		t.Fatalf("无用量月费账单流水异常:\n%s", ledger)
+	}
+}
+
+func TestMonthlyZeroFeeAndFixedNoUsageRejected(t *testing.T) {
+	h := newHarness(t)
+	// 月费为 0（显式指定或省略）的方案无用量时仍拒绝且不封账。
+	h.mustRun("plan", "add-monthly", "pz", "零月费", "0", "-:3")
+	h.mustRun("plan", "add-monthly", "po", "省略月费", "-:4")
+	h.mustRun("customer", "add-plan", "c1", "客户一", "pz")
+	h.mustRun("customer", "add-plan", "c2", "客户二", "po")
+	h.mustRun("customer", "add", "c3", "客户三", "100")
+	for _, cust := range []string{"c1", "c2", "c3"} {
+		if msg := h.runExpectErr("bill", "settle", cust, "2026-09"); !strings.Contains(msg, "没有用量") {
+			t.Fatalf("客户 %s 无用量结算未拒绝: %s", cust, msg)
+		}
+	}
+	// 未封账：补录用量后结算成功。
+	f := h.writeFile("u.csv", csvHeader+
+		"u1,c1,2026-09-01T00:00:00Z,10\n"+
+		"u2,c2,2026-09-01T00:00:00Z,10\n"+
+		"u3,c3,2026-09-01T00:00:00Z,10\n")
+	h.mustRun("usage", "import", f)
+	for _, cust := range []string{"c1", "c2", "c3"} {
+		h.mustRun("bill", "settle", cust, "2026-09")
+	}
+}
+
+func TestMonthlySettleBatchMixed(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("plan", "add-monthly", "pm", "订阅阶梯", "500", "-:10")
+	h.mustRun("plan", "add", "p0", "旧阶梯", "-:2")
+	h.mustRun("customer", "add-plan", "c1", "客户一", "pm") // 2026-09 无用量，月费 500
+	h.mustRun("customer", "add-plan", "c2", "客户二", "p0")
+	h.mustRun("customer", "add", "c3", "客户三", "100")
+	f := h.writeFile("u.csv", csvHeader+
+		"u2,c2,2026-09-01T00:00:00Z,10\n"+
+		"u3,c3,2026-09-01T00:00:00Z,10\n"+
+		"u4,c3,2026-10-01T00:00:00Z,1\n")
+	h.mustRun("usage", "import", f)
+	// 已有账单项：c3 的 2026-10 先单独结算。
+	h.mustRun("bill", "settle", "c3", "2026-10")
+
+	// 清单混合含月费方案（无用量出账）、旧方案、固定单价与已有账单。
+	out := h.mustRun("bill", "settle-batch", "c1", "2026-09", "c2", "2026-09", "c3", "2026-09", "c3", "2026-10")
+	for _, want := range []string{"新增账单 3 张", "已有账单 1 张", "客户 c1 月份 2026-09", "原总金额 500 分", "原总金额 20 分", "原总金额 1000 分"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("批量结算输出缺少 %q:\n%s", want, out)
+		}
+	}
+	show := h.mustRun("bill", "show", "c1", "2026-09")
+	if !strings.Contains(show, "总数量：0") || !strings.Contains(show, "原总金额：500 分") {
+		t.Fatalf("批量生成的月费账单异常:\n%s", show)
+	}
+
+	// 任一项失败整批不生效：c1 的 2026-10（月费方案，可出账）与 c2 的
+	// 2026-10（旧方案无用量，失败）同批，整批拒绝，c1 的 2026-10 不封账。
+	if msg := h.runExpectErr("bill", "settle-batch", "c1", "2026-10", "c2", "2026-10"); !strings.Contains(msg, "整批未生效") {
+		t.Fatalf("混合失败清单未整批拒绝: %s", msg)
+	}
+	// c1 的 2026-10 未被封账：单独结算成功。
+	out = h.mustRun("bill", "settle", "c1", "2026-10")
+	if !strings.Contains(out, "原总金额：500 分") {
+		t.Fatalf("整批拒绝后月费账单未能单独结算:\n%s", out)
+	}
+}
+
+func TestMonthlyFeePlusUsageOverflowRejects(t *testing.T) {
+	h := newHarness(t)
+	// 月费加全月用量费溢出有符号 64 位范围时结算拒绝且不封账。
+	h.mustRun("plan", "add-monthly", "pm", "巨额月费", "9223372036854775807", "-:1")
+	h.mustRun("customer", "add-plan", "c1", "客户一", "pm")
+	f := h.writeFile("u.csv", csvHeader+"u1,c1,2026-09-01T00:00:00Z,1\n")
+	h.mustRun("usage", "import", f)
+	if msg := h.runExpectErr("bill", "settle", "c1", "2026-09"); !strings.Contains(msg, "溢出") {
+		t.Fatalf("月费加用量费溢出未拒绝: %s", msg)
+	}
+	// 不封账：同月可继续导入用量。
+	f2 := h.writeFile("u2.csv", csvHeader+"u2,c1,2026-09-02T00:00:00Z,1\n")
+	h.mustRun("usage", "import", f2)
+	// 批量结算同样拒绝且整批不生效。
+	if msg := h.runExpectErr("bill", "settle-batch", "c1", "2026-09"); !strings.Contains(msg, "溢出") {
+		t.Fatalf("批量结算溢出未拒绝: %s", msg)
+	}
+	// 单价 0 时月费不逐条累加：导入预检只看用量费，月费 + 0 不溢出，正常出账。
+	h.mustRun("plan", "add-monthly", "pz", "免费用量", "9223372036854775807", "-:0")
+	h.mustRun("customer", "add-plan", "c2", "客户二", "pz")
+	f3 := h.writeFile("u3.csv", csvHeader+"u3,c2,2026-09-01T00:00:00Z,5\n")
+	h.mustRun("usage", "import", f3)
+	out := h.mustRun("bill", "settle", "c2", "2026-09")
+	if !strings.Contains(out, "用量费：0 分") || !strings.Contains(out, "原总金额：9223372036854775807 分") {
+		t.Fatalf("零单价巨额月费账单异常:\n%s", out)
+	}
+}
+
+func TestMonthlyPlanChangeSwitchesFeeAndTiers(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("plan", "add-monthly", "p1", "旧订阅", "100", "-:10")
+	h.mustRun("plan", "add-monthly", "p2", "新订阅", "200", "-:1")
+	h.mustRun("customer", "add-plan", "c1", "客户一", "p1")
+	f := h.writeFile("u.csv", csvHeader+
+		"u1,c1,2026-10-05T00:00:00Z,10\n"+
+		"u2,c1,2026-11-05T00:00:00Z,10\n")
+	h.mustRun("usage", "import", f)
+
+	// 变更前结算 2026-10：月费 100 + 用量费 100 = 200。
+	out := h.mustRun("bill", "settle", "c1", "2026-10")
+	if !strings.Contains(out, "月费：100 分") || !strings.Contains(out, "原总金额：200 分") {
+		t.Fatalf("变更前月费账单异常:\n%s", out)
+	}
+	// 方案变更同时切换月费与阶梯规则：2026-11 起月费 200、单价 1。
+	chg := h.mustRun("plan", "change", "c1", "2026-11", "p2", "续期新订阅")
+	if !strings.Contains(chg, "月费 200 分") {
+		t.Fatalf("变更登记未展示目标方案月费:\n%s", chg)
+	}
+	out = h.mustRun("bill", "settle", "c1", "2026-11")
+	for _, want := range []string{"方案：p2（新订阅）", "月费：200 分", "用量费：10 分", "原总金额：210 分"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("变更后月费账单缺少 %q:\n%s", want, out)
+		}
+	}
+	// 历史账单不重算：2026-10 仍是旧月费与旧规则。
+	show := h.mustRun("bill", "show", "c1", "2026-10")
+	if !strings.Contains(show, "方案：p1（旧订阅）") || !strings.Contains(show, "月费：100 分") || !strings.Contains(show, "原总金额：200 分") {
+		t.Fatalf("历史月费账单被变更影响:\n%s", show)
+	}
+	// 安排查询展示各方案月费。
+	sched := h.mustRun("plan", "schedule", "c1", "2026-11")
+	if !strings.Contains(sched, "月费 100 分") || !strings.Contains(sched, "月费 200 分") {
+		t.Fatalf("方案安排未展示月费:\n%s", sched)
+	}
+	// 变更后无用量月份按新月费出账。
+	out = h.mustRun("bill", "settle", "c1", "2026-12")
+	if !strings.Contains(out, "月费：200 分") || !strings.Contains(out, "总数量：0") || !strings.Contains(out, "原总金额：200 分") {
+		t.Fatalf("变更后无用量月份未按新月费出账:\n%s", out)
+	}
+}
+
+func TestMonthlyCorruptStateRejected(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("plan", "add-monthly", "pm", "订阅阶梯", "500", "100:10", "-:5")
+	h.mustRun("customer", "add-plan", "c1", "客户一", "pm")
+	f := h.writeFile("u.csv", csvHeader+"u1,c1,2026-09-01T00:00:00Z,60\n")
+	h.mustRun("usage", "import", f)
+	h.mustRun("bill", "settle", "c1", "2026-09") // 月费 500 + 用量费 600 = 1100
+
+	good, err := os.ReadFile(h.statePath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct{ name, old, new string }{
+		{"方案月费被篡改", `"monthly_fee_fen": 500`, `"monthly_fee_fen": 501`}, // 首个出现是方案，账单快照不符
+		{"方案月费为负", `"monthly_fee_fen": 500`, `"monthly_fee_fen": -1`},
+		{"账单总金额被篡改", `"total_fee_fen": 1100`, `"total_fee_fen": 1101`}, // 不再等于月费加用量费
+		{"账单月费快照被篡改", `"monthly_fee_fen": 500,`, `"monthly_fee_fen": 600,`},
+	}
+	for _, tc := range cases {
+		broken := strings.Replace(string(good), tc.old, tc.new, 1)
+		if broken == string(good) {
+			t.Fatalf("替换 %q 未生效", tc.old)
+		}
+		if err := os.WriteFile(h.statePath(), []byte(broken), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		msg := h.runExpectErr("bill", "show", "c1", "2026-09")
+		if !strings.Contains(msg, "损坏") {
+			t.Fatalf("%s（%q）未报损坏: %s", tc.name, tc.old, msg)
+		}
+		got, _ := os.ReadFile(h.statePath())
+		if string(got) != broken {
+			t.Fatalf("%s 后文件被改写", tc.name)
+		}
+	}
+	if err := os.WriteFile(h.statePath(), good, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h.mustRun("bill", "show", "c1", "2026-09")
+}
+
+func TestMonthlyEmptyLinesBillWithZeroFeeRejected(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("plan", "add-monthly", "pm", "订阅阶梯", "500", "-:5")
+	h.mustRun("customer", "add-plan", "c1", "客户一", "pm")
+	h.mustRun("bill", "settle", "c1", "2026-09") // 无用量，仅月费 500
+
+	good, err := os.ReadFile(h.statePath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 篡改：月费与总金额都改为 0 —— 空用量明细仅月费大于 0 时合法。
+	broken := strings.ReplaceAll(string(good), `"monthly_fee_fen": 500`, `"monthly_fee_fen": 0`)
+	broken = strings.Replace(broken, `"total_fee_fen": 500`, `"total_fee_fen": 0`, 1)
+	if broken == string(good) {
+		t.Fatal("替换未生效")
+	}
+	if err := os.WriteFile(h.statePath(), []byte(broken), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if msg := h.runExpectErr("bill", "show", "c1", "2026-09"); !strings.Contains(msg, "损坏") {
+		t.Fatalf("零月费空明细账单未报损坏: %s", msg)
+	}
+	if err := os.WriteFile(h.statePath(), good, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out := h.mustRun("bill", "show", "c1", "2026-09")
+	if !strings.Contains(out, "原总金额：500 分") {
+		t.Fatalf("恢复后账单异常:\n%s", out)
+	}
+}
+
+func TestMonthlyFixedBillCarryingFeeRejected(t *testing.T) {
+	h := newHarness(t)
+	settleBill(h, "c1", "150", "6") // 固定单价账单，总金额 900
+	good, err := os.ReadFile(h.statePath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 固定单价账单不得携带月费。
+	broken := strings.Replace(string(good), `"total_fee_fen": 900`, `"monthly_fee_fen": 5, "total_fee_fen": 905`, 1)
+	if broken == string(good) {
+		t.Fatal("替换未生效")
+	}
+	if err := os.WriteFile(h.statePath(), []byte(broken), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if msg := h.runExpectErr("bill", "show", "c1", "2026-09"); !strings.Contains(msg, "损坏") {
+		t.Fatalf("固定单价账单携带月费未报损坏: %s", msg)
+	}
+	if err := os.WriteFile(h.statePath(), good, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h.mustRun("bill", "show", "c1", "2026-09")
+}
+
+func TestMonthlyOldStateReadsFeeAsZero(t *testing.T) {
+	h := newHarness(t)
+	// 旧格式存档：方案与账单均无 monthly_fee_fen 字段，按 0 读取。
+	old := `{
+  "version": 1,
+  "customers": {"c1": {"id": "c1", "name": "客户一", "price_fen": 0, "plan_id": "p1"}},
+  "plans": {"p1": {"id": "p1", "name": "阶梯", "tiers": [{"limit": 0, "price_fen": 10}]}},
+  "usage": {"u1": {"id": "u1", "customer_id": "c1", "time": "2026-09-01T00:00:00Z", "quantity": 3}},
+  "bills": {"c1|2026-09": {"id": "BILL-old", "customer_id": "c1", "month": "2026-09", "pricing": "tiered", "plan_id": "p1", "plan_name": "阶梯", "plan_tiers": [{"limit": 0, "price_fen": 10}], "tier_totals": [{"quantity": 3, "fee_fen": 30}], "total_quantity": 3, "unit_price_fen": 0, "total_fee_fen": 30, "lines": [{"usage_id": "u1", "time": "2026-09-01T00:00:00Z", "quantity": 3, "line_fee_fen": 30, "segments": [{"tier": 0, "quantity": 3, "fee_fen": 30}]}], "created_at": "2026-10-01T00:00:00Z"}}
+}
+`
+	if err := os.WriteFile(h.statePath(), []byte(old), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	show := h.mustRun("bill", "show", "c1", "2026-09")
+	if !strings.Contains(show, "总金额：30 分") {
+		t.Fatalf("旧账单重启后异常:\n%s", show)
+	}
+	plan := h.mustRun("plan", "show", "p1")
+	if !strings.Contains(plan, "月费：0 分") {
+		t.Fatalf("旧方案未按月费 0 读取:\n%s", plan)
+	}
+	// 旧方案月费为 0：新月份无用量仍拒绝结算。
+	if msg := h.runExpectErr("bill", "settle", "c1", "2026-10"); !strings.Contains(msg, "没有用量") {
+		t.Fatalf("旧方案无用量结算未拒绝: %s", msg)
+	}
+}
