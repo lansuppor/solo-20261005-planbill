@@ -259,10 +259,11 @@ func cmdCustomerAddPlan(dir, id, name, planID string) error {
 }
 
 // settleTiered 对绑定阶梯方案的客户按 UTC 自然月累计用量分档计价并封账。
+// 使用账期月份在客户方案安排中生效的方案（初始绑定 + 按月生效的变更）。
 // recs 已按计价顺序（时间点升序、同一时间按标识字典序）排列。
 // 月累计数量、分档金额或总额溢出时拒绝结算且不封账。
 func settleTiered(s *state, cust *customer, month string, recs []*usageRecord) error {
-	p := s.Plans[cust.PlanID] // 载入时已校验存在
+	p := s.Plans[s.planForMonth(cust.ID, month)] // 载入时已校验引用有效
 	priced, err := tieredPrice(p.Tiers, recs)
 	if err != nil {
 		return fmt.Errorf("客户 %s 的 %s 阶梯计价失败，拒绝结算且不封账: %w", cust.ID, month, err)

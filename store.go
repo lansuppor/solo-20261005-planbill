@@ -25,7 +25,7 @@ const stateVersion = 1
 type customer struct {
 	ID     string `json:"id"`
 	Name   string `json:"name"`
-	Price  int64  `json:"price_fen"`        // 固定单价，非负整数分，创建后不可修改
+	Price  int64  `json:"price_fen"`         // 固定单价，非负整数分，创建后不可修改
 	PlanID string `json:"plan_id,omitempty"` // 绑定的阶梯计费方案标识；空表示固定单价客户，创建后不可变更
 }
 
@@ -42,6 +42,18 @@ type plan struct {
 	ID    string `json:"id"`
 	Name  string `json:"name"`
 	Tiers []tier `json:"tiers"` // 至少一档；有限上限严格递增，最后一档无上限
+}
+
+// planChange 是阶梯客户的一次按月生效方案变更：自生效月（UTC 自然月）
+// 起改用目标方案，直到下一次变更；之前月份不受影响。以客户与生效月共同
+// 标识，只能按生效月递增追加，已有记录不可改写；不产生账后流水事件，
+// 也不占用全局操作序号。
+type planChange struct {
+	CustomerID string `json:"customer_id"`
+	Month      string `json:"month"`   // YYYY-MM（UTC），生效月
+	PlanID     string `json:"plan_id"` // 目标阶梯计费方案标识
+	Reason     string `json:"reason"`  // 非空变更原因
+	CreatedAt  string `json:"created_at"`
 }
 
 type usageRecord struct {
@@ -76,12 +88,12 @@ type billLine struct {
 type bill struct {
 	ID         string      `json:"id"`
 	CustomerID string      `json:"customer_id"`
-	Month      string      `json:"month"` // YYYY-MM（UTC）
-	Pricing    string      `json:"pricing,omitempty"`      // 计价类型：空或 fixed 为固定单价；tiered 为阶梯计费
-	PlanID     string      `json:"plan_id,omitempty"`      // 阶梯账单：方案标识
-	PlanName   string      `json:"plan_name,omitempty"`    // 阶梯账单：方案名称（快照）
-	PlanTiers  []tier      `json:"plan_tiers,omitempty"`   // 阶梯账单：完整方案规则（快照）
-	TierTotals []tierTotal `json:"tier_totals,omitempty"`  // 阶梯账单：各档实际数量与金额合计
+	Month      string      `json:"month"`                 // YYYY-MM（UTC）
+	Pricing    string      `json:"pricing,omitempty"`     // 计价类型：空或 fixed 为固定单价；tiered 为阶梯计费
+	PlanID     string      `json:"plan_id,omitempty"`     // 阶梯账单：方案标识
+	PlanName   string      `json:"plan_name,omitempty"`   // 阶梯账单：方案名称（快照）
+	PlanTiers  []tier      `json:"plan_tiers,omitempty"`  // 阶梯账单：完整方案规则（快照）
+	TierTotals []tierTotal `json:"tier_totals,omitempty"` // 阶梯账单：各档实际数量与金额合计
 	TotalQty   int64       `json:"total_quantity"`
 	UnitPrice  int64       `json:"unit_price_fen"` // 固定单价账单的单价；阶梯账单恒为 0（不伪造统一单价）
 	TotalFee   int64       `json:"total_fee_fen"`
@@ -175,13 +187,14 @@ type correction struct {
 type state struct {
 	Version     int                     `json:"version"`
 	Customers   map[string]*customer    `json:"customers"`
-	Plans       map[string]*plan        `json:"plans"`       // 全局唯一方案标识 -> 阶梯计费方案
-	Usage       map[string]*usageRecord `json:"usage"`       // 全局唯一用量标识 -> 记录
-	Bills       map[string]*bill        `json:"bills"`       // 客户 + "|" + 月份 -> 账单
-	Adjustments map[string]*adjustment  `json:"adjustments"` // 全局唯一调整标识 -> 记录
-	Payments    map[string]*payment     `json:"payments"`    // 全局唯一收款标识 -> 记录（与调整标识相互独立，可同名）
-	Corrections map[string]*correction  `json:"corrections"` // 全局唯一更正标识 -> 记录（与收款、调整标识相互独立，可同名）
-	NextSeq     int64                   `json:"next_seq"`    // 已分配的最大操作序号（调整/收款/更正及其撤销共用）
+	Plans       map[string]*plan        `json:"plans"`        // 全局唯一方案标识 -> 阶梯计费方案
+	PlanChanges map[string]*planChange  `json:"plan_changes"` // 客户 + "|" + 生效月 -> 方案变更（旧文件缺省视为无变更）
+	Usage       map[string]*usageRecord `json:"usage"`        // 全局唯一用量标识 -> 记录
+	Bills       map[string]*bill        `json:"bills"`        // 客户 + "|" + 月份 -> 账单
+	Adjustments map[string]*adjustment  `json:"adjustments"`  // 全局唯一调整标识 -> 记录
+	Payments    map[string]*payment     `json:"payments"`     // 全局唯一收款标识 -> 记录（与调整标识相互独立，可同名）
+	Corrections map[string]*correction  `json:"corrections"`  // 全局唯一更正标识 -> 记录（与收款、调整标识相互独立，可同名）
+	NextSeq     int64                   `json:"next_seq"`     // 已分配的最大操作序号（调整/收款/更正及其撤销共用）
 	path        string                  `json:"-"`
 }
 
@@ -212,10 +225,13 @@ func loadStore(dir string) (*state, error) {
 	if err := s.validate(); err != nil {
 		return nil, fmt.Errorf("数据文件已损坏: %w", err)
 	}
-	// 旧版本数据文件没有 plans/adjustments/payments/corrections/next_seq 字段：
-	// 视为零方案、零调整、零实收、零更正。
+	// 旧版本数据文件没有 plans/plan_changes/adjustments/payments/corrections/
+	// next_seq 字段：视为零方案、零变更、零调整、零实收、零更正。
 	if s.Plans == nil {
 		s.Plans = map[string]*plan{}
+	}
+	if s.PlanChanges == nil {
+		s.PlanChanges = map[string]*planChange{}
 	}
 	if s.Adjustments == nil {
 		s.Adjustments = map[string]*adjustment{}
@@ -235,6 +251,7 @@ func newState(p string) *state {
 		Version:     stateVersion,
 		Customers:   map[string]*customer{},
 		Plans:       map[string]*plan{},
+		PlanChanges: map[string]*planChange{},
 		Usage:       map[string]*usageRecord{},
 		Bills:       map[string]*bill{},
 		Adjustments: map[string]*adjustment{},
@@ -280,6 +297,30 @@ func (s *state) validate() error {
 			if _, ok := s.Plans[c.PlanID]; !ok {
 				return fmt.Errorf("客户 %q 绑定了不存在的方案 %q", id, c.PlanID)
 			}
+		}
+	}
+	for key, ch := range s.PlanChanges {
+		if ch == nil {
+			return fmt.Errorf("方案变更 %q 的数据为空", key)
+		}
+		if changeKey(ch.CustomerID, ch.Month) != key {
+			return fmt.Errorf("方案变更键不一致: 键 %q / 客户月份 %s|%s", key, ch.CustomerID, ch.Month)
+		}
+		c, ok := s.Customers[ch.CustomerID]
+		if !ok {
+			return fmt.Errorf("方案变更 %q 引用了不存在的客户 %q", key, ch.CustomerID)
+		}
+		if c.PlanID == "" {
+			return fmt.Errorf("方案变更 %q 的客户 %q 是固定单价客户，未绑定阶梯方案", key, ch.CustomerID)
+		}
+		if !validMonth(ch.Month) {
+			return fmt.Errorf("方案变更 %q 的生效月份无效", key)
+		}
+		if _, ok := s.Plans[ch.PlanID]; !ok {
+			return fmt.Errorf("方案变更 %q 引用了不存在的方案 %q", key, ch.PlanID)
+		}
+		if strings.TrimSpace(ch.Reason) == "" {
+			return fmt.Errorf("方案变更 %q 的原因为空", key)
 		}
 	}
 	for id, u := range s.Usage {
@@ -370,7 +411,7 @@ func (s *state) validate() error {
 				return fmt.Errorf("账单 %q 单价与客户固定单价不符", key)
 			}
 		case "tiered":
-			if err := s.validateTieredBill(key, b, c); err != nil {
+			if err := s.validateTieredBill(key, b); err != nil {
 				return err
 			}
 		default:
@@ -665,10 +706,11 @@ func sortedByInstant(recs []*usageRecord) bool {
 	return true
 }
 
-// validateTieredBill 校验阶梯账单：方案引用有效、快照与方案一致、客户绑定
-// 未变更，并按保存的方案规则从零累计重放计价，逐条比对分段、小计、各档
-// 合计与总金额；任何不符都视为数据损坏。
-func (s *state) validateTieredBill(key string, b *bill, c *customer) error {
+// validateTieredBill 校验阶梯账单：方案引用有效、快照与方案一致、账单方案
+// 符合该客户账期的方案安排（初始绑定 + 按月生效的变更），并按保存的方案
+// 规则从零累计重放计价，逐条比对分段、小计、各档合计与总金额；任何不符
+// 都视为数据损坏。
+func (s *state) validateTieredBill(key string, b *bill) error {
 	if b.PlanID == "" {
 		return fmt.Errorf("账单 %q 缺少方案标识", key)
 	}
@@ -682,8 +724,8 @@ func (s *state) validateTieredBill(key string, b *bill, c *customer) error {
 	if !tiersEqual(b.PlanTiers, p.Tiers) {
 		return fmt.Errorf("账单 %q 的方案规则快照与方案 %q 不符", key, b.PlanID)
 	}
-	if c.PlanID != b.PlanID {
-		return fmt.Errorf("账单 %q 的方案 %q 与客户当前绑定 %q 不一致", key, b.PlanID, c.PlanID)
+	if want := s.planForMonth(b.CustomerID, b.Month); want != b.PlanID {
+		return fmt.Errorf("账单 %q 的方案 %q 与账期安排的方案 %q 不一致", key, b.PlanID, want)
 	}
 	if b.UnitPrice != 0 {
 		return fmt.Errorf("账单 %q 是阶梯账单但保存了统一单价", key)
@@ -766,6 +808,33 @@ func (s *state) save() error {
 
 func billKey(customerID, month string) string {
 	return customerID + "|" + month
+}
+
+// changeKey 由客户标识与生效月共同标识一项方案变更。
+func changeKey(customerID, month string) string {
+	return customerID + "|" + month
+}
+
+// planForMonth 返回客户在指定 UTC 月份生效的阶梯方案标识：创建时绑定的
+// 初始方案被生效月不晚于 month 的变更依次覆盖，直到下一次变更；无变更的
+// 旧存档沿用原绑定。仅对绑定阶梯方案的客户有意义。
+func (s *state) planForMonth(customerID, month string) string {
+	c, ok := s.Customers[customerID]
+	if !ok {
+		return ""
+	}
+	planID := c.PlanID
+	var months []string
+	for _, ch := range s.PlanChanges {
+		if ch.CustomerID == customerID && ch.Month <= month {
+			months = append(months, ch.Month)
+		}
+	}
+	sort.Strings(months)
+	for _, m := range months {
+		planID = s.PlanChanges[changeKey(customerID, m)].PlanID
+	}
+	return planID
 }
 
 // sealed 报告某客户的指定月份是否已封账。

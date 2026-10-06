@@ -30,7 +30,7 @@ func runCmd(args []string, dataDir string) error {
 	switch args[0] {
 	case "customer":
 		if len(args) < 2 {
-			return usageError("缺少子命令，应为：customer add <标识> <名称> <单价分> 或 customer add-plan <标识> <名称> <方案标识>")
+			return usageError("缺少子命令，应为：customer add|add-plan|change-plan|plan-schedule ...")
 		}
 		switch args[1] {
 		case "add":
@@ -43,8 +43,22 @@ func runCmd(args []string, dataDir string) error {
 				return usageError("用法：customer add-plan <标识> <名称> <方案标识>")
 			}
 			return cmdCustomerAddPlan(dataDir, args[2], args[3], args[4])
+		case "change-plan":
+			if len(args) != 6 {
+				return usageError("用法：customer change-plan <客户标识> <YYYY-MM> <目标方案标识> <原因>")
+			}
+			return cmdCustomerChangePlan(dataDir, args[2], args[3], args[4], args[5])
+		case "plan-schedule":
+			if len(args) != 3 && len(args) != 4 {
+				return usageError("用法：customer plan-schedule <客户标识> [YYYY-MM]")
+			}
+			month, hasMonth := "", false
+			if len(args) == 4 {
+				month, hasMonth = args[3], true
+			}
+			return cmdCustomerPlanSchedule(dataDir, args[2], month, hasMonth)
 		default:
-			return usageError("未知 customer 子命令 %q；可用：add、add-plan", args[1])
+			return usageError("未知 customer 子命令 %q；可用：add、add-plan、change-plan、plan-schedule", args[1])
 		}
 
 	case "plan":
@@ -241,16 +255,19 @@ func cmdUsageImport(dir, file string) error {
 			continue
 		}
 		// 金额可行性预检：固定单价客户检查 数量×单价；阶梯客户以单条
-		// 数量从零计价，检查分段金额不溢出（金额单位：分）。
+		// 数量从零计价，检查分段金额不溢出（金额单位：分）。阶梯客户按
+		// 记录时间换算的 UTC 月份在方案安排中选择当月生效的方案。
+		month := r.t.UTC().Format("2006-01")
 		if cust.PlanID == "" {
 			if _, err := mul64(r.rec.Quantity, cust.Price); err != nil {
 				problems = append(problems, fmt.Sprintf("第 %d 行：数量 %d × 单价 %d 金额溢出有符号 64 位整数范围", r.line, r.rec.Quantity, cust.Price))
 				continue
 			}
 		} else {
+			planID := s.planForMonth(cust.ID, month)
 			rec := r.rec
-			if _, err := tieredPrice(s.Plans[cust.PlanID].Tiers, []*usageRecord{&rec}); err != nil {
-				problems = append(problems, fmt.Sprintf("第 %d 行：按方案 %q 对单条数量从零计价失败：%v", r.line, cust.PlanID, err))
+			if _, err := tieredPrice(s.Plans[planID].Tiers, []*usageRecord{&rec}); err != nil {
+				problems = append(problems, fmt.Sprintf("第 %d 行：按方案 %q 对单条数量从零计价失败：%v", r.line, planID, err))
 				continue
 			}
 		}
@@ -274,7 +291,6 @@ func cmdUsageImport(dir, file string) error {
 		}
 
 		// 全新标识：不得进入该客户已封账的 UTC 自然月。
-		month := r.t.UTC().Format("2006-01")
 		if s.sealed(r.rec.CustomerID, month) {
 			problems = append(problems, fmt.Sprintf("第 %d 行：客户 %s 的 %s 已封账，新用量 %q 不得进入",
 				r.line, r.rec.CustomerID, month, r.rec.ID))

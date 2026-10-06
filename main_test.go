@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -2413,19 +2414,19 @@ func TestPlanAddShowListAndPersistence(t *testing.T) {
 func TestPlanAddValidation(t *testing.T) {
 	h := newHarness(t)
 	cases := [][]string{
-		{"plan", "add", "p1", "名称"},                              // 缺少阶梯（用法错误）
-		{"plan", "add", "p1", "名称", "abc"},                       // 格式非法
-		{"plan", "add", "p1", "名称", "100:1", "100:2", "-:3"},     // 上限未严格递增
-		{"plan", "add", "p1", "名称", "200:1", "100:2", "-:3"},     // 上限倒退
-		{"plan", "add", "p1", "名称", "0:1", "-:2"},                // 上限非正
-		{"plan", "add", "p1", "名称", "-5:1", "-:2"},               // 上限为负
-		{"plan", "add", "p1", "名称", "100:-1", "-:2"},             // 单价为负
-		{"plan", "add", "p1", "名称", "100:1", "200:2"},            // 最后一档有上限
-		{"plan", "add", "p1", "名称", "-:1", "100:2"},              // 无上限档不在最后
-		{"plan", "add", "p1", "名称", "100", "-:2"},                // 缺少冒号
-		{"plan", "add", "p1", "名称", "100:abc", "-:2"},            // 单价非整数
-		{"plan", "add", "p1", "", "100:1", "-:2"},                  // 空名称
-		{"plan", "add", "", "名称", "100:1", "-:2"},                // 空标识
+		{"plan", "add", "p1", "名称"},                          // 缺少阶梯（用法错误）
+		{"plan", "add", "p1", "名称", "abc"},                   // 格式非法
+		{"plan", "add", "p1", "名称", "100:1", "100:2", "-:3"}, // 上限未严格递增
+		{"plan", "add", "p1", "名称", "200:1", "100:2", "-:3"}, // 上限倒退
+		{"plan", "add", "p1", "名称", "0:1", "-:2"},            // 上限非正
+		{"plan", "add", "p1", "名称", "-5:1", "-:2"},           // 上限为负
+		{"plan", "add", "p1", "名称", "100:-1", "-:2"},         // 单价为负
+		{"plan", "add", "p1", "名称", "100:1", "200:2"},        // 最后一档有上限
+		{"plan", "add", "p1", "名称", "-:1", "100:2"},          // 无上限档不在最后
+		{"plan", "add", "p1", "名称", "100", "-:2"},            // 缺少冒号
+		{"plan", "add", "p1", "名称", "100:abc", "-:2"},        // 单价非整数
+		{"plan", "add", "p1", "", "100:1", "-:2"},            // 空名称
+		{"plan", "add", "", "名称", "100:1", "-:2"},            // 空标识
 	}
 	for _, args := range cases {
 		h.runExpectErr(args...)
@@ -2651,13 +2652,13 @@ func TestTieredCorruptStateRejected(t *testing.T) {
 		t.Fatal(err)
 	}
 	cases := []struct{ old, new string }{
-		{`"line_fee_fen": 600`, `"line_fee_fen": 601`}, // 明细小计与计价规则不符
-		{`"fee_fen": 400`, `"fee_fen": 401`},            // 分段小计被篡改
-		{`"quantity": 100`, `"quantity": 101`},          // 分档合计被篡改
+		{`"line_fee_fen": 600`, `"line_fee_fen": 601`},     // 明细小计与计价规则不符
+		{`"fee_fen": 400`, `"fee_fen": 401`},               // 分段小计被篡改
+		{`"quantity": 100`, `"quantity": 101`},             // 分档合计被篡改
 		{`"total_fee_fen": 1200`, `"total_fee_fen": 1201`}, // 总金额被篡改
-		{`"plan_id": "p1"`, `"plan_id": "ghost"`},       // 方案引用失效
-		{`"plan_name": "标准阶梯"`, `"plan_name": "改名"`},   // 方案名称快照不符
-		{`"limit": 100`, `"limit": 101`},                // 方案规则快照不符
+		{`"plan_id": "p1"`, `"plan_id": "ghost"`},          // 方案引用失效
+		{`"plan_name": "标准阶梯"`, `"plan_name": "改名"`},       // 方案名称快照不符
+		{`"limit": 100`, `"limit": 101`},                   // 方案规则快照不符
 	}
 	for _, tc := range cases {
 		broken := strings.Replace(string(good), tc.old, tc.new, 1)
@@ -2706,5 +2707,411 @@ func TestOldStateFileWithoutPlans(t *testing.T) {
 	show := h.mustRun("bill", "show", "c1", "2026-09")
 	if !strings.Contains(show, "总金额：30 分") {
 		t.Fatalf("旧账单重启后异常:\n%s", show)
+	}
+}
+
+// --- 阶梯客户按月生效的方案变更 ---
+
+// 登记两个方案与一个阶梯客户，供方案变更用例使用。
+func setupChangePlans(h *harness) {
+	h.t.Helper()
+	h.mustRun("plan", "add", "std", "标准阶梯", "100:10", "-:5")
+	h.mustRun("plan", "add", "prem", "高级阶梯", "100:20", "-:10")
+	h.mustRun("plan", "add", "std2", "标准阶梯二", "200:8", "-:4")
+	h.mustRun("customer", "add-plan", "beta", "阶梯客户", "std")
+}
+
+func TestChangePlanHappyPathAndSchedule(t *testing.T) {
+	h := newHarness(t)
+	setupChangePlans(h)
+
+	out := h.mustRun("customer", "change-plan", "beta", "2027-01", "prem", "续约涨价")
+	for _, want := range []string{"已登记方案变更", "自 2027-01", `改用方案 "prem"（高级阶梯）`, "2027-01 之前的月份不受影响", "原因：续约涨价"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("change-plan 输出缺少 %q:\n%s", want, out)
+		}
+	}
+	// 再次追加更晚的变更。
+	h.mustRun("customer", "change-plan", "beta", "2027-03", "std2", "价格回调")
+
+	// 查询安排：初始方案 + 按生效月排列的变更及原因（只读，每次调用重新载入）。
+	sched := h.mustRun("customer", "plan-schedule", "beta")
+	for _, want := range []string{
+		"初始方案：std（标准阶梯）：100:10 -:5",
+		"1. 自 2027-01 起改用 prem（高级阶梯）：100:20 -:10；原因：续约涨价",
+		"2. 自 2027-03 起改用 std2（标准阶梯二）：200:8 -:4；原因：价格回调",
+	} {
+		if !strings.Contains(sched, want) {
+			t.Fatalf("plan-schedule 输出缺少 %q:\n%s", want, sched)
+		}
+	}
+	// 按月份查询有效方案：变更前、两次变更之间、最后一次变更之后。
+	for month, want := range map[string]string{
+		"2026-12": "2026-12 的有效方案：std（标准阶梯）",
+		"2027-01": "2027-01 的有效方案：prem（高级阶梯）",
+		"2027-02": "2027-02 的有效方案：prem（高级阶梯）",
+		"2027-04": "2027-04 的有效方案：std2（标准阶梯二）",
+	} {
+		out := h.mustRun("customer", "plan-schedule", "beta", month)
+		if !strings.Contains(out, want) {
+			t.Fatalf("plan-schedule %s 输出缺少 %q:\n%s", month, want, out)
+		}
+	}
+	// 固定单价客户无方案安排。
+	h.mustRun("customer", "add", "fix", "固定客户", "10")
+	out = h.mustRun("customer", "plan-schedule", "fix")
+	if !strings.Contains(out, "固定单价客户") || !strings.Contains(out, "无阶梯方案安排") {
+		t.Fatalf("固定单价客户 plan-schedule 输出异常:\n%s", out)
+	}
+	// 查询非法月份与不存在的客户拒绝。
+	h.runExpectErr("customer", "plan-schedule", "beta", "2027-13")
+	if msg := h.runExpectErr("customer", "plan-schedule", "ghost"); !strings.Contains(msg, "不存在") {
+		t.Fatal(msg)
+	}
+}
+
+func TestChangePlanValidation(t *testing.T) {
+	h := newHarness(t)
+	setupChangePlans(h)
+	h.mustRun("customer", "add", "fix", "固定客户", "10")
+
+	cases := []struct {
+		args []string
+		want string
+	}{
+		{[]string{"customer", "change-plan", "ghost", "2027-01", "prem", "原因"}, "不存在"},   // 客户不存在
+		{[]string{"customer", "change-plan", "fix", "2027-01", "prem", "原因"}, "固定单价客户"},  // 固定单价客户
+		{[]string{"customer", "change-plan", "beta", "2027-01", "ghost", "原因"}, "不存在"},   // 方案不存在
+		{[]string{"customer", "change-plan", "beta", "2027-13", "prem", "原因"}, "无效"},     // 非法月份
+		{[]string{"customer", "change-plan", "beta", "2027-1", "prem", "原因"}, "无效"},      // 月份格式
+		{[]string{"customer", "change-plan", "beta", "2027-01", "prem", "  "}, "原因不能为空"}, // 空原因
+		{[]string{"customer", "change-plan", "beta", "2027-01", "", "原因"}, "方案标识不能为空"},   // 空方案标识
+	}
+	for _, c := range cases {
+		if msg := h.runExpectErr(c.args...); !strings.Contains(msg, c.want) {
+			t.Fatalf("args=%v 应包含 %q，得到: %s", c.args, c.want, msg)
+		}
+	}
+	// 参数数量不对属于用法错误。
+	if _, err := h.run("customer", "change-plan", "beta", "2027-01", "prem"); err == nil {
+		t.Fatal("缺少原因应失败")
+	}
+	// 全部失败均不占用客户月份：随后可正常登记。
+	h.mustRun("customer", "change-plan", "beta", "2027-01", "prem", "续约涨价")
+}
+
+func TestChangePlanIncreasingAndSealedMonths(t *testing.T) {
+	h := newHarness(t)
+	setupChangePlans(h)
+	h.mustRun("customer", "add-plan", "gamma", "另一客户", "std")
+
+	h.writeFile("u.csv", csvHeader+
+		"u-1,beta,2026-12-15T00:00:00Z,10\n")
+	h.mustRun("usage", "import", h.dir+"/u.csv")
+	h.mustRun("bill", "settle", "beta", "2026-12")
+
+	// 生效月必须晚于所有已封账月份。
+	if msg := h.runExpectErr("customer", "change-plan", "beta", "2026-12", "prem", "回退"); !strings.Contains(msg, "已封账") {
+		t.Fatal(msg)
+	}
+	if msg := h.runExpectErr("customer", "change-plan", "beta", "2026-11", "prem", "回退"); !strings.Contains(msg, "已封账") {
+		t.Fatal(msg)
+	}
+	h.mustRun("customer", "change-plan", "beta", "2027-02", "prem", "续约涨价")
+	// 新变更只能按生效月递增追加。
+	if msg := h.runExpectErr("customer", "change-plan", "beta", "2027-01", "std2", "插入"); !strings.Contains(msg, "递增追加") {
+		t.Fatal(msg)
+	}
+	h.mustRun("customer", "change-plan", "beta", "2027-05", "std2", "价格回调")
+	// 其他客户可使用相同月份，互不影响。
+	h.mustRun("customer", "change-plan", "gamma", "2027-02", "prem", "同步涨价")
+	sched := h.mustRun("customer", "plan-schedule", "gamma", "2027-02")
+	if !strings.Contains(sched, "2027-02 的有效方案：prem") {
+		t.Fatalf("其他客户的相同月份变更未生效:\n%s", sched)
+	}
+}
+
+func TestChangePlanIdempotentAndConflict(t *testing.T) {
+	h := newHarness(t)
+	setupChangePlans(h)
+
+	h.mustRun("customer", "change-plan", "beta", "2027-01", "prem", "续约涨价")
+	// 相同目标方案和原因的重放返回原记录，不重复生效。
+	out := h.mustRun("customer", "change-plan", "beta", "2027-01", "prem", "续约涨价")
+	if !strings.Contains(out, "已存在且内容相同") || !strings.Contains(out, "幂等") {
+		t.Fatalf("重放输出异常:\n%s", out)
+	}
+	// 追加更晚变更、封账之后重放仍返回原记录。
+	h.mustRun("customer", "change-plan", "beta", "2027-03", "std2", "价格回调")
+	h.writeFile("u.csv", csvHeader+"u-1,beta,2027-01-15T00:00:00Z,10\n")
+	h.mustRun("usage", "import", h.dir+"/u.csv")
+	h.mustRun("bill", "settle", "beta", "2027-01")
+	out = h.mustRun("customer", "change-plan", "beta", "2027-01", "prem", "续约涨价")
+	if !strings.Contains(out, "已存在且内容相同") {
+		t.Fatalf("封账后重放输出异常:\n%s", out)
+	}
+	// 同一客户同一生效月内容不同（目标方案或原因任一不同）拒绝，已有变更不可改写。
+	if msg := h.runExpectErr("customer", "change-plan", "beta", "2027-01", "std2", "续约涨价"); !strings.Contains(msg, "内容不同") {
+		t.Fatal(msg)
+	}
+	if msg := h.runExpectErr("customer", "change-plan", "beta", "2027-01", "prem", "另一个原因"); !strings.Contains(msg, "内容不同") {
+		t.Fatal(msg)
+	}
+	// 安排未被改写。
+	sched := h.mustRun("customer", "plan-schedule", "beta", "2027-01")
+	if !strings.Contains(sched, "2027-01 的有效方案：prem") {
+		t.Fatalf("变更被改写:\n%s", sched)
+	}
+}
+
+func TestChangePlanSettleUsesEffectivePlan(t *testing.T) {
+	h := newHarness(t)
+	setupChangePlans(h)
+	h.writeFile("u.csv", csvHeader+
+		"u-dec,beta,2026-12-15T10:00:00Z,150\n"+
+		"u-jan,beta,2027-01-15T10:00:00Z,150\n")
+	h.mustRun("usage", "import", h.dir+"/u.csv")
+	h.mustRun("customer", "change-plan", "beta", "2027-01", "prem", "续约涨价")
+
+	// 生效月之前的账期仍用初始方案：100×10 + 50×5 = 1250。
+	out := h.mustRun("bill", "settle", "beta", "2026-12")
+	if !strings.Contains(out, "方案：std（标准阶梯）") || !strings.Contains(out, "总金额：1250 分") {
+		t.Fatalf("变更前月份结算方案异常:\n%s", out)
+	}
+	// 生效月起用目标方案：100×20 + 50×10 = 2500。
+	out = h.mustRun("bill", "settle", "beta", "2027-01")
+	for _, want := range []string{"方案：prem（高级阶梯）", "总金额：2500 分", "第 1 档：数量 100，单价 20 分，金额 2000 分", "第 2 档：数量 50，单价 10 分，金额 500 分"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("生效月结算输出缺少 %q:\n%s", want, out)
+		}
+	}
+	// 账单保存实际使用方案的快照：bill show 与重复 settle 保留原快照与金额。
+	show := h.mustRun("bill", "show", "beta", "2027-01")
+	if !strings.Contains(show, "方案：prem（高级阶梯）") || !strings.Contains(show, "总金额：2500 分") {
+		t.Fatalf("bill show 快照异常:\n%s", show)
+	}
+	again := h.mustRun("bill", "settle", "beta", "2027-01")
+	if !strings.Contains(again, "已结算，返回原账单") || !strings.Contains(again, "总金额：2500 分") {
+		t.Fatalf("重复结算未保持幂等:\n%s", again)
+	}
+	// 追加更晚变更不影响已封账账单，也不影响变更前月份的有效方案。
+	h.mustRun("customer", "change-plan", "beta", "2027-03", "std2", "价格回调")
+	show = h.mustRun("bill", "show", "beta", "2027-01")
+	if !strings.Contains(show, "方案：prem（高级阶梯）") || !strings.Contains(show, "总金额：2500 分") {
+		t.Fatalf("追加变更后历史账单被改写:\n%s", show)
+	}
+	sched := h.mustRun("customer", "plan-schedule", "beta", "2027-02")
+	if !strings.Contains(sched, "2027-02 的有效方案：prem") {
+		t.Fatalf("账期安排异常:\n%s", sched)
+	}
+}
+
+func TestChangePlanImportPrecheckOverflow(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("plan", "add", "cheap", "低价", "-:1")
+	h.mustRun("plan", "add", "dear", "高价", "-:2")
+	h.mustRun("customer", "add-plan", "beta", "阶梯客户", "cheap")
+	// 低价方案下单条计价不溢出，高价方案下溢出。
+	h.writeFile("u.csv", csvHeader+
+		"u-old,beta,2026-12-15T00:00:00Z,9223372036854775807\n"+
+		"u-big,beta,2027-02-15T00:00:00Z,9223372036854775807\n")
+	h.mustRun("usage", "import", h.dir+"/u.csv")
+
+	// 生效月起已导入的未封账用量按新方案逐条从零计价：u-big 溢出，整项拒绝并指出用量。
+	msg := h.runExpectErr("customer", "change-plan", "beta", "2027-01", "dear", "涨价")
+	if !strings.Contains(msg, "u-big") || !strings.Contains(msg, "溢出") || !strings.Contains(msg, "未修改任何用量") {
+		t.Fatalf("预检拒绝信息异常: %s", msg)
+	}
+	// 生效月之前的用量不参与预检：从 2027-03 起变更同样因 u-big 拒绝；
+	// 从更晚月份起避开 u-big 则成功（u-old 在生效月之前，不检查）。
+	h.mustRun("customer", "change-plan", "beta", "2027-03", "dear", "涨价")
+	// 失败的登记不占用客户月份：2027-01 仍可登记到其他方案。
+	h.mustRun("customer", "change-plan", "beta", "2027-04", "cheap", "维持原价")
+}
+
+func TestChangePlanImportUsesEffectivePlan(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("plan", "add", "dear", "高价", "-:2")
+	h.mustRun("plan", "add", "cheap", "低价", "-:1")
+	h.mustRun("customer", "add-plan", "beta", "阶梯客户", "dear")
+	h.mustRun("customer", "change-plan", "beta", "2027-01", "cheap", "续约降价")
+
+	// 生效月及之后的导入按新方案预检：低价下单条不溢出，导入成功。
+	h.writeFile("u1.csv", csvHeader+"u-new,beta,2027-02-15T00:00:00Z,9223372036854775807\n")
+	h.mustRun("usage", "import", h.dir+"/u1.csv")
+	// 生效月之前的月份仍按初始方案预检：高价下溢出，整批拒绝。
+	h.writeFile("u2.csv", csvHeader+"u-old,beta,2026-12-15T00:00:00Z,9223372036854775807\n")
+	if msg := h.runExpectErr("usage", "import", h.dir+"/u2.csv"); !strings.Contains(msg, "溢出") {
+		t.Fatalf("变更前月份导入预检异常: %s", msg)
+	}
+}
+
+func TestChangePlanNoSeqConsumed(t *testing.T) {
+	h := newHarness(t)
+	setupChangePlans(h)
+	h.writeFile("u.csv", csvHeader+"u-1,beta,2026-12-15T00:00:00Z,10\n")
+	h.mustRun("usage", "import", h.dir+"/u.csv")
+	h.mustRun("bill", "settle", "beta", "2026-12")
+
+	// 方案变更不产生账后流水事件，也不占用全局操作序号。
+	h.mustRun("customer", "change-plan", "beta", "2027-01", "prem", "续约涨价")
+	out := h.mustRun("bill", "ledger", "beta", "2026-12")
+	if !strings.Contains(out, "存档全局序号上限：0") || !strings.Contains(out, "流水：无") {
+		t.Fatalf("变更不应产生流水事件或占用序号:\n%s", out)
+	}
+	// 随后的调整仍从序号 1 开始。
+	h.mustRun("bill", "adjust", "beta", "2026-12", "adj-1", "100", "漏算")
+	out = h.mustRun("bill", "ledger", "beta", "2026-12")
+	if !strings.Contains(out, "存档全局序号上限：1") || !strings.Contains(out, "序号 1 调整 adj-1") {
+		t.Fatalf("变更后流水序号异常:\n%s", out)
+	}
+}
+
+func TestChangePlanPersistsAcrossInvocations(t *testing.T) {
+	h := newHarness(t)
+	setupChangePlans(h)
+	h.mustRun("customer", "change-plan", "beta", "2027-01", "prem", "续约涨价")
+
+	// 每次调用都重新从磁盘载入：安排、幂等与账期选择跨重启保持。
+	sched := h.mustRun("customer", "plan-schedule", "beta", "2027-02")
+	if !strings.Contains(sched, "原因：续约涨价") || !strings.Contains(sched, "2027-02 的有效方案：prem") {
+		t.Fatalf("重启后安排丢失:\n%s", sched)
+	}
+	out := h.mustRun("customer", "change-plan", "beta", "2027-01", "prem", "续约涨价")
+	if !strings.Contains(out, "已存在且内容相同") {
+		t.Fatalf("重启后幂等丢失:\n%s", out)
+	}
+	// state.json 中确实保存了变更记录。
+	data, err := os.ReadFile(h.statePath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), `"plan_changes"`) || !strings.Contains(string(data), "续约涨价") {
+		t.Fatalf("state.json 缺少变更记录:\n%s", data)
+	}
+}
+
+func TestOldStateFileWithoutPlanChanges(t *testing.T) {
+	h := newHarness(t)
+	// 旧格式存档：无 plan_changes 字段，阶梯客户沿用原绑定。
+	old := `{
+  "version": 1,
+  "customers": {"beta": {"id": "beta", "name": "阶梯客户", "price_fen": 0, "plan_id": "std"}},
+  "plans": {"std": {"id": "std", "name": "标准阶梯", "tiers": [{"limit": 100, "price_fen": 10}, {"limit": 0, "price_fen": 5}]}},
+  "usage": {"u1": {"id": "u1", "customer_id": "beta", "time": "2026-09-15T00:00:00Z", "quantity": 150}},
+  "bills": {}
+}
+`
+	if err := os.WriteFile(h.statePath(), []byte(old), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	// 无变更时按原绑定结算：100×10 + 50×5 = 1250。
+	out := h.mustRun("bill", "settle", "beta", "2026-09")
+	if !strings.Contains(out, "方案：std（标准阶梯）") || !strings.Contains(out, "总金额：1250 分") {
+		t.Fatalf("旧存档结算异常:\n%s", out)
+	}
+	// 安排查询显示初始方案、无变更；随后可正常登记变更。
+	sched := h.mustRun("customer", "plan-schedule", "beta")
+	if !strings.Contains(sched, "初始方案：std（标准阶梯）") || !strings.Contains(sched, "变更（按生效月排列）：无") {
+		t.Fatalf("旧存档安排查询异常:\n%s", sched)
+	}
+	h.mustRun("plan", "add", "prem", "高级阶梯", "100:20", "-:10")
+	h.mustRun("customer", "change-plan", "beta", "2026-10", "prem", "续约涨价")
+	sched = h.mustRun("customer", "plan-schedule", "beta", "2026-10")
+	if !strings.Contains(sched, "2026-10 的有效方案：prem") {
+		t.Fatalf("旧存档登记变更后异常:\n%s", sched)
+	}
+}
+
+func TestCorruptPlanChangeDataRejected(t *testing.T) {
+	base := `{
+  "version": 1,
+  "customers": {"beta": {"id": "beta", "name": "阶梯客户", "price_fen": 0, "plan_id": "std"}},
+  "plans": {"std": {"id": "std", "name": "标准阶梯", "tiers": [{"limit": 0, "price_fen": 5}]}},
+  "usage": {},
+  "bills": {},
+  "plan_changes": %s
+}
+`
+	cases := []string{
+		// 引用不存在的方案
+		`{"beta|2027-01": {"customer_id": "beta", "month": "2027-01", "plan_id": "ghost", "reason": "r", "created_at": "2026-10-01T00:00:00Z"}}`,
+		// 引用不存在的客户
+		`{"ghost|2027-01": {"customer_id": "ghost", "month": "2027-01", "plan_id": "std", "reason": "r", "created_at": "2026-10-01T00:00:00Z"}}`,
+		// 键与记录不一致
+		`{"beta|2027-02": {"customer_id": "beta", "month": "2027-01", "plan_id": "std", "reason": "r", "created_at": "2026-10-01T00:00:00Z"}}`,
+		// 生效月份非法
+		`{"beta|2027-13": {"customer_id": "beta", "month": "2027-13", "plan_id": "std", "reason": "r", "created_at": "2026-10-01T00:00:00Z"}}`,
+		// 原因为空
+		`{"beta|2027-01": {"customer_id": "beta", "month": "2027-01", "plan_id": "std", "reason": " ", "created_at": "2026-10-01T00:00:00Z"}}`,
+	}
+	for i, changes := range cases {
+		h := newHarness(t)
+		if err := os.WriteFile(h.statePath(), []byte(fmt.Sprintf(base, changes)), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		before, _ := os.ReadFile(h.statePath())
+		if msg := h.runExpectErr("customer", "plan-schedule", "beta"); !strings.Contains(msg, "损坏") {
+			t.Fatalf("用例 %d 应按损坏拒绝: %s", i, msg)
+		}
+		after, _ := os.ReadFile(h.statePath())
+		if string(before) != string(after) {
+			t.Fatalf("用例 %d 损坏文件被改写", i)
+		}
+	}
+	// 固定单价客户携带方案变更同样按损坏拒绝。
+	h := newHarness(t)
+	fixed := `{
+  "version": 1,
+  "customers": {"c1": {"id": "c1", "name": "固定客户", "price_fen": 10}},
+  "plans": {"std": {"id": "std", "name": "标准阶梯", "tiers": [{"limit": 0, "price_fen": 5}]}},
+  "usage": {},
+  "bills": {},
+  "plan_changes": {"c1|2027-01": {"customer_id": "c1", "month": "2027-01", "plan_id": "std", "reason": "r", "created_at": "2026-10-01T00:00:00Z"}}
+}
+`
+	if err := os.WriteFile(h.statePath(), []byte(fixed), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if msg := h.runExpectErr("plan", "list"); !strings.Contains(msg, "损坏") {
+		t.Fatalf("固定单价客户的变更应按损坏拒绝: %s", msg)
+	}
+}
+
+func TestBillPlanMustMatchSchedule(t *testing.T) {
+	h := newHarness(t)
+	// 账单方案与账期安排不一致的存档按损坏拒绝并保留。
+	bad := `{
+  "version": 1,
+  "customers": {"beta": {"id": "beta", "name": "阶梯客户", "price_fen": 0, "plan_id": "std"}},
+  "plans": {
+    "std": {"id": "std", "name": "标准阶梯", "tiers": [{"limit": 0, "price_fen": 5}]},
+    "prem": {"id": "prem", "name": "高级阶梯", "tiers": [{"limit": 0, "price_fen": 10}]}
+  },
+  "usage": {"u1": {"id": "u1", "customer_id": "beta", "time": "2027-01-15T00:00:00Z", "quantity": 3}},
+  "bills": {
+    "beta|2027-01": {
+      "id": "BILL-x", "customer_id": "beta", "month": "2027-01",
+      "pricing": "tiered", "plan_id": "std", "plan_name": "标准阶梯",
+      "plan_tiers": [{"limit": 0, "price_fen": 5}],
+      "tier_totals": [{"quantity": 3, "fee_fen": 15}],
+      "total_quantity": 3, "unit_price_fen": 0, "total_fee_fen": 15,
+      "lines": [{"usage_id": "u1", "time": "2027-01-15T00:00:00Z", "quantity": 3, "line_fee_fen": 15, "segments": [{"tier": 0, "quantity": 3, "fee_fen": 15}]}],
+      "created_at": "2027-02-01T00:00:00Z"
+    }
+  },
+  "plan_changes": {"beta|2027-01": {"customer_id": "beta", "month": "2027-01", "plan_id": "prem", "reason": "续约涨价", "created_at": "2026-12-01T00:00:00Z"}}
+}
+`
+	if err := os.WriteFile(h.statePath(), []byte(bad), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	before, _ := os.ReadFile(h.statePath())
+	if msg := h.runExpectErr("bill", "show", "beta", "2027-01"); !strings.Contains(msg, "账期安排") {
+		t.Fatalf("账单方案与账期安排不一致应拒绝: %s", msg)
+	}
+	after, _ := os.ReadFile(h.statePath())
+	if string(before) != string(after) {
+		t.Fatal("损坏文件被改写")
 	}
 }
