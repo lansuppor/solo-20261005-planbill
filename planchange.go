@@ -64,11 +64,15 @@ func cmdPlanChange(dir, customerID, month, planID, reason string) error {
 			return fmt.Errorf("客户 %s 的 %s 已封账，生效月 %s 须晚于该客户所有已封账月份", customerID, b.Month, month)
 		}
 	}
-	// 登记前预检：生效月起已导入的用量（上述检查已保证这些月份均未封账）
-	// 按目标方案逐条从零计价，任一条金额溢出则整项拒绝并指出用量，
-	// 不修改用量；月累计溢出仍由结算把关（拒绝且不封账）。
+	// 登记前预检：生效月起已导入的未撤回用量（上述检查已保证这些月份均未
+	// 封账）按目标方案逐条从零计价，任一条金额溢出则整项拒绝并指出用量，
+	// 不修改用量；已撤回用量不参与预检；月累计溢出仍由结算把关（拒绝且
+	// 不封账）。
 	var ids []string
 	for _, u := range s.Usage {
+		if s.isWithdrawn(u.ID) {
+			continue
+		}
 		if u.CustomerID == customerID && utcMonth(u.Time) >= month {
 			ids = append(ids, u.ID)
 		}

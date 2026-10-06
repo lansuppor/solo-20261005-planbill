@@ -52,6 +52,17 @@ type usageRecord struct {
 	Quantity   int64  `json:"quantity"`
 }
 
+// usageWithdrawal 是一条用量记录的撤回信息：用于纠正误导入的未封账用量。
+// 原用量记录（客户、时间、数量、标识）永久保留，撤回只追加状态与原因；
+// 撤回不可恢复，标识不可复用。撤回只作用于该条记录，不产生账后流水事件，
+// 也不占用全局操作序号。已撤回用量不参与结算、方案变更预检与暂停区间
+// 冲突检查，但相同内容的重放仍按原内容判重跳过。
+type usageWithdrawal struct {
+	UsageID   string `json:"usage_id"` // 撤回的用量标识（即 map 键）
+	Reason    string `json:"reason"`   // 撤回原因，非空
+	CreatedAt string `json:"created_at"`
+}
+
 // lineSegment 是阶梯计费下一条用量记录落入某一档的分段：数量与小计；
 // 该档单价由账单保存的方案规则按档位序号取得。
 type lineSegment struct {
@@ -211,8 +222,10 @@ type state struct {
 	Corrections map[string]*correction  `json:"corrections"`           // 全局唯一更正标识 -> 记录（与收款、调整标识相互独立，可同名）
 	PlanChanges map[string]*planChange  `json:"plan_changes"`          // 客户 + "|" + 生效月 -> 方案变更（按生效月递增追加，不可改写）
 	Suspensions map[string]*suspension  `json:"suspensions,omitempty"` // 客户 + "|" + 起月 -> 暂停区间（不可改写）
-	NextSeq     int64                   `json:"next_seq"`              // 已分配的最大操作序号（调整/收款/更正及其撤销共用；方案变更与暂停不占用）
-	path        string                  `json:"-"`
+	// 全局唯一用量标识 -> 撤回信息（只追加，不可恢复）；旧存档缺少该节视为全部有效。
+	Withdrawals map[string]*usageWithdrawal `json:"usage_withdrawals,omitempty"`
+	NextSeq     int64                       `json:"next_seq"` // 已分配的最大操作序号（调整/收款/更正及其撤销共用；方案变更、暂停与用量撤回不占用）
+	path        string                      `json:"-"`
 }
 
 // loadStore 读取数据目录；目录不存在时按需创建并视为空库。
@@ -246,8 +259,8 @@ func loadStore(dir string) (*state, error) {
 		return nil, fmt.Errorf("数据文件已损坏: %w", err)
 	}
 	// 旧版本数据文件没有 plans/adjustments/payments/corrections/plan_changes/
-	// suspensions/next_seq 字段：视为零方案、零调整、零实收、零更正、
-	// 零方案变更、零暂停。
+	// suspensions/usage_withdrawals/next_seq 字段：视为零方案、零调整、零实收、
+	// 零更正、零方案变更、零暂停、零撤回（全部用量有效）。
 	if s.Plans == nil {
 		s.Plans = map[string]*plan{}
 	}
@@ -266,6 +279,9 @@ func loadStore(dir string) (*state, error) {
 	if s.Suspensions == nil {
 		s.Suspensions = map[string]*suspension{}
 	}
+	if s.Withdrawals == nil {
+		s.Withdrawals = map[string]*usageWithdrawal{}
+	}
 	s.path = p
 	return &s, nil
 }
@@ -282,6 +298,7 @@ func newState(p string) *state {
 		Corrections: map[string]*correction{},
 		PlanChanges: map[string]*planChange{},
 		Suspensions: map[string]*suspension{},
+		Withdrawals: map[string]*usageWithdrawal{},
 		path:        p,
 	}
 }
@@ -370,6 +387,23 @@ func (s *state) validate() error {
 			return fmt.Errorf("用量 %q 的时间不是 RFC3339: %w", u.ID, err)
 		}
 	}
+	// 用量撤回：撤回目标必须存在（失效目标拒绝），撤回原因非空；留存的
+	// 原记录仍按上面的用量规则校验格式、正数量与客户存在性，已撤回记录
+	// 不被视为待计费用量（见账单与暂停区间的相关检查）。
+	for id, w := range s.Withdrawals {
+		if w == nil {
+			return fmt.Errorf("用量 %q 的撤回信息为空", id)
+		}
+		if w.UsageID != id {
+			return fmt.Errorf("撤回信息键不一致: 键 %q / 用量标识 %q", id, w.UsageID)
+		}
+		if _, ok := s.Usage[id]; !ok {
+			return fmt.Errorf("撤回目标失效：用量 %q 不存在", id)
+		}
+		if strings.TrimSpace(w.Reason) == "" {
+			return fmt.Errorf("用量 %q 的撤回原因为空", id)
+		}
+	}
 	for key, b := range s.Bills {
 		if b == nil {
 			return fmt.Errorf("账单 %q 的数据为空", key)
@@ -395,6 +429,9 @@ func (s *state) validate() error {
 			u, ok := s.Usage[ln.UsageID]
 			if !ok {
 				return fmt.Errorf("账单 %q 引用了不存在的用量 %q", key, ln.UsageID)
+			}
+			if s.isWithdrawn(ln.UsageID) {
+				return fmt.Errorf("账单 %q 引用了已撤回用量 %q", key, ln.UsageID)
 			}
 			if u.CustomerID != b.CustomerID || u.Time != ln.Time || u.Quantity != ln.Quantity {
 				return fmt.Errorf("账单 %q 的明细 %q 与用量记录不一致", key, ln.UsageID)
@@ -455,9 +492,13 @@ func (s *state) validate() error {
 		default:
 			return fmt.Errorf("账单 %q 的计价类型 %q 未知", key, b.Pricing)
 		}
-		// 封账期内不得存在游离于账单之外的用量（封账后新增被禁止，
-		// 而已入账记录理应全部在明细中）。
+		// 封账期内不得存在游离于账单之外的未撤回用量（封账后新增被禁止，
+		// 而未撤回的已入账记录理应全部在明细中）；已撤回用量不参与计费，
+		// 可以存在于已封账月份且不进入账单。
 		for _, u := range s.Usage {
+			if s.isWithdrawn(u.ID) {
+				continue
+			}
 			if u.CustomerID == b.CustomerID && inMonth(u.Time, b.Month) {
 				found := false
 				for _, ln := range b.Lines {
@@ -510,6 +551,10 @@ func (s *state) validate() error {
 		}
 		for _, su := range list {
 			for _, u := range s.Usage {
+				// 已撤回用量可存在于随后暂停的月份，不参与用量冲突判断。
+				if s.isWithdrawn(u.ID) {
+					continue
+				}
 				if u.CustomerID == customerID && monthInRange(utcMonth(u.Time), su.StartMonth, su.EndMonth) {
 					return fmt.Errorf("客户 %s 在暂停区间 %s..%s（不含结束月）内存在用量 %q（%s）",
 						customerID, su.StartMonth, su.EndMonth, u.ID, utcMonth(u.Time))
@@ -975,6 +1020,13 @@ func (s *state) effectivePlanID(cust *customer, month string) string {
 // sealed 报告某客户的指定月份是否已封账。
 func (s *state) sealed(customerID, month string) bool {
 	_, ok := s.Bills[billKey(customerID, month)]
+	return ok
+}
+
+// isWithdrawn 报告指定标识的用量记录是否已撤回。已撤回用量不参与结算、
+// 方案变更预检与暂停区间冲突检查，但原记录永久保留并继续参与判重。
+func (s *state) isWithdrawn(usageID string) bool {
+	_, ok := s.Withdrawals[usageID]
 	return ok
 }
 
