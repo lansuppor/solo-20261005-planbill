@@ -82,6 +82,12 @@ func cmdBillSettleBatch(dir string, args []string) error {
 			items = append(items, settleItem{pos: pos, customerID: customerID, month: month, b: existing})
 			continue
 		}
+		// 暂停月整批拒绝：不留下任何新账单或封账，也不输出部分成功报告。
+		if p := s.pauseCovering(customerID, month); p != nil {
+			problems = append(problems, fmt.Sprintf("%s：该月处于暂停区间 [%s, %s)（原因：%s），暂停月不产生月费账单",
+				where, p.StartMonth, p.EndMonth, p.Reason))
+			continue
+		}
 		// 未结算项按该账期的计费规则独立计价：不跨客户或月份共享累计量。
 		b, err := buildBill(s, cust, month)
 		if err != nil {

@@ -90,6 +90,29 @@ func runCmd(args []string, dataDir string) error {
 			return usageError("未知 plan 子命令 %q；可用：add、add-fee、show、list、change、schedule", args[1])
 		}
 
+	case "pause":
+		if len(args) < 2 {
+			return usageError("缺少子命令，应为：pause add <客户标识> <起月> <结束月> <原因> 或 pause list <客户标识> [YYYY-MM]")
+		}
+		switch args[1] {
+		case "add":
+			if len(args) != 6 {
+				return usageError("用法：pause add <客户标识> <起月 YYYY-MM> <结束月 YYYY-MM> <原因>")
+			}
+			return cmdPauseAdd(dataDir, args[2], args[3], args[4], args[5])
+		case "list":
+			if len(args) != 3 && len(args) != 4 {
+				return usageError("用法：pause list <客户标识> [YYYY-MM]")
+			}
+			month, hasMonth := "", false
+			if len(args) == 4 {
+				month, hasMonth = args[3], true
+			}
+			return cmdPauseList(dataDir, args[2], month, hasMonth)
+		default:
+			return usageError("未知 pause 子命令 %q；可用：add、list", args[1])
+		}
+
 	case "usage":
 		if len(args) < 2 {
 			return usageError("缺少子命令，应为：usage import <文件>")
@@ -165,7 +188,7 @@ func runCmd(args []string, dataDir string) error {
 		}
 
 	default:
-		return usageError("未知命令 %q；可用：customer、plan、usage、bill", args[0])
+		return usageError("未知命令 %q；可用：customer、plan、pause、usage、bill", args[0])
 	}
 }
 
@@ -302,6 +325,12 @@ func cmdUsageImport(dir, file string) error {
 		if s.sealed(r.rec.CustomerID, month) {
 			problems = append(problems, fmt.Sprintf("第 %d 行：客户 %s 的 %s 已封账，新用量 %q 不得进入",
 				r.line, r.rec.CustomerID, month, r.rec.ID))
+			continue
+		}
+		// 全新标识：不得进入该客户的暂停月（暂停期间不接收用量）。
+		if p := s.pauseCovering(r.rec.CustomerID, month); p != nil {
+			problems = append(problems, fmt.Sprintf("第 %d 行：客户 %s 的 %s 处于暂停区间 [%s, %s)，新用量 %q 不得进入",
+				r.line, r.rec.CustomerID, month, p.StartMonth, p.EndMonth, r.rec.ID))
 			continue
 		}
 
@@ -459,6 +488,12 @@ func cmdBillSettle(dir, customerID, month string) error {
 		fmt.Fprintf(stdout, "客户 %s 的 %s 已结算，返回原账单（幂等，不重新计费）：\n\n", customerID, month)
 		printBill(existing, cust, s)
 		return nil
+	}
+
+	// 暂停月无论方案月费多少都拒绝结算：不封账，也不生成零金额账单。
+	if p := s.pauseCovering(customerID, month); p != nil {
+		return fmt.Errorf("客户 %s 的 %s 处于暂停区间 [%s, %s)（原因：%s），暂停月不产生月费账单，拒绝结算且不封账",
+			customerID, month, p.StartMonth, p.EndMonth, p.Reason)
 	}
 
 	// 归集该客户 UTC 自然月内的全部用量，区间为左闭右开 [月初, 下月初)。

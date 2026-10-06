@@ -3659,3 +3659,374 @@ func TestMonthlyFeeOldStateFile(t *testing.T) {
 		t.Fatalf("旧账单重启后异常:\n%s", show)
 	}
 }
+
+// --- 订阅暂停 ---
+
+func TestPauseAddAndList(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("plan", "add-fee", "sub", "订阅阶梯", "1000", "100:10", "-:5")
+	h.mustRun("customer", "add-plan", "c1", "客户一", "sub")
+	h.mustRun("customer", "add-plan", "c2", "客户二", "sub")
+	h.mustRun("customer", "add", "c9", "客户九", "10")
+
+	// 查询为空：全部月份正常服务。
+	out := h.mustRun("pause", "list", "c1")
+	if !strings.Contains(out, "暂停区间：无") || !strings.Contains(out, "全部月份正常服务") {
+		t.Fatalf("空暂停查询异常:\n%s", out)
+	}
+	if out = h.mustRun("pause", "list", "c1", "2027-01"); !strings.Contains(out, "月份 2027-01：正常服务") {
+		t.Fatalf("月份查询异常:\n%s", out)
+	}
+
+	// 登记暂停区间 [2027-01, 2027-03)。
+	out = h.mustRun("pause", "add", "c1", "2027-01", "2027-03", "客户停用设备")
+	for _, want := range []string{"已登记订阅暂停", "客户：c1", "暂停区间：[2027-01, 2027-03)", "原因：客户停用设备"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("登记暂停输出缺少 %q:\n%s", want, out)
+		}
+	}
+	// 相接的第二段视为连续暂停，合法。
+	h.mustRun("pause", "add", "c1", "2027-03", "2027-05", "延长停用")
+
+	// 列表按起月升序展示全部区间与原因。
+	out = h.mustRun("pause", "list", "c1")
+	i1 := strings.Index(out, "[2027-01, 2027-03)，原因：客户停用设备")
+	i2 := strings.Index(out, "[2027-03, 2027-05)，原因：延长停用")
+	if i1 < 0 || i2 < 0 || i1 > i2 {
+		t.Fatalf("暂停列表未按起月升序或缺少原因:\n%s", out)
+	}
+	// 月份查询：含起月、不含结束月，区间外正常服务。
+	if out = h.mustRun("pause", "list", "c1", "2027-01"); !strings.Contains(out, "月份 2027-01：暂停中") {
+		t.Fatalf("起月应暂停:\n%s", out)
+	}
+	if out = h.mustRun("pause", "list", "c1", "2027-04"); !strings.Contains(out, "月份 2027-04：暂停中") {
+		t.Fatalf("相接区间内应暂停:\n%s", out)
+	}
+	if out = h.mustRun("pause", "list", "c1", "2027-05"); !strings.Contains(out, "月份 2027-05：正常服务") {
+		t.Fatalf("结束月（不含）应正常服务:\n%s", out)
+	}
+	if out = h.mustRun("pause", "list", "c1", "2026-12"); !strings.Contains(out, "月份 2026-12：正常服务") {
+		t.Fatalf("区间前应正常服务:\n%s", out)
+	}
+	// 固定单价客户不适用暂停；其他客户互不影响。
+	if out = h.mustRun("pause", "list", "c9"); !strings.Contains(out, "固定单价客户") || !strings.Contains(out, "不适用订阅暂停") {
+		t.Fatalf("固定单价客户查询异常:\n%s", out)
+	}
+	if out = h.mustRun("pause", "list", "c2", "2027-02"); !strings.Contains(out, "月份 2027-02：正常服务") {
+		t.Fatalf("其他客户不应受影响:\n%s", out)
+	}
+	// 非法输入：不存在的客户、非法月份、结束月不晚于起月、空原因。
+	h.runExpectErr("pause", "list", "ghost")
+	h.runExpectErr("pause", "list", "c1", "2027-13")
+	h.runExpectErr("pause", "add", "ghost", "2027-06", "2027-08", "原因")
+	h.runExpectErr("pause", "add", "c9", "2027-06", "2027-08", "原因") // 固定单价客户
+	h.runExpectErr("pause", "add", "c1", "2027-13", "2027-08", "原因")
+	h.runExpectErr("pause", "add", "c1", "2027-06", "2027-06", "原因")
+	h.runExpectErr("pause", "add", "c1", "2027-06", "2027-05", "原因")
+	h.runExpectErr("pause", "add", "c1", "2027-06", "2027-08", "  ")
+	// 失败不占用客户起月：修正后可原样重试。
+	h.mustRun("pause", "add", "c1", "2027-06", "2027-08", "再次停用")
+}
+
+func TestPauseOverlapAndSealedRules(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("plan", "add", "p1", "阶梯", "-:10")
+	h.mustRun("customer", "add-plan", "c1", "客户一", "p1")
+	h.mustRun("customer", "add-plan", "c2", "客户二", "p1")
+	f := h.writeFile("u.csv", csvHeader+"u1,c1,2026-09-05T00:00:00Z,3\n")
+	h.mustRun("usage", "import", f)
+	h.mustRun("bill", "settle", "c1", "2026-09")
+
+	// 起月须晚于所有已封账月份。
+	if msg := h.runExpectErr("pause", "add", "c1", "2026-09", "2026-11", "停用"); !strings.Contains(msg, "已封账") {
+		t.Fatalf("起月等于封账月应拒绝: %s", msg)
+	}
+	if msg := h.runExpectErr("pause", "add", "c1", "2026-08", "2026-10", "停用"); !strings.Contains(msg, "已封账") {
+		t.Fatalf("起月早于封账月应拒绝: %s", msg)
+	}
+	h.mustRun("pause", "add", "c1", "2026-10", "2026-12", "停用")
+
+	// 同一客户区间不得重叠；可以相接。
+	h.runExpectErr("pause", "add", "c1", "2026-11", "2027-02", "重叠")
+	h.runExpectErr("pause", "add", "c1", "2026-09", "2026-11", "重叠")
+	h.runExpectErr("pause", "add", "c1", "2026-10", "2026-12", "相同区间不同原因")
+	h.mustRun("pause", "add", "c1", "2026-12", "2027-01", "相接延长")
+	// 其他客户相同区间互不影响。
+	h.mustRun("pause", "add", "c2", "2026-10", "2026-12", "另一客户")
+}
+
+func TestPauseIdempotentReplay(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("plan", "add-fee", "sub", "订阅阶梯", "500", "-:10")
+	h.mustRun("customer", "add-plan", "c1", "客户一", "sub")
+	h.mustRun("pause", "add", "c1", "2026-10", "2026-12", "停用")
+
+	// 相同结束月与原因的重放返回原记录，不写盘。
+	before, err := os.ReadFile(h.statePath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	out := h.mustRun("pause", "add", "c1", "2026-10", "2026-12", "停用")
+	if !strings.Contains(out, "已存在且内容相同") {
+		t.Fatalf("重放应幂等返回:\n%s", out)
+	}
+	after, _ := os.ReadFile(h.statePath())
+	if string(before) != string(after) {
+		t.Fatal("幂等重放改写了存档")
+	}
+	// 内容不同（结束月或原因不同）拒绝。
+	h.runExpectErr("pause", "add", "c1", "2026-10", "2026-11", "停用")
+	h.runExpectErr("pause", "add", "c1", "2026-10", "2026-12", "别的")
+
+	// 结算恢复后的月份（2026-12，结束月不含，正常出账）后重放仍成功。
+	f := h.writeFile("u.csv", csvHeader+"u1,c1,2026-12-05T00:00:00Z,3\n")
+	h.mustRun("usage", "import", f)
+	h.mustRun("bill", "settle", "c1", "2026-12")
+	out = h.mustRun("pause", "add", "c1", "2026-10", "2026-12", "停用")
+	if !strings.Contains(out, "已存在且内容相同") {
+		t.Fatalf("结算恢复月后重放应成功:\n%s", out)
+	}
+}
+
+func TestPauseRejectsWhenUsageInInterval(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("plan", "add", "p1", "阶梯", "-:10")
+	h.mustRun("customer", "add-plan", "c1", "客户一", "p1")
+	f := h.writeFile("u.csv", csvHeader+
+		"u1,c1,2026-10-05T00:00:00Z,3\n"+
+		"u2,c1,2026-11-20T08:00:00+08:00,5\n") // UTC 2026-11-20T00:00:00Z
+	h.mustRun("usage", "import", f)
+
+	// 区间覆盖已有用量：拒绝并指出冲突记录，不删除或改写用量。
+	msg := h.runExpectErr("pause", "add", "c1", "2026-10", "2026-12", "停用")
+	if !strings.Contains(msg, "u1") || !strings.Contains(msg, "u2") {
+		t.Fatalf("应指出全部冲突用量: %s", msg)
+	}
+	// 区间不含已有用量（结束月不含）则合法。
+	h.mustRun("pause", "add", "c1", "2026-12", "2027-02", "停用")
+	// 用量仍在，可正常结算。
+	out := h.mustRun("bill", "settle", "c1", "2026-10")
+	if !strings.Contains(out, "总金额：30 分") {
+		t.Fatalf("已有用量不应被暂停登记改写:\n%s", out)
+	}
+}
+
+func TestPauseImportBlocked(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("plan", "add", "p1", "阶梯", "-:10")
+	h.mustRun("customer", "add-plan", "c1", "客户一", "p1")
+	h.mustRun("pause", "add", "c1", "2026-10", "2026-12", "停用")
+
+	// 暂停月的新用量使整批导入失败并指出行号，合法项也不留下。
+	f := h.writeFile("u.csv", csvHeader+
+		"u1,c1,2026-09-05T00:00:00Z,3\n"+ // 第 2 行：合法
+		"u2,c1,2026-10-05T00:00:00Z,4\n"+ // 第 3 行：暂停月
+		"u3,c1,2026-12-05T00:00:00Z,5\n") // 第 4 行：合法（结束月不含）
+	msg := h.runExpectErr("usage", "import", f)
+	if !strings.Contains(msg, "第 3 行") || !strings.Contains(msg, "暂停区间 [2026-10, 2026-12)") {
+		t.Fatalf("应指出暂停月行号与区间: %s", msg)
+	}
+	// 合法项也不留下：重新导入只含合法行的文件，全部新增。
+	f2 := h.writeFile("u2.csv", csvHeader+
+		"u1,c1,2026-09-05T00:00:00Z,3\n"+
+		"u3,c1,2026-12-05T00:00:00Z,5\n")
+	out := h.mustRun("usage", "import", f2)
+	if !strings.Contains(out, "新增 2 条") {
+		t.Fatalf("失败批次不应留下任何用量:\n%s", out)
+	}
+	// 暂停月用量的重放仍失败（该记录从未入库，不是重复）。
+	f3 := h.writeFile("u3.csv", csvHeader+"u2,c1,2026-10-05T00:00:00Z,4\n")
+	h.runExpectErr("usage", "import", f3)
+}
+
+func TestPauseSettleRejected(t *testing.T) {
+	h := newHarness(t)
+	// 月费大于 0 的方案：暂停月也不产生零金额账单。
+	h.mustRun("plan", "add-fee", "sub", "订阅阶梯", "1000", "-:10")
+	h.mustRun("customer", "add-plan", "c1", "客户一", "sub")
+	h.mustRun("customer", "add-plan", "c2", "客户二", "sub")
+	h.mustRun("pause", "add", "c1", "2026-10", "2026-12", "停用")
+
+	msg := h.runExpectErr("bill", "settle", "c1", "2026-10")
+	if !strings.Contains(msg, "暂停区间 [2026-10, 2026-12)") || !strings.Contains(msg, "不封账") {
+		t.Fatalf("暂停月单笔结算应拒绝: %s", msg)
+	}
+	h.runExpectErr("bill", "settle", "c1", "2026-11")
+	if msg := h.runExpectErr("bill", "show", "c1", "2026-10"); !strings.Contains(msg, "尚无账单") {
+		t.Fatalf("暂停月不应生成账单: %s", msg)
+	}
+
+	// 批量清单包含暂停月时整批拒绝：不留下任何新账单或封账。
+	f := h.writeFile("u.csv", csvHeader+
+		"u1,c1,2026-12-05T00:00:00Z,3\n"+
+		"u2,c2,2026-10-05T00:00:00Z,4\n")
+	h.mustRun("usage", "import", f)
+	msg = h.runExpectErr("bill", "settle-batch", "c1", "2026-12", "c2", "2026-10", "c1", "2026-10")
+	if !strings.Contains(msg, "整批未生效") || !strings.Contains(msg, "暂停区间") {
+		t.Fatalf("批量含暂停月应整批拒绝: %s", msg)
+	}
+	for _, m := range []string{"2026-10", "2026-12"} {
+		if msg := h.runExpectErr("bill", "show", "c1", m); !strings.Contains(msg, "尚无账单") {
+			t.Fatalf("整批拒绝不应留下 %s 账单: %s", m, msg)
+		}
+	}
+	if msg := h.runExpectErr("bill", "show", "c2", "2026-10"); !strings.Contains(msg, "尚无账单") {
+		t.Fatalf("整批拒绝不应封账其他客户: %s", msg)
+	}
+
+	// 恢复服务后：按账期有效方案收取一次整月月费，用量从零累计，不补收暂停月。
+	out := h.mustRun("bill", "settle", "c1", "2026-12")
+	if !strings.Contains(out, "月费：1000 分") || !strings.Contains(out, "用量费：30 分") ||
+		!strings.Contains(out, "原总金额：1030 分") {
+		t.Fatalf("恢复月结算异常:\n%s", out)
+	}
+}
+
+func TestPauseDoesNotConsumeSeq(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("plan", "add", "p1", "阶梯", "-:10")
+	h.mustRun("customer", "add-plan", "c1", "客户一", "p1")
+	f := h.writeFile("u.csv", csvHeader+"u1,c1,2026-09-05T00:00:00Z,3\n")
+	h.mustRun("usage", "import", f)
+	h.mustRun("bill", "settle", "c1", "2026-09")
+	// 暂停登记不产生账后流水事件、不占用全局操作序号。
+	h.mustRun("pause", "add", "c1", "2026-10", "2026-12", "停用")
+	h.mustRun("bill", "adjust", "c1", "2026-09", "adj-1", "5", "补收")
+	ledger := h.mustRun("bill", "ledger", "c1", "2026-09")
+	if !strings.Contains(ledger, "存档全局序号上限：1") || !strings.Contains(ledger, "序号 1 调整 adj-1") {
+		t.Fatalf("暂停登记占用了操作序号:\n%s", ledger)
+	}
+}
+
+func TestPausePlanChangeUnaffected(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("plan", "add", "p1", "旧阶梯", "-:10")
+	h.mustRun("plan", "add", "p2", "新阶梯", "-:1")
+	h.mustRun("customer", "add-plan", "c1", "客户一", "p1")
+	h.mustRun("pause", "add", "c1", "2026-10", "2026-12", "停用")
+	// 暂停不改动方案变更限制：变更生效月仍按递增追加、晚于封账月。
+	h.mustRun("plan", "change", "c1", "2026-11", "p2", "续期新价")
+	// 恢复月按账期有效方案计价（新方案单价 1）。
+	f := h.writeFile("u.csv", csvHeader+"u1,c1,2026-12-05T00:00:00Z,6\n")
+	h.mustRun("usage", "import", f)
+	out := h.mustRun("bill", "settle", "c1", "2026-12")
+	if !strings.Contains(out, "方案：p2（新阶梯）") || !strings.Contains(out, "总金额：6 分") {
+		t.Fatalf("恢复月应按有效方案计价:\n%s", out)
+	}
+	// 暂停月仍拒绝结算。
+	h.runExpectErr("bill", "settle", "c1", "2026-11")
+}
+
+func TestPauseCorruptStateRejected(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("plan", "add", "p1", "阶梯", "-:10")
+	h.mustRun("customer", "add-plan", "c1", "客户一", "p1")
+	h.mustRun("pause", "add", "c1", "2026-10", "2026-12", "停用")
+
+	good, err := os.ReadFile(h.statePath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct{ old, new string }{
+		{`"end_month": "2026-12"`, `"end_month": "2026-10"`},    // 结束月不晚于起月
+		{`"end_month": "2026-12"`, `"end_month": "2026-13"`},    // 非法月份
+		{`"reason": "停用"`, `"reason": "  "`},                    // 原因为空
+		{`"customer_id": "c1"`, `"customer_id": "ghost"`},       // 客户引用失效
+		{`"start_month": "2026-10"`, `"start_month": "2026-1"`}, // 起月格式非法
+	}
+	for _, tc := range cases {
+		broken := strings.Replace(string(good), tc.old, tc.new, 1)
+		if broken == string(good) {
+			t.Fatalf("替换 %q 未生效", tc.old)
+		}
+		if err := os.WriteFile(h.statePath(), []byte(broken), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		msg := h.runExpectErr("pause", "list", "c1")
+		if !strings.Contains(msg, "损坏") {
+			t.Fatalf("篡改 %q 未报损坏: %s", tc.old, msg)
+		}
+		got, _ := os.ReadFile(h.statePath())
+		if string(got) != broken {
+			t.Fatalf("篡改 %q 后文件被改写", tc.old)
+		}
+	}
+	// 同客户区间重叠。
+	overlap := strings.Replace(string(good),
+		`"pauses": {`,
+		`"pauses": {
+    "c1|2026-11": {
+      "customer_id": "c1",
+      "start_month": "2026-11",
+      "end_month": "2027-01",
+      "reason": "重叠",
+      "created_at": "2026-10-01T00:00:00Z"
+    },`, 1)
+	if overlap == string(good) {
+		t.Fatal("重叠替换未生效")
+	}
+	if err := os.WriteFile(h.statePath(), []byte(overlap), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if msg := h.runExpectErr("pause", "list", "c1"); !strings.Contains(msg, "重叠") {
+		t.Fatalf("区间重叠未报损坏: %s", msg)
+	}
+	// 暂停月存在用量。
+	withUsage := strings.Replace(string(good),
+		`"usage": {}`,
+		`"usage": {
+    "u1": {
+      "id": "u1",
+      "customer_id": "c1",
+      "time": "2026-10-05T00:00:00Z",
+      "quantity": 3
+    }
+  }`, 1)
+	if withUsage == string(good) {
+		t.Fatal("用量替换未生效")
+	}
+	if err := os.WriteFile(h.statePath(), []byte(withUsage), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if msg := h.runExpectErr("pause", "list", "c1"); !strings.Contains(msg, "损坏") {
+		t.Fatalf("暂停月存在用量未报损坏: %s", msg)
+	}
+	// 恢复完好存档后一切正常。
+	if err := os.WriteFile(h.statePath(), good, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h.mustRun("pause", "list", "c1")
+}
+
+func TestPauseOldStateFileWithoutPauses(t *testing.T) {
+	h := newHarness(t)
+	// 旧格式存档：无 pauses 字段，视为正常服务。
+	old := `{
+  "version": 1,
+  "customers": {"c1": {"id": "c1", "name": "老客户", "price_fen": 0, "plan_id": "p1"}},
+  "plans": {"p1": {"id": "p1", "name": "旧阶梯", "tiers": [{"limit": 0, "price_fen": 5}]}},
+  "usage": {"u1": {"id": "u1", "customer_id": "c1", "time": "2026-09-01T00:00:00Z", "quantity": 3}},
+  "bills": {}
+}
+`
+	if err := os.WriteFile(h.statePath(), []byte(old), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out := h.mustRun("pause", "list", "c1")
+	if !strings.Contains(out, "暂停区间：无") {
+		t.Fatalf("旧存档应视为无暂停:\n%s", out)
+	}
+	// 重启保持：登记后区间、幂等与暂停限制跨进程保持。
+	h.mustRun("pause", "add", "c1", "2026-10", "2026-12", "停用")
+	h.mustRun("pause", "add", "c1", "2026-10", "2026-12", "停用")
+	h.runExpectErr("bill", "settle", "c1", "2026-10")
+	out = h.mustRun("pause", "list", "c1", "2026-11")
+	if !strings.Contains(out, "月份 2026-11：暂停中") {
+		t.Fatalf("重启后暂停限制未保持:\n%s", out)
+	}
+	// 旧用量（非暂停月）结算不受影响。
+	out = h.mustRun("bill", "settle", "c1", "2026-09")
+	if !strings.Contains(out, "总金额：15 分") {
+		t.Fatalf("旧存档结算异常:\n%s", out)
+	}
+}

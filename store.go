@@ -176,6 +176,18 @@ type correction struct {
 	CreatedAt   string              `json:"created_at"`
 }
 
+// pause 是阶梯客户的一段按月订阅暂停区间：[起月, 结束月) 按 UTC 自然月
+// 解释，包含起月、不包含结束月，与操作当天无关。暂停月不接收新用量、不产生
+// 月费账单；区间之外正常服务。记录由客户与起月共同识别，一旦写入永不修改
+// 或删除；暂停不产生账后流水事件，也不占用全局操作序号。
+type pause struct {
+	CustomerID string `json:"customer_id"`
+	StartMonth string `json:"start_month"` // YYYY-MM（UTC），含
+	EndMonth   string `json:"end_month"`   // YYYY-MM（UTC），不含，须晚于起月
+	Reason     string `json:"reason"`
+	CreatedAt  string `json:"created_at"`
+}
+
 // planChange 是阶梯客户的一次按月生效的方案变更：自生效月（UTC 自然月，
 // 含）起改用目标方案，直到下一次变更；生效月之前的月份不受影响。记录一旦
 // 写入永不修改或删除；变更不产生账后流水事件，也不占用全局操作序号。
@@ -197,7 +209,8 @@ type state struct {
 	Payments    map[string]*payment     `json:"payments"`     // 全局唯一收款标识 -> 记录（与调整标识相互独立，可同名）
 	Corrections map[string]*correction  `json:"corrections"`  // 全局唯一更正标识 -> 记录（与收款、调整标识相互独立，可同名）
 	PlanChanges map[string]*planChange  `json:"plan_changes"` // 客户 + "|" + 生效月 -> 方案变更（按生效月递增追加，不可改写）
-	NextSeq     int64                   `json:"next_seq"`     // 已分配的最大操作序号（调整/收款/更正及其撤销共用；方案变更不占用）
+	Pauses      map[string]*pause       `json:"pauses"`       // 客户 + "|" + 起月 -> 订阅暂停区间（不可改写）
+	NextSeq     int64                   `json:"next_seq"`     // 已分配的最大操作序号（调整/收款/更正及其撤销共用；方案变更与暂停不占用）
 	path        string                  `json:"-"`
 }
 
@@ -232,7 +245,8 @@ func loadStore(dir string) (*state, error) {
 		return nil, fmt.Errorf("数据文件已损坏: %w", err)
 	}
 	// 旧版本数据文件没有 plans/adjustments/payments/corrections/plan_changes/
-	// next_seq 字段：视为零方案、零调整、零实收、零更正、零方案变更。
+	// pauses/next_seq 字段：视为零方案、零调整、零实收、零更正、零方案变更、
+	// 零暂停（即全部月份正常服务）。
 	if s.Plans == nil {
 		s.Plans = map[string]*plan{}
 	}
@@ -247,6 +261,9 @@ func loadStore(dir string) (*state, error) {
 	}
 	if s.PlanChanges == nil {
 		s.PlanChanges = map[string]*planChange{}
+	}
+	if s.Pauses == nil {
+		s.Pauses = map[string]*pause{}
 	}
 	s.path = p
 	return &s, nil
@@ -263,6 +280,7 @@ func newState(p string) *state {
 		Payments:    map[string]*payment{},
 		Corrections: map[string]*correction{},
 		PlanChanges: map[string]*planChange{},
+		Pauses:      map[string]*pause{},
 		path:        p,
 	}
 }
@@ -329,6 +347,48 @@ func (s *state) validate() error {
 		}
 		if strings.TrimSpace(ch.Reason) == "" {
 			return fmt.Errorf("方案变更 %q 的原因为空", key)
+		}
+	}
+	// 订阅暂停：键、客户（须为绑定阶梯方案的客户）、起止月与原因都必须
+	// 自洽；同一客户的区间不得重叠（可以相接）；暂停月内不得存在用量或
+	// 账单（登记与导入/结算入口均已拦截，此处兜底核验存档一致）。
+	for key, p := range s.Pauses {
+		if p == nil {
+			return fmt.Errorf("暂停区间 %q 的数据为空", key)
+		}
+		if pauseKey(p.CustomerID, p.StartMonth) != key {
+			return fmt.Errorf("暂停区间键不一致: 键 %q / 客户起月 %s|%s", key, p.CustomerID, p.StartMonth)
+		}
+		c, ok := s.Customers[p.CustomerID]
+		if !ok {
+			return fmt.Errorf("暂停区间 %q 引用了不存在的客户 %q", key, p.CustomerID)
+		}
+		if c.PlanID == "" {
+			return fmt.Errorf("暂停区间 %q 的客户 %q 未绑定阶梯方案（固定单价客户不适用暂停）", key, p.CustomerID)
+		}
+		if !validMonth(p.StartMonth) || !validMonth(p.EndMonth) || p.EndMonth <= p.StartMonth {
+			return fmt.Errorf("暂停区间 %q 的区间非法（[%s, %s)，结束月须晚于起月）", key, p.StartMonth, p.EndMonth)
+		}
+		if strings.TrimSpace(p.Reason) == "" {
+			return fmt.Errorf("暂停区间 %q 的原因为空", key)
+		}
+	}
+	for id, pauses := range groupPausesByCustomer(s) {
+		for i := 1; i < len(pauses); i++ {
+			if pauses[i].StartMonth < pauses[i-1].EndMonth {
+				return fmt.Errorf("客户 %s 的暂停区间 [%s, %s) 与 [%s, %s) 重叠",
+					id, pauses[i-1].StartMonth, pauses[i-1].EndMonth, pauses[i].StartMonth, pauses[i].EndMonth)
+			}
+		}
+	}
+	for _, u := range s.Usage {
+		if s.paused(u.CustomerID, utcMonth(u.Time)) {
+			return fmt.Errorf("用量 %q 落在客户 %s 的暂停月 %s 内", u.ID, u.CustomerID, utcMonth(u.Time))
+		}
+	}
+	for key, b := range s.Bills {
+		if s.paused(b.CustomerID, b.Month) {
+			return fmt.Errorf("账单 %q 的月份处于客户 %s 的暂停区间内", key, b.CustomerID)
 		}
 	}
 	for id, u := range s.Usage {
@@ -841,6 +901,55 @@ func billKey(customerID, month string) string {
 
 func planChangeKey(customerID, month string) string {
 	return customerID + "|" + month
+}
+
+func pauseKey(customerID, startMonth string) string {
+	return customerID + "|" + startMonth
+}
+
+// pausesFor 返回某客户的全部暂停区间，按起月升序。
+func (s *state) pausesFor(customerID string) []*pause {
+	var list []*pause
+	for _, p := range s.Pauses {
+		if p.CustomerID == customerID {
+			list = append(list, p)
+		}
+	}
+	sort.Slice(list, func(i, j int) bool { return list[i].StartMonth < list[j].StartMonth })
+	return list
+}
+
+// groupPausesByCustomer 返回按客户分组、组内按起月升序的全部暂停区间。
+func groupPausesByCustomer(s *state) map[string][]*pause {
+	byCust := make(map[string][]*pause)
+	for _, p := range s.Pauses {
+		byCust[p.CustomerID] = append(byCust[p.CustomerID], p)
+	}
+	for _, list := range byCust {
+		sort.Slice(list, func(i, j int) bool { return list[i].StartMonth < list[j].StartMonth })
+	}
+	return byCust
+}
+
+// paused 报告某客户的指定 UTC 自然月（YYYY-MM）是否处于任一暂停区间
+// [起月, 结束月) 内；区间按月份字符串比较即符合自然月先后。
+func (s *state) paused(customerID, month string) bool {
+	for _, p := range s.Pauses {
+		if p.CustomerID == customerID && month >= p.StartMonth && month < p.EndMonth {
+			return true
+		}
+	}
+	return false
+}
+
+// pauseCovering 返回覆盖指定月份的暂停区间；无覆盖时返回 nil。
+func (s *state) pauseCovering(customerID, month string) *pause {
+	for _, p := range s.Pauses {
+		if p.CustomerID == customerID && month >= p.StartMonth && month < p.EndMonth {
+			return p
+		}
+	}
+	return nil
 }
 
 // planChangesFor 返回某客户的全部方案变更，按生效月升序。
