@@ -23,9 +23,25 @@ import (
 const stateVersion = 1
 
 type customer struct {
+	ID     string `json:"id"`
+	Name   string `json:"name"`
+	Price  int64  `json:"price_fen"`        // 固定单价，非负整数分，创建后不可修改
+	PlanID string `json:"plan_id,omitempty"` // 绑定的阶梯计费方案标识；空表示固定单价客户，创建后不可变更
+}
+
+// tier 是阶梯计费方案中的一档：Limit 为月累计数量上限（正整数），
+// 仅最后一档无上限（Limit 为 0）；Price 为该档每单位价格（非负整数分）。
+type tier struct {
+	Limit int64 `json:"limit"`     // 累计数量上限；0 表示无上限（仅最后一档）
+	Price int64 `json:"price_fen"` // 每单位价格，非负整数分，可升可降
+}
+
+// plan 是按月累计用量的阶梯计费方案：标识唯一非空、名称非空、至少一档
+// 有序阶梯；创建后不可修改。
+type plan struct {
 	ID    string `json:"id"`
 	Name  string `json:"name"`
-	Price int64  `json:"price_fen"` // 固定单价，非负整数分，创建后不可修改
+	Tiers []tier `json:"tiers"` // 至少一档；有限上限严格递增，最后一档无上限
 }
 
 type usageRecord struct {
@@ -35,22 +51,42 @@ type usageRecord struct {
 	Quantity   int64  `json:"quantity"`
 }
 
+// lineSegment 是阶梯计费下一条用量记录落入某一档的分段：数量与小计；
+// 该档单价由账单保存的方案规则按档位序号取得。
+type lineSegment struct {
+	Tier     int   `json:"tier"`     // 档位序号（0 起，对应账单保存的方案规则）
+	Quantity int64 `json:"quantity"` // 落入本档的数量
+	Fee      int64 `json:"fee_fen"`  // 本分段小计（数量 × 该档单价）
+}
+
+// tierTotal 是阶梯账单中某一档的合计数量与金额（与 PlanTiers 顺序对齐）。
+type tierTotal struct {
+	Quantity int64 `json:"quantity"`
+	Fee      int64 `json:"fee_fen"`
+}
+
 type billLine struct {
-	UsageID  string `json:"usage_id"`
-	Time     string `json:"time"`
-	Quantity int64  `json:"quantity"`
-	LineFee  int64  `json:"line_fee_fen"`
+	UsageID  string        `json:"usage_id"`
+	Time     string        `json:"time"`
+	Quantity int64         `json:"quantity"`
+	LineFee  int64         `json:"line_fee_fen"`
+	Segments []lineSegment `json:"segments,omitempty"` // 阶梯账单：本条用量的跨档分段
 }
 
 type bill struct {
-	ID         string     `json:"id"`
-	CustomerID string     `json:"customer_id"`
-	Month      string     `json:"month"` // YYYY-MM（UTC）
-	TotalQty   int64      `json:"total_quantity"`
-	UnitPrice  int64      `json:"unit_price_fen"`
-	TotalFee   int64      `json:"total_fee_fen"`
-	Lines      []billLine `json:"lines"`
-	CreatedAt  string     `json:"created_at"`
+	ID         string      `json:"id"`
+	CustomerID string      `json:"customer_id"`
+	Month      string      `json:"month"` // YYYY-MM（UTC）
+	Pricing    string      `json:"pricing,omitempty"`      // 计价类型：空或 fixed 为固定单价；tiered 为阶梯计费
+	PlanID     string      `json:"plan_id,omitempty"`      // 阶梯账单：方案标识
+	PlanName   string      `json:"plan_name,omitempty"`    // 阶梯账单：方案名称（快照）
+	PlanTiers  []tier      `json:"plan_tiers,omitempty"`   // 阶梯账单：完整方案规则（快照）
+	TierTotals []tierTotal `json:"tier_totals,omitempty"`  // 阶梯账单：各档实际数量与金额合计
+	TotalQty   int64       `json:"total_quantity"`
+	UnitPrice  int64       `json:"unit_price_fen"` // 固定单价账单的单价；阶梯账单恒为 0（不伪造统一单价）
+	TotalFee   int64       `json:"total_fee_fen"`
+	Lines      []billLine  `json:"lines"`
+	CreatedAt  string      `json:"created_at"`
 }
 
 // adjustment 是对已结算账单的一次费用调整（正数补收、负数减免）。
@@ -139,6 +175,7 @@ type correction struct {
 type state struct {
 	Version     int                     `json:"version"`
 	Customers   map[string]*customer    `json:"customers"`
+	Plans       map[string]*plan        `json:"plans"`       // 全局唯一方案标识 -> 阶梯计费方案
 	Usage       map[string]*usageRecord `json:"usage"`       // 全局唯一用量标识 -> 记录
 	Bills       map[string]*bill        `json:"bills"`       // 客户 + "|" + 月份 -> 账单
 	Adjustments map[string]*adjustment  `json:"adjustments"` // 全局唯一调整标识 -> 记录
@@ -175,8 +212,11 @@ func loadStore(dir string) (*state, error) {
 	if err := s.validate(); err != nil {
 		return nil, fmt.Errorf("数据文件已损坏: %w", err)
 	}
-	// 旧版本数据文件没有 adjustments/payments/corrections/next_seq 字段：
-	// 视为零调整、零实收、零更正。
+	// 旧版本数据文件没有 plans/adjustments/payments/corrections/next_seq 字段：
+	// 视为零方案、零调整、零实收、零更正。
+	if s.Plans == nil {
+		s.Plans = map[string]*plan{}
+	}
 	if s.Adjustments == nil {
 		s.Adjustments = map[string]*adjustment{}
 	}
@@ -194,6 +234,7 @@ func newState(p string) *state {
 	return &state{
 		Version:     stateVersion,
 		Customers:   map[string]*customer{},
+		Plans:       map[string]*plan{},
 		Usage:       map[string]*usageRecord{},
 		Bills:       map[string]*bill{},
 		Adjustments: map[string]*adjustment{},
@@ -211,6 +252,17 @@ func (s *state) validate() error {
 	if s.Customers == nil || s.Usage == nil || s.Bills == nil {
 		return errors.New("缺少必要的数据节")
 	}
+	for id, p := range s.Plans {
+		if p == nil {
+			return fmt.Errorf("方案 %q 的数据为空", id)
+		}
+		if p.ID != id {
+			return fmt.Errorf("方案标识不一致: 键 %q / 记录 %q", id, p.ID)
+		}
+		if err := validatePlanRules(p); err != nil {
+			return err
+		}
+	}
 	for id, c := range s.Customers {
 		if c == nil {
 			return fmt.Errorf("客户 %q 的数据为空", id)
@@ -223,6 +275,11 @@ func (s *state) validate() error {
 		}
 		if c.Price < 0 {
 			return fmt.Errorf("客户 %q 单价为负", id)
+		}
+		if c.PlanID != "" {
+			if _, ok := s.Plans[c.PlanID]; !ok {
+				return fmt.Errorf("客户 %q 绑定了不存在的方案 %q", id, c.PlanID)
+			}
 		}
 	}
 	for id, u := range s.Usage {
@@ -290,17 +347,34 @@ func (s *state) validate() error {
 			return fmt.Errorf("账单 %q 总金额与明细不符", key)
 		}
 		c := s.Customers[b.CustomerID]
-		for _, ln := range b.Lines {
-			lf, err := mul64(ln.Quantity, c.Price)
-			if err != nil {
-				return fmt.Errorf("账单 %q 明细 %q 小计溢出", key, ln.UsageID)
+		switch b.Pricing {
+		case "", "fixed":
+			// 固定单价账单：每条小计必须等于 数量×客户固定单价，且不得
+			// 携带阶梯方案信息或分段。
+			if b.PlanID != "" || b.PlanName != "" || len(b.PlanTiers) > 0 || len(b.TierTotals) > 0 {
+				return fmt.Errorf("账单 %q 是固定单价账单但携带阶梯方案信息", key)
 			}
-			if lf != ln.LineFee {
-				return fmt.Errorf("账单 %q 明细 %q 小计与数量×单价不符", key, ln.UsageID)
+			for _, ln := range b.Lines {
+				if len(ln.Segments) > 0 {
+					return fmt.Errorf("账单 %q 的明细 %q 携带阶梯分段", key, ln.UsageID)
+				}
+				lf, err := mul64(ln.Quantity, c.Price)
+				if err != nil {
+					return fmt.Errorf("账单 %q 明细 %q 小计溢出", key, ln.UsageID)
+				}
+				if lf != ln.LineFee {
+					return fmt.Errorf("账单 %q 明细 %q 小计与数量×单价不符", key, ln.UsageID)
+				}
 			}
-		}
-		if b.UnitPrice != c.Price {
-			return fmt.Errorf("账单 %q 单价与客户固定单价不符", key)
+			if b.UnitPrice != c.Price {
+				return fmt.Errorf("账单 %q 单价与客户固定单价不符", key)
+			}
+		case "tiered":
+			if err := s.validateTieredBill(key, b, c); err != nil {
+				return err
+			}
+		default:
+			return fmt.Errorf("账单 %q 的计价类型 %q 未知", key, b.Pricing)
 		}
 		// 封账期内不得存在游离于账单之外的用量（封账后新增被禁止，
 		// 而已入账记录理应全部在明细中）。
@@ -516,6 +590,134 @@ func (s *state) validate() error {
 		if received > payable {
 			return fmt.Errorf("账单 %q 的实收 %d 分超过当前应付 %d 分", key, received, payable)
 		}
+	}
+	return nil
+}
+
+// validatePlanRules 校验阶梯方案的标识、名称与阶梯规则本身自洽：
+// 至少一档，有限上限为严格递增的正整数，最后一档无上限，单价非负。
+func validatePlanRules(p *plan) error {
+	if p.ID == "" || p.Name == "" {
+		return fmt.Errorf("方案 %q 的标识或名称为空", p.ID)
+	}
+	if len(p.Tiers) == 0 {
+		return fmt.Errorf("方案 %q 至少需要一档阶梯", p.ID)
+	}
+	prev := int64(0)
+	for i, t := range p.Tiers {
+		if t.Price < 0 {
+			return fmt.Errorf("方案 %q 第 %d 档单价为负", p.ID, i+1)
+		}
+		if i == len(p.Tiers)-1 {
+			if t.Limit != 0 {
+				return fmt.Errorf("方案 %q 最后一档必须无上限", p.ID)
+			}
+		} else {
+			if t.Limit <= 0 {
+				return fmt.Errorf("方案 %q 第 %d 档上限必须是正整数", p.ID, i+1)
+			}
+			if t.Limit <= prev {
+				return fmt.Errorf("方案 %q 的有限上限必须严格递增", p.ID)
+			}
+			prev = t.Limit
+		}
+	}
+	return nil
+}
+
+// tiersEqual 判定两份阶梯规则完全相同。
+func tiersEqual(a, b []tier) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// segmentsEqual 判定两份分段列表完全相同。
+func segmentsEqual(a, b []lineSegment) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	for i := range a {
+		if a[i] != b[i] {
+			return false
+		}
+	}
+	return true
+}
+
+// sortedByInstant 判定用量记录是否按（解析后的时间点升序、同一时间按
+// 标识字典序）排列，即阶梯计价的计价顺序。
+func sortedByInstant(recs []*usageRecord) bool {
+	for i := 1; i < len(recs); i++ {
+		ti, _ := time.Parse(time.RFC3339, recs[i-1].Time)
+		tj, _ := time.Parse(time.RFC3339, recs[i].Time)
+		ui, uj := ti.UTC(), tj.UTC()
+		if uj.Before(ui) || (uj.Equal(ui) && recs[i].ID <= recs[i-1].ID) {
+			return false
+		}
+	}
+	return true
+}
+
+// validateTieredBill 校验阶梯账单：方案引用有效、快照与方案一致、客户绑定
+// 未变更，并按保存的方案规则从零累计重放计价，逐条比对分段、小计、各档
+// 合计与总金额；任何不符都视为数据损坏。
+func (s *state) validateTieredBill(key string, b *bill, c *customer) error {
+	if b.PlanID == "" {
+		return fmt.Errorf("账单 %q 缺少方案标识", key)
+	}
+	p, ok := s.Plans[b.PlanID]
+	if !ok {
+		return fmt.Errorf("账单 %q 引用了不存在的方案 %q", key, b.PlanID)
+	}
+	if b.PlanName != p.Name {
+		return fmt.Errorf("账单 %q 的方案名称快照与方案 %q 不符", key, b.PlanID)
+	}
+	if !tiersEqual(b.PlanTiers, p.Tiers) {
+		return fmt.Errorf("账单 %q 的方案规则快照与方案 %q 不符", key, b.PlanID)
+	}
+	if c.PlanID != b.PlanID {
+		return fmt.Errorf("账单 %q 的方案 %q 与客户当前绑定 %q 不一致", key, b.PlanID, c.PlanID)
+	}
+	if b.UnitPrice != 0 {
+		return fmt.Errorf("账单 %q 是阶梯账单但保存了统一单价", key)
+	}
+	if len(b.TierTotals) != len(p.Tiers) {
+		return fmt.Errorf("账单 %q 的分档合计档数与方案规则不符", key)
+	}
+	// 明细必须按计价顺序排列（前面已逐条核验与用量记录一致）。
+	recs := make([]*usageRecord, len(b.Lines))
+	for i, ln := range b.Lines {
+		recs[i] = s.Usage[ln.UsageID]
+	}
+	if !sortedByInstant(recs) {
+		return fmt.Errorf("账单 %q 的明细未按计价顺序（时间点升序、同一时间按标识字典序）排列", key)
+	}
+	priced, err := tieredPrice(p.Tiers, recs)
+	if err != nil {
+		return fmt.Errorf("账单 %q 按方案规则计价失败: %w", key, err)
+	}
+	for i, ln := range b.Lines {
+		if !segmentsEqual(ln.Segments, priced.lines[i].segments) {
+			return fmt.Errorf("账单 %q 的明细 %q 分段与计价规则不符", key, ln.UsageID)
+		}
+		if ln.LineFee != priced.lines[i].fee {
+			return fmt.Errorf("账单 %q 的明细 %q 小计与计价规则不符", key, ln.UsageID)
+		}
+	}
+	for i, tt := range b.TierTotals {
+		if tt.Quantity != priced.tierQty[i] || tt.Fee != priced.tierFee[i] {
+			return fmt.Errorf("账单 %q 的第 %d 档合计与计价规则不符", key, i+1)
+		}
+	}
+	if b.TotalFee != priced.totalFee {
+		return fmt.Errorf("账单 %q 总金额与计价规则不符", key)
 	}
 	return nil
 }

@@ -2383,3 +2383,328 @@ func TestCorruptCorrectionDataRejected(t *testing.T) {
 		t.Fatal("损坏文件被改写")
 	}
 }
+
+// --- 阶梯计费方案 ---
+
+func TestPlanAddShowListAndPersistence(t *testing.T) {
+	h := newHarness(t)
+	out := h.mustRun("plan", "add", "p1", "标准阶梯", "100:10", "500:8", "-:5")
+	for _, want := range []string{"方案标识：p1", "方案名称：标准阶梯", "第 1 档：累计上限 100，单价 10 分", "第 2 档：累计上限 500，单价 8 分", "第 3 档：累计数量无上限，单价 5 分"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("plan add 输出缺少 %q:\n%s", want, out)
+		}
+	}
+	// 查询与列表（每次调用重新从磁盘载入，天然验证持久化）。
+	show := h.mustRun("plan", "show", "p1")
+	if !strings.Contains(show, "第 3 档：累计数量无上限，单价 5 分") {
+		t.Fatalf("plan show 输出异常:\n%s", show)
+	}
+	list := h.mustRun("plan", "list")
+	if !strings.Contains(list, "已登记阶梯计费方案 1 个") || !strings.Contains(list, "p1（标准阶梯）：3 档，规则 100:10 500:8 -:5") {
+		t.Fatalf("plan list 输出异常:\n%s", list)
+	}
+	// 单档方案（仅无上限档）合法。
+	h.mustRun("plan", "add", "p0", "单档", "-:7")
+	if msg := h.runExpectErr("plan", "show", "ghost"); !strings.Contains(msg, "不存在") {
+		t.Fatal(msg)
+	}
+}
+
+func TestPlanAddValidation(t *testing.T) {
+	h := newHarness(t)
+	cases := [][]string{
+		{"plan", "add", "p1", "名称"},                              // 缺少阶梯（用法错误）
+		{"plan", "add", "p1", "名称", "abc"},                       // 格式非法
+		{"plan", "add", "p1", "名称", "100:1", "100:2", "-:3"},     // 上限未严格递增
+		{"plan", "add", "p1", "名称", "200:1", "100:2", "-:3"},     // 上限倒退
+		{"plan", "add", "p1", "名称", "0:1", "-:2"},                // 上限非正
+		{"plan", "add", "p1", "名称", "-5:1", "-:2"},               // 上限为负
+		{"plan", "add", "p1", "名称", "100:-1", "-:2"},             // 单价为负
+		{"plan", "add", "p1", "名称", "100:1", "200:2"},            // 最后一档有上限
+		{"plan", "add", "p1", "名称", "-:1", "100:2"},              // 无上限档不在最后
+		{"plan", "add", "p1", "名称", "100", "-:2"},                // 缺少冒号
+		{"plan", "add", "p1", "名称", "100:abc", "-:2"},            // 单价非整数
+		{"plan", "add", "p1", "", "100:1", "-:2"},                  // 空名称
+		{"plan", "add", "", "名称", "100:1", "-:2"},                // 空标识
+	}
+	for _, args := range cases {
+		h.runExpectErr(args...)
+	}
+	// 失败的新增不占标识：同一标识随后可正常登记。
+	if msg := h.runExpectErr("plan", "show", "p1"); !strings.Contains(msg, "不存在") {
+		t.Fatal(msg)
+	}
+	h.mustRun("plan", "add", "p1", "名称", "100:1", "-:2")
+	// 重复方案标识拒绝，方案创建后不可修改。
+	if msg := h.runExpectErr("plan", "add", "p1", "另一个", "-:9"); !strings.Contains(msg, "已存在") {
+		t.Fatal(msg)
+	}
+	show := h.mustRun("plan", "show", "p1")
+	if !strings.Contains(show, "规则") || !strings.Contains(show, "累计上限 100，单价 1 分") {
+		t.Fatalf("方案被重复登记改写:\n%s", show)
+	}
+}
+
+func TestCustomerAddPlan(t *testing.T) {
+	h := newHarness(t)
+	// 方案不存在时拒绝。
+	if msg := h.runExpectErr("customer", "add-plan", "c1", "客户一", "ghost"); !strings.Contains(msg, "不存在") {
+		t.Fatal(msg)
+	}
+	h.mustRun("plan", "add", "p1", "标准阶梯", "100:10", "-:5")
+	out := h.mustRun("customer", "add-plan", "c1", "客户一", "p1")
+	if !strings.Contains(out, `绑定阶梯计费方案 "p1"`) {
+		t.Fatalf("add-plan 输出异常:\n%s", out)
+	}
+	// 标识和名称规则不变。
+	h.runExpectErr("customer", "add-plan", "", "客户", "p1")
+	h.runExpectErr("customer", "add-plan", "c2", "", "p1")
+	h.runExpectErr("customer", "add-plan", "c2", "客户", "")
+	// 重复客户标识拒绝（两个入口都不可复用），绑定不可变更。
+	h.runExpectErr("customer", "add-plan", "c1", "客户一", "p1")
+	h.runExpectErr("customer", "add", "c1", "客户一", "10")
+	// 固定单价客户同样不能再登记为方案客户。
+	h.mustRun("customer", "add", "c9", "客户九", "10")
+	h.runExpectErr("customer", "add-plan", "c9", "客户九", "p1")
+}
+
+func TestTieredSettleCrossTierAndSegments(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("plan", "add", "p1", "标准阶梯", "100:10", "-:5")
+	h.mustRun("customer", "add-plan", "c1", "客户一", "p1")
+	f := h.writeFile("u.csv", csvHeader+
+		"u1,c1,2026-09-01T00:00:00Z,60\n"+
+		"u2,c1,2026-09-02T00:00:00Z,80\n")
+	h.mustRun("usage", "import", f)
+
+	out1 := h.mustRun("bill", "settle", "c1", "2026-09")
+	for _, want := range []string{
+		"计价类型：阶梯计费",
+		"方案：p1（标准阶梯）",
+		"第 1 档：累计上限 100，单价 10 分",
+		"第 2 档：累计数量无上限，单价 5 分",
+		"总数量：140",
+		"总金额：1200 分",
+		"第 1 档：数量 100，单价 10 分，金额 1000 分",
+		"第 2 档：数量 40，单价 5 分，金额 200 分",
+		"用量标识=u1 时间=2026-09-01T00:00:00Z 数量=60 小计=600 分",
+		"分段 1：第 1 档 数量=60 单价=10 分 小计=600 分",
+		"用量标识=u2 时间=2026-09-02T00:00:00Z 数量=80 小计=600 分",
+		"分段 1：第 1 档 数量=40 单价=10 分 小计=400 分",
+		"分段 2：第 2 档 数量=40 单价=5 分 小计=200 分",
+	} {
+		if !strings.Contains(out1, want) {
+			t.Fatalf("阶梯账单输出缺少 %q:\n%s", want, out1)
+		}
+	}
+	// 阶梯账单不伪造统一单价。
+	if strings.Contains(out1, "\n单价：") {
+		t.Fatalf("阶梯账单不应出现统一单价行:\n%s", out1)
+	}
+
+	// bill show 与重复 bill settle 返回相同计费明细。
+	idx := strings.Index(out1, "\n\n")
+	if idx < 0 {
+		t.Fatalf("结算输出缺少账单部分:\n%s", out1)
+	}
+	billText := out1[idx+2:]
+	out2 := h.mustRun("bill", "settle", "c1", "2026-09")
+	show := h.mustRun("bill", "show", "c1", "2026-09")
+	if show != billText || !strings.HasSuffix(out2, billText) {
+		t.Fatalf("重复结算/查询明细不一致:\nsettle1=%q\nsettle2=%q\nshow=%q", out1, out2, show)
+	}
+
+	// 固定单价客户与阶梯客户互不影响。
+	h.mustRun("customer", "add", "c9", "客户九", "10")
+	f9 := h.writeFile("u9.csv", csvHeader+"u9,c9,2026-09-01T00:00:00Z,7\n")
+	h.mustRun("usage", "import", f9)
+	out9 := h.mustRun("bill", "settle", "c9", "2026-09")
+	if !strings.Contains(out9, "单价：10 分") || strings.Contains(out9, "计价类型") {
+		t.Fatalf("固定单价账单展示异常:\n%s", out9)
+	}
+}
+
+func TestTieredSettleOrderingAndTieBreak(t *testing.T) {
+	h := newHarness(t)
+	// 单价可升：同一时间按标识字典序计价。
+	h.mustRun("plan", "add", "p2", "递增阶梯", "10:1", "-:100")
+	h.mustRun("customer", "add-plan", "c2", "客户二", "p2")
+	f := h.writeFile("u2.csv", csvHeader+
+		"u-b,c2,2026-09-10T00:00:00Z,10\n"+
+		"u-a,c2,2026-09-10T00:00:00Z,10\n")
+	h.mustRun("usage", "import", f)
+	out := h.mustRun("bill", "settle", "c2", "2026-09")
+	ia, ib := strings.Index(out, "用量标识=u-a"), strings.Index(out, "用量标识=u-b")
+	if ia < 0 || ib < 0 || ia > ib {
+		t.Fatalf("同一时间未按标识字典序计价:\n%s", out)
+	}
+	if !strings.Contains(out, "用量标识=u-a 时间=2026-09-10T00:00:00Z 数量=10 小计=10 分") ||
+		!strings.Contains(out, "用量标识=u-b 时间=2026-09-10T00:00:00Z 数量=10 小计=1000 分") ||
+		!strings.Contains(out, "总金额：1010 分") {
+		t.Fatalf("同时间字典序计价结果异常:\n%s", out)
+	}
+
+	// 按解析后的时间点升序计价，与导入顺序无关。
+	h.mustRun("plan", "add", "p3", "递减阶梯", "5:10", "-:1")
+	h.mustRun("customer", "add-plan", "c3", "客户三", "p3")
+	f3 := h.writeFile("u3.csv", csvHeader+
+		"u-later,c3,2026-09-20T00:00:00Z,5\n"+
+		"u-earlier,c3,2026-09-01T00:00:00Z,10\n")
+	h.mustRun("usage", "import", f3)
+	out3 := h.mustRun("bill", "settle", "c3", "2026-09")
+	// u-earlier 先计价：5×10 + 5×1 = 55；u-later 后计价：5×1 = 5；合计 60。
+	if !strings.Contains(out3, "用量标识=u-earlier 时间=2026-09-01T00:00:00Z 数量=10 小计=55 分") ||
+		!strings.Contains(out3, "用量标识=u-later 时间=2026-09-20T00:00:00Z 数量=5 小计=5 分") ||
+		!strings.Contains(out3, "总金额：60 分") {
+		t.Fatalf("按时间升序计价结果异常:\n%s", out3)
+	}
+}
+
+func TestTieredImportPrecheckFromZero(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("plan", "add", "p1", "天价阶梯", "-:9223372036854775807")
+	h.mustRun("customer", "add-plan", "c1", "客户一", "p1")
+	// 单条数量从零计价即溢出：整批拒绝，不留新用量。
+	f := h.writeFile("u.csv", csvHeader+"u1,c1,2026-09-01T00:00:00Z,2\n")
+	msg := h.runExpectErr("usage", "import", f)
+	if !strings.Contains(msg, "溢出") || !strings.Contains(msg, "整批未生效") {
+		t.Fatal(msg)
+	}
+	// 数量 1 不溢出，可正常导入。
+	f1 := h.writeFile("u1.csv", csvHeader+"u1,c1,2026-09-01T00:00:00Z,1\n")
+	h.mustRun("usage", "import", f1)
+}
+
+func TestTieredSettleOverflowRejectsWithoutSealing(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("plan", "add", "p1", "单档", "-:1")
+	h.mustRun("customer", "add-plan", "c1", "客户一", "p1")
+	f := h.writeFile("u.csv", csvHeader+
+		"u1,c1,2026-09-01T00:00:00Z,9223372036854775807\n"+
+		"u2,c1,2026-09-02T00:00:00Z,9223372036854775807\n")
+	h.mustRun("usage", "import", f)
+	msg := h.runExpectErr("bill", "settle", "c1", "2026-09")
+	if !strings.Contains(msg, "溢出") || !strings.Contains(msg, "不封账") {
+		t.Fatal(msg)
+	}
+	// 未封账：无账单，重复用量导入仍按重复跳过（说明状态未变）。
+	if msg := h.runExpectErr("bill", "show", "c1", "2026-09"); !strings.Contains(msg, "尚无账单") {
+		t.Fatal(msg)
+	}
+	out := h.mustRun("usage", "import", f)
+	if !strings.Contains(out, "新增 0 条，重复跳过 2 条") {
+		t.Fatalf("结算失败后状态发生变化:\n%s", out)
+	}
+}
+
+func TestTieredZeroFeeBillSeals(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("plan", "add", "p1", "免费阶梯", "100:0", "-:0")
+	h.mustRun("customer", "add-plan", "c1", "客户一", "p1")
+	f := h.writeFile("u.csv", csvHeader+"u1,c1,2026-09-01T00:00:00Z,50\n")
+	h.mustRun("usage", "import", f)
+	out := h.mustRun("bill", "settle", "c1", "2026-09")
+	if !strings.Contains(out, "总金额：0 分") || !strings.Contains(out, "已封账") {
+		t.Fatalf("零费用账单未正常封账:\n%s", out)
+	}
+	// 封账后新用量不得进入。
+	f2 := h.writeFile("u2.csv", csvHeader+"u2,c1,2026-09-02T00:00:00Z,1\n")
+	h.runExpectErr("usage", "import", f2)
+}
+
+func TestTieredAdjustPayLedgerFlow(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("plan", "add", "p1", "阶梯", "10:2", "-:1")
+	h.mustRun("customer", "add-plan", "c1", "客户一", "p1")
+	f := h.writeFile("u.csv", csvHeader+"u1,c1,2026-09-01T00:00:00Z,15\n")
+	h.mustRun("usage", "import", f)
+	h.mustRun("bill", "settle", "c1", "2026-09") // 10×2 + 5×1 = 25
+
+	h.mustRun("bill", "adjust", "c1", "2026-09", "adj-1", "5", "补收")
+	h.mustRun("bill", "pay", "c1", "2026-09", "pay-1", "30", "转账")
+	out := h.mustRun("bill", "show", "c1", "2026-09")
+	for _, want := range []string{"计价类型：阶梯计费", "总金额：25 分", "当前应付：30 分", "实收：30 分", "未收余额：0 分"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("阶梯账单账后操作展示缺少 %q:\n%s", want, out)
+		}
+	}
+	ledger := h.mustRun("bill", "ledger", "c1", "2026-09")
+	if !strings.Contains(ledger, "截止时余额：应付 30 分") {
+		t.Fatalf("阶梯账单流水异常:\n%s", ledger)
+	}
+	// 超额收款拒绝：0 ≤ 实收 ≤ 应付 对阶梯账单同样成立。
+	h.runExpectErr("bill", "pay", "c1", "2026-09", "pay-2", "1", "超额")
+}
+
+func TestTieredCorruptStateRejected(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("plan", "add", "p1", "标准阶梯", "100:10", "-:5")
+	h.mustRun("customer", "add-plan", "c1", "客户一", "p1")
+	f := h.writeFile("u.csv", csvHeader+
+		"u1,c1,2026-09-01T00:00:00Z,60\n"+
+		"u2,c1,2026-09-02T00:00:00Z,80\n")
+	h.mustRun("usage", "import", f)
+	h.mustRun("bill", "settle", "c1", "2026-09")
+
+	good, err := os.ReadFile(h.statePath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	cases := []struct{ old, new string }{
+		{`"line_fee_fen": 600`, `"line_fee_fen": 601`}, // 明细小计与计价规则不符
+		{`"fee_fen": 400`, `"fee_fen": 401`},            // 分段小计被篡改
+		{`"quantity": 100`, `"quantity": 101`},          // 分档合计被篡改
+		{`"total_fee_fen": 1200`, `"total_fee_fen": 1201`}, // 总金额被篡改
+		{`"plan_id": "p1"`, `"plan_id": "ghost"`},       // 方案引用失效
+		{`"plan_name": "标准阶梯"`, `"plan_name": "改名"`},   // 方案名称快照不符
+		{`"limit": 100`, `"limit": 101`},                // 方案规则快照不符
+	}
+	for _, tc := range cases {
+		broken := strings.Replace(string(good), tc.old, tc.new, 1)
+		if broken == string(good) {
+			t.Fatalf("替换 %q 未生效", tc.old)
+		}
+		if err := os.WriteFile(h.statePath(), []byte(broken), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		msg := h.runExpectErr("bill", "show", "c1", "2026-09")
+		if !strings.Contains(msg, "损坏") {
+			t.Fatalf("篡改 %q 未报损坏: %s", tc.old, msg)
+		}
+		got, _ := os.ReadFile(h.statePath())
+		if string(got) != broken {
+			t.Fatalf("篡改 %q 后文件被改写", tc.old)
+		}
+	}
+	// 恢复完好存档后一切正常。
+	if err := os.WriteFile(h.statePath(), good, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h.mustRun("bill", "show", "c1", "2026-09")
+}
+
+func TestOldStateFileWithoutPlans(t *testing.T) {
+	h := newHarness(t)
+	// 旧格式存档：无 plans 字段，客户与账单均为固定单价。
+	old := `{
+  "version": 1,
+  "customers": {"c1": {"id": "c1", "name": "老客户", "price_fen": 10}},
+  "usage": {"u1": {"id": "u1", "customer_id": "c1", "time": "2026-09-01T00:00:00Z", "quantity": 3}},
+  "bills": {}
+}
+`
+	if err := os.WriteFile(h.statePath(), []byte(old), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out := h.mustRun("bill", "settle", "c1", "2026-09")
+	if !strings.Contains(out, "单价：10 分") || !strings.Contains(out, "总金额：30 分") {
+		t.Fatalf("旧存档固定单价结算异常:\n%s", out)
+	}
+	// 重启（重新载入）后方案、绑定、账单与幂等保持。
+	h.mustRun("plan", "add", "p1", "新方案", "10:1", "-:2")
+	h.mustRun("customer", "add-plan", "c2", "新客户", "p1")
+	show := h.mustRun("bill", "show", "c1", "2026-09")
+	if !strings.Contains(show, "总金额：30 分") {
+		t.Fatalf("旧账单重启后异常:\n%s", show)
+	}
+}

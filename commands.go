@@ -30,7 +30,7 @@ func runCmd(args []string, dataDir string) error {
 	switch args[0] {
 	case "customer":
 		if len(args) < 2 {
-			return usageError("缺少子命令，应为：customer add <标识> <名称> <单价分>")
+			return usageError("缺少子命令，应为：customer add <标识> <名称> <单价分> 或 customer add-plan <标识> <名称> <方案标识>")
 		}
 		switch args[1] {
 		case "add":
@@ -38,8 +38,37 @@ func runCmd(args []string, dataDir string) error {
 				return usageError("用法：customer add <标识> <名称> <单价分>")
 			}
 			return cmdCustomerAdd(dataDir, args[2], args[3], args[4])
+		case "add-plan":
+			if len(args) != 5 {
+				return usageError("用法：customer add-plan <标识> <名称> <方案标识>")
+			}
+			return cmdCustomerAddPlan(dataDir, args[2], args[3], args[4])
 		default:
-			return usageError("未知 customer 子命令 %q；可用：add", args[1])
+			return usageError("未知 customer 子命令 %q；可用：add、add-plan", args[1])
+		}
+
+	case "plan":
+		if len(args) < 2 {
+			return usageError("缺少子命令，应为：plan add|show|list ...")
+		}
+		switch args[1] {
+		case "add":
+			if len(args) < 5 {
+				return usageError("用法：plan add <标识> <名称> <上限:单价分>... <-:单价分>")
+			}
+			return cmdPlanAdd(dataDir, args[2], args[3], args[4:])
+		case "show":
+			if len(args) != 3 {
+				return usageError("用法：plan show <标识>")
+			}
+			return cmdPlanShow(dataDir, args[2])
+		case "list":
+			if len(args) != 2 {
+				return usageError("用法：plan list")
+			}
+			return cmdPlanList(dataDir)
+		default:
+			return usageError("未知 plan 子命令 %q；可用：add、show、list", args[1])
 		}
 
 	case "usage":
@@ -115,7 +144,7 @@ func runCmd(args []string, dataDir string) error {
 		}
 
 	default:
-		return usageError("未知命令 %q；可用：customer、usage、bill", args[0])
+		return usageError("未知命令 %q；可用：customer、plan、usage、bill", args[0])
 	}
 }
 
@@ -211,10 +240,19 @@ func cmdUsageImport(dir, file string) error {
 			problems = append(problems, fmt.Sprintf("第 %d 行：客户标识 %q 不存在", r.line, r.rec.CustomerID))
 			continue
 		}
-		// 金额可行性预检：数量×固定单价不得溢出（金额单位：分）。
-		if _, err := mul64(r.rec.Quantity, cust.Price); err != nil {
-			problems = append(problems, fmt.Sprintf("第 %d 行：数量 %d × 单价 %d 金额溢出有符号 64 位整数范围", r.line, r.rec.Quantity, cust.Price))
-			continue
+		// 金额可行性预检：固定单价客户检查 数量×单价；阶梯客户以单条
+		// 数量从零计价，检查分段金额不溢出（金额单位：分）。
+		if cust.PlanID == "" {
+			if _, err := mul64(r.rec.Quantity, cust.Price); err != nil {
+				problems = append(problems, fmt.Sprintf("第 %d 行：数量 %d × 单价 %d 金额溢出有符号 64 位整数范围", r.line, r.rec.Quantity, cust.Price))
+				continue
+			}
+		} else {
+			rec := r.rec
+			if _, err := tieredPrice(s.Plans[cust.PlanID].Tiers, []*usageRecord{&rec}); err != nil {
+				problems = append(problems, fmt.Sprintf("第 %d 行：按方案 %q 对单条数量从零计价失败：%v", r.line, cust.PlanID, err))
+				continue
+			}
 		}
 
 		// 去重判定同时对“库中已有”和“本文件内已出现”生效。
@@ -404,6 +442,11 @@ func cmdBillSettle(dir, customerID, month string) error {
 	}
 	sortByInstant(inMonthRecs)
 
+	// 绑定阶梯方案的客户走按月累计分档计价；固定单价客户保持原路径。
+	if cust.PlanID != "" {
+		return settleTiered(s, cust, month, inMonthRecs)
+	}
+
 	lines := make([]billLine, 0, len(inMonthRecs))
 	var totalQty, totalFee int64
 	for _, u := range inMonthRecs {
@@ -496,9 +539,31 @@ func printBill(b *bill, cust *customer, s *state) {
 	fmt.Fprintf(stdout, "账单标识：%s\n", b.ID)
 	fmt.Fprintf(stdout, "客户：%s（%s）\n", cust.ID, cust.Name)
 	fmt.Fprintf(stdout, "月份：%s（UTC 自然月，左闭右开）\n", b.Month)
-	fmt.Fprintf(stdout, "单价：%d 分（%s）\n", b.UnitPrice, moneyFen(b.UnitPrice))
+	tiered := b.Pricing == "tiered"
+	if tiered {
+		// 阶梯账单明确计价类型并展示方案与完整规则，不伪造统一单价。
+		fmt.Fprintf(stdout, "计价类型：阶梯计费（按 UTC 自然月累计用量分档计价，每月从零累计）\n")
+		fmt.Fprintf(stdout, "方案：%s（%s）\n", b.PlanID, b.PlanName)
+		fmt.Fprintln(stdout, "阶梯规则：")
+		for i, t := range b.PlanTiers {
+			if t.Limit == 0 {
+				fmt.Fprintf(stdout, "  第 %d 档：累计数量无上限，单价 %d 分（%s）\n", i+1, t.Price, moneyFen(t.Price))
+			} else {
+				fmt.Fprintf(stdout, "  第 %d 档：累计上限 %d，单价 %d 分（%s）\n", i+1, t.Limit, t.Price, moneyFen(t.Price))
+			}
+		}
+	} else {
+		fmt.Fprintf(stdout, "单价：%d 分（%s）\n", b.UnitPrice, moneyFen(b.UnitPrice))
+	}
 	fmt.Fprintf(stdout, "总数量：%d\n", b.TotalQty)
 	fmt.Fprintf(stdout, "总金额：%d 分（%s）\n", b.TotalFee, moneyFen(b.TotalFee))
+	if tiered {
+		fmt.Fprintln(stdout, "各档合计：")
+		for i, tt := range b.TierTotals {
+			fmt.Fprintf(stdout, "  第 %d 档：数量 %d，单价 %d 分，金额 %d 分（%s）\n",
+				i+1, tt.Quantity, b.PlanTiers[i].Price, tt.Fee, moneyFen(tt.Fee))
+		}
+	}
 	// 数据在载入时已校验一致，此处计算不会出错。
 	net, payable, _ := billTotals(b, adjs)
 	received, _ := paymentReceived(s, b.CustomerID, b.Month)
@@ -511,6 +576,11 @@ func printBill(b *bill, cust *customer, s *state) {
 	for i, ln := range b.Lines {
 		fmt.Fprintf(stdout, "  %d. 用量标识=%s 时间=%s 数量=%d 小计=%d 分（%s）\n",
 			i+1, ln.UsageID, ln.Time, ln.Quantity, ln.LineFee, moneyFen(ln.LineFee))
+		// 阶梯账单逐条展示跨档分段的数量、单价与小计。
+		for j, seg := range ln.Segments {
+			fmt.Fprintf(stdout, "     分段 %d：第 %d 档 数量=%d 单价=%d 分 小计=%d 分（%s）\n",
+				j+1, seg.Tier+1, seg.Quantity, b.PlanTiers[seg.Tier].Price, seg.Fee, moneyFen(seg.Fee))
+		}
 	}
 	if len(adjs) == 0 {
 		fmt.Fprintln(stdout, "调整与撤销历史：无")
