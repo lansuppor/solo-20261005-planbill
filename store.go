@@ -36,12 +36,13 @@ type tier struct {
 	Price int64 `json:"price_fen"` // 每单位价格，非负整数分，可升可降
 }
 
-// plan 是按月累计用量的阶梯计费方案：标识唯一非空、名称非空、至少一档
-// 有序阶梯；创建后不可修改。
+// plan 是按月累计用量的阶梯计费方案：标识唯一非空、名称非空、固定月费
+// （非负整数分，省略视为 0）与至少一档有序阶梯；月费与规则创建后不可修改。
 type plan struct {
-	ID    string `json:"id"`
-	Name  string `json:"name"`
-	Tiers []tier `json:"tiers"` // 至少一档；有限上限严格递增，最后一档无上限
+	ID         string `json:"id"`
+	Name       string `json:"name"`
+	MonthlyFee int64  `json:"monthly_fee_fen,omitempty"` // 固定月费，非负整数分；每账期收取一次整月，不按天折算
+	Tiers      []tier `json:"tiers"`                     // 至少一档；有限上限严格递增，最后一档无上限
 }
 
 type usageRecord struct {
@@ -82,11 +83,14 @@ type bill struct {
 	PlanName   string      `json:"plan_name,omitempty"`   // 阶梯账单：方案名称（快照）
 	PlanTiers  []tier      `json:"plan_tiers,omitempty"`  // 阶梯账单：完整方案规则（快照）
 	TierTotals []tierTotal `json:"tier_totals,omitempty"` // 阶梯账单：各档实际数量与金额合计
-	TotalQty   int64       `json:"total_quantity"`
-	UnitPrice  int64       `json:"unit_price_fen"` // 固定单价账单的单价；阶梯账单恒为 0（不伪造统一单价）
-	TotalFee   int64       `json:"total_fee_fen"`
-	Lines      []billLine  `json:"lines"`
-	CreatedAt  string      `json:"created_at"`
+	// 阶梯账单：实际收取的固定月费快照（分），非负；按账期有效方案收取一次
+	// 整月，不计入总数量、各档金额或逐条小计。固定单价账单恒为 0。
+	MonthlyFee int64      `json:"monthly_fee_fen,omitempty"`
+	TotalQty   int64      `json:"total_quantity"`
+	UnitPrice  int64      `json:"unit_price_fen"` // 固定单价账单的单价；阶梯账单恒为 0（不伪造统一单价）
+	TotalFee   int64      `json:"total_fee_fen"`
+	Lines      []billLine `json:"lines"`
+	CreatedAt  string     `json:"created_at"`
 }
 
 // adjustment 是对已结算账单的一次费用调整（正数补收、负数减免）。
@@ -360,7 +364,11 @@ func (s *state) validate() error {
 		if !validMonth(b.Month) {
 			return fmt.Errorf("账单 %q 的月份无效", key)
 		}
-		if len(b.Lines) == 0 {
+		if b.MonthlyFee < 0 {
+			return fmt.Errorf("账单 %q 的月费为负", key)
+		}
+		// 仅月费大于 0 的账单允许空用量明细（无用量也须出账收取月费）。
+		if len(b.Lines) == 0 && b.MonthlyFee == 0 {
 			return fmt.Errorf("账单 %q 没有明细", key)
 		}
 		var qty, fee int64
@@ -388,16 +396,23 @@ func (s *state) validate() error {
 		if qty != b.TotalQty {
 			return fmt.Errorf("账单 %q 总数量与明细不符", key)
 		}
-		if fee != b.TotalFee {
-			return fmt.Errorf("账单 %q 总金额与明细不符", key)
+		// 原总金额 = 月费 + 全月用量费；月费不计入逐条用量小计，故明细
+		// 小计之和等于用量费（总金额 − 月费）。月费与总金额均非负，相减
+		// 不会溢出；总金额为负或小于月费时此处必然不符。
+		if usageFee := b.TotalFee - b.MonthlyFee; fee != usageFee {
+			return fmt.Errorf("账单 %q 总金额不等于月费加全月用量费（明细小计合计 %d 分，月费 %d 分，总金额 %d 分）",
+				key, fee, b.MonthlyFee, b.TotalFee)
 		}
 		c := s.Customers[b.CustomerID]
 		switch b.Pricing {
 		case "", "fixed":
 			// 固定单价账单：每条小计必须等于 数量×客户固定单价，且不得
-			// 携带阶梯方案信息或分段。
+			// 携带阶梯方案信息、分段或月费。
 			if b.PlanID != "" || b.PlanName != "" || len(b.PlanTiers) > 0 || len(b.TierTotals) > 0 {
 				return fmt.Errorf("账单 %q 是固定单价账单但携带阶梯方案信息", key)
+			}
+			if b.MonthlyFee != 0 {
+				return fmt.Errorf("账单 %q 是固定单价账单但携带月费", key)
 			}
 			for _, ln := range b.Lines {
 				if len(ln.Segments) > 0 {
@@ -639,11 +654,15 @@ func (s *state) validate() error {
 	return nil
 }
 
-// validatePlanRules 校验阶梯方案的标识、名称与阶梯规则本身自洽：
-// 至少一档，有限上限为严格递增的正整数，最后一档无上限，单价非负。
+// validatePlanRules 校验阶梯方案的标识、名称、月费与阶梯规则本身自洽：
+// 月费为非负整数分，至少一档，有限上限为严格递增的正整数，最后一档无
+// 上限，单价非负。
 func validatePlanRules(p *plan) error {
 	if p.ID == "" || p.Name == "" {
 		return fmt.Errorf("方案 %q 的标识或名称为空", p.ID)
+	}
+	if p.MonthlyFee < 0 {
+		return fmt.Errorf("方案 %q 的月费为负", p.ID)
 	}
 	if len(p.Tiers) == 0 {
 		return fmt.Errorf("方案 %q 至少需要一档阶梯", p.ID)
@@ -727,6 +746,9 @@ func (s *state) validateTieredBill(key string, b *bill, c *customer) error {
 	if !tiersEqual(b.PlanTiers, p.Tiers) {
 		return fmt.Errorf("账单 %q 的方案规则快照与方案 %q 不符", key, b.PlanID)
 	}
+	if b.MonthlyFee != p.MonthlyFee {
+		return fmt.Errorf("账单 %q 的月费快照与方案 %q 不符", key, b.PlanID)
+	}
 	// 账单方案必须符合账期安排：创建时绑定的初始方案被生效月不晚于
 	// 账期月的最后一次变更替换（无变更时即初始绑定，兼容旧存档）。
 	if want := s.effectivePlanID(c, b.Month); want != b.PlanID {
@@ -763,8 +785,10 @@ func (s *state) validateTieredBill(key string, b *bill, c *customer) error {
 			return fmt.Errorf("账单 %q 的第 %d 档合计与计价规则不符", key, i+1)
 		}
 	}
-	if b.TotalFee != priced.totalFee {
-		return fmt.Errorf("账单 %q 总金额与计价规则不符", key)
+	// 原总金额 = 月费 + 全月用量费；月费不进入分档合计与逐条小计。
+	wantTotal, err := add64(priced.totalFee, b.MonthlyFee)
+	if err != nil || wantTotal != b.TotalFee {
+		return fmt.Errorf("账单 %q 总金额不等于月费加全月用量费", key)
 	}
 	return nil
 }

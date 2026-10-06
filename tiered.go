@@ -144,10 +144,11 @@ func formatTiers(tiers []tier) string {
 	return strings.Join(parts, " ")
 }
 
-// printPlan 输出一个阶梯计费方案的完整规则。
+// printPlan 输出一个阶梯计费方案的完整规则（含固定月费）。
 func printPlan(p *plan) {
 	fmt.Fprintf(stdout, "方案标识：%s\n", p.ID)
 	fmt.Fprintf(stdout, "方案名称：%s\n", p.Name)
+	fmt.Fprintf(stdout, "月费：%d 分（%s，每账期按有效方案收取一次整月，不按天折算）\n", p.MonthlyFee, moneyFen(p.MonthlyFee))
 	fmt.Fprintln(stdout, "阶梯规则（按 UTC 自然月累计用量分档计价，每月从零累计）：")
 	for i, t := range p.Tiers {
 		if t.Limit == 0 {
@@ -159,6 +160,33 @@ func printPlan(p *plan) {
 }
 
 func cmdPlanAdd(dir, id, name string, tierArgs []string) error {
+	// 省略月费视为 0。
+	return registerPlan(dir, id, name, 0, tierArgs)
+}
+
+// cmdPlanAddFee 登记含固定月费的阶梯计费方案；月费为非负整数人民币分。
+func cmdPlanAddFee(dir, id, name, feeText string, tierArgs []string) error {
+	fee, err := parseMonthlyFee(feeText)
+	if err != nil {
+		return err
+	}
+	return registerPlan(dir, id, name, fee, tierArgs)
+}
+
+// parseMonthlyFee 解析月费：非负有符号 64 位整数人民币分。
+func parseMonthlyFee(text string) (int64, error) {
+	text = strings.TrimSpace(text)
+	fee, err := strconv.ParseInt(text, 10, 64)
+	if err != nil {
+		return 0, fmt.Errorf("月费 %q 不是有符号 64 位整数范围内的整数: %w", text, err)
+	}
+	if fee < 0 {
+		return 0, fmt.Errorf("月费必须是非负整数分，收到 %d", fee)
+	}
+	return fee, nil
+}
+
+func registerPlan(dir, id, name string, monthlyFee int64, tierArgs []string) error {
 	if strings.TrimSpace(id) == "" {
 		return fmt.Errorf("方案标识不能为空")
 	}
@@ -177,7 +205,7 @@ func cmdPlanAdd(dir, id, name string, tierArgs []string) error {
 	if _, exists := s.Plans[id]; exists {
 		return fmt.Errorf("方案标识 %q 已存在，方案创建后不可修改", id)
 	}
-	p := &plan{ID: id, Name: name, Tiers: tiers}
+	p := &plan{ID: id, Name: name, MonthlyFee: monthlyFee, Tiers: tiers}
 	s.Plans[id] = p
 
 	// 方案整体原子落盘；保存失败则一切不生效，该方案标识不被占用。
@@ -220,7 +248,7 @@ func cmdPlanList(dir string) error {
 	fmt.Fprintf(stdout, "已登记阶梯计费方案 %d 个：\n", len(ids))
 	for i, id := range ids {
 		p := s.Plans[id]
-		fmt.Fprintf(stdout, "  %d. %s（%s）：%d 档，规则 %s\n", i+1, p.ID, p.Name, len(p.Tiers), formatTiers(p.Tiers))
+		fmt.Fprintf(stdout, "  %d. %s（%s）：月费 %d 分，%d 档，规则 %s\n", i+1, p.ID, p.Name, p.MonthlyFee, len(p.Tiers), formatTiers(p.Tiers))
 	}
 	return nil
 }
@@ -259,8 +287,9 @@ func cmdCustomerAddPlan(dir, id, name, planID string) error {
 }
 
 // settleTiered 对绑定阶梯方案的客户按 UTC 自然月累计用量分档计价并封账。
-// recs 已按计价顺序（时间点升序、同一时间按标识字典序）排列。
-// 月累计数量、分档金额或总额溢出时拒绝结算且不封账。
+// recs 已按计价顺序（时间点升序、同一时间按标识字典序）排列；有效方案
+// 月费大于 0 时 recs 可为空（无用量也须出账收取整月月费）。
+// 月累计数量、分档金额或月费加全月用量费溢出时拒绝结算且不封账。
 func settleTiered(s *state, cust *customer, month string, recs []*usageRecord) error {
 	b, err := buildTieredBill(s, cust, month, recs)
 	if err != nil {
@@ -281,13 +310,19 @@ func settleTiered(s *state, cust *customer, month string, recs []*usageRecord) e
 
 // buildTieredBill 为绑定阶梯方案的客户构造阶梯账单（不落盘）：采用账期月的
 // 有效方案（初始绑定被生效月不晚于账期月的最后一次变更替换）从零累计分档
-// 计价，账单保存方案标识、名称与完整规则快照。recs 须已按计价顺序排列。
-// 月累计数量、分档金额或总额溢出时返回错误。
+// 计价，账单保存方案标识、名称、完整规则与实际月费快照。recs 须已按计价
+// 顺序排列；有效方案月费大于 0 时 recs 可为空。原总金额 = 月费 + 全月
+// 用量费；月累计数量、分档金额或月费加全月用量费溢出时返回错误。
 func buildTieredBill(s *state, cust *customer, month string, recs []*usageRecord) (*bill, error) {
 	p := s.Plans[s.effectivePlanID(cust, month)] // 载入时已校验存在
 	priced, err := tieredPrice(p.Tiers, recs)
 	if err != nil {
 		return nil, err
+	}
+	// 月费加全月用量费溢出时拒绝结算。
+	totalFee, err := add64(priced.totalFee, p.MonthlyFee)
+	if err != nil {
+		return nil, fmt.Errorf("月费 %d 分加全月用量费 %d 分溢出有符号 64 位整数范围", p.MonthlyFee, priced.totalFee)
 	}
 
 	lines := make([]billLine, len(recs))
@@ -304,7 +339,8 @@ func buildTieredBill(s *state, cust *customer, month string, recs []*usageRecord
 	for i := range p.Tiers {
 		tierTotals[i] = tierTotal{Quantity: priced.tierQty[i], Fee: priced.tierFee[i]}
 	}
-	// 账单保存方案标识、名称与完整规则快照，之后计价与校验只依赖账单自身。
+	// 账单保存方案标识、名称、完整规则与实际月费快照，之后计价与校验
+	// 只依赖账单自身。
 	tiersCopy := make([]tier, len(p.Tiers))
 	copy(tiersCopy, p.Tiers)
 	return &bill{
@@ -316,9 +352,20 @@ func buildTieredBill(s *state, cust *customer, month string, recs []*usageRecord
 		PlanName:   p.Name,
 		PlanTiers:  tiersCopy,
 		TierTotals: tierTotals,
+		MonthlyFee: p.MonthlyFee,
 		TotalQty:   priced.totalQty,
-		TotalFee:   priced.totalFee,
+		TotalFee:   totalFee,
 		Lines:      lines,
 		CreatedAt:  time.Now().UTC().Format(time.RFC3339),
 	}, nil
+}
+
+// monthlyFeeBillable 报告客户在某账期是否因有效方案月费大于 0 而即使
+// 无用量也须出账：仅绑定阶梯方案且该账期有效方案月费大于 0 时成立；
+// 固定单价客户与月费为 0 的方案在无用量时仍拒绝结算。
+func monthlyFeeBillable(s *state, cust *customer, month string) bool {
+	if cust.PlanID == "" {
+		return false
+	}
+	return s.Plans[s.effectivePlanID(cust, month)].MonthlyFee > 0
 }

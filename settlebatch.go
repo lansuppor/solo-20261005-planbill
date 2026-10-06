@@ -13,10 +13,11 @@ import (
 
 // buildBill 为未结算的客户月份构造账单（不落盘）：归集该 UTC 自然月的全部
 // 用量，固定单价客户逐条 数量×单价，阶梯客户按账期月有效方案从零累计分档
-// 计价（保留跨档明细与方案快照）。没有用量或计价溢出时返回错误。
+// 计价（保留跨档明细与方案快照），原总金额含该方案的一次整月月费。没有用量
+// 且有效方案月费为 0（或固定单价客户），或计价溢出时返回错误。
 func buildBill(s *state, cust *customer, month string) (*bill, error) {
 	recs := monthUsage(s, cust.ID, month)
-	if len(recs) == 0 {
+	if len(recs) == 0 && !monthlyFeeBillable(s, cust, month) {
 		return nil, fmt.Errorf("该 UTC 自然月没有用量")
 	}
 	if cust.PlanID != "" {
