@@ -217,8 +217,9 @@ func loadStore(dir string) (*state, error) {
 	if err := dec.Decode(&s); err != nil {
 		return nil, fmt.Errorf("数据文件已损坏（不是有效的 JSON）%s: %w", p, err)
 	}
-	// 拒绝尾部多余内容，避免静默吞掉异常数据。
-	if dec.More() {
+	// 拒绝完整 JSON 之后的任何非空白内容（包括单独的 ] 或 }），
+	// 避免静默吞掉异常数据；合法尾随空白仍可读取。
+	if rest := data[dec.InputOffset():]; len(bytes.TrimSpace(rest)) > 0 {
 		return nil, fmt.Errorf("数据文件已损坏（JSON 之后存在多余内容）: %s", p)
 	}
 	if err := s.validate(); err != nil {

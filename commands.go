@@ -101,7 +101,7 @@ func runCmd(args []string, dataDir string) error {
 
 	case "bill":
 		if len(args) < 2 {
-			return usageError("缺少子命令，应为：bill settle|show|adjust|revoke|pay|remit|correct|unpay|ledger ...")
+			return usageError("缺少子命令，应为：bill settle|settle-batch|show|adjust|revoke|pay|remit|correct|unpay|ledger ...")
 		}
 		switch args[1] {
 		case "settle":
@@ -109,6 +109,11 @@ func runCmd(args []string, dataDir string) error {
 				return usageError("用法：bill settle <客户标识> <YYYY-MM>")
 			}
 			return cmdBillSettle(dataDir, args[2], args[3])
+		case "settle-batch":
+			if len(args) < 3 {
+				return usageError("用法：bill settle-batch <客户标识:YYYY-MM> [更多 客户:月份 ...]")
+			}
+			return cmdBillSettleBatch(dataDir, args[2:])
 		case "show":
 			if len(args) != 4 {
 				return usageError("用法：bill show <客户标识> <YYYY-MM>")
@@ -154,7 +159,7 @@ func runCmd(args []string, dataDir string) error {
 			}
 			return cmdBillLedger(dataDir, args[2], args[3], cutoff, hasCutoff)
 		default:
-			return usageError("未知 bill 子命令 %q；可用：settle、show、adjust、revoke、pay、remit、correct、unpay、ledger", args[1])
+			return usageError("未知 bill 子命令 %q；可用：settle、settle-batch、show、adjust、revoke、pay、remit、correct、unpay、ledger", args[1])
 		}
 
 	default:
@@ -454,21 +459,45 @@ func cmdBillSettle(dir, customerID, month string) error {
 		return nil
 	}
 
-	// 归集该客户 UTC 自然月内的全部用量，区间为左闭右开 [月初, 下月初)。
+	b, err := computeBill(s, cust, month)
+	if err != nil {
+		return err
+	}
+	s.Bills[key] = b
+
+	// 账单与封账状态在同一次原子保存中一起持久化；保存失败则一切不生效。
+	if err := s.save(); err != nil {
+		delete(s.Bills, key)
+		return err
+	}
+	if b.Pricing == "tiered" {
+		fmt.Fprintf(stdout, "结算完成，客户 %s 的 %s 已封账（阶梯计费）：\n\n", customerID, month)
+	} else {
+		fmt.Fprintf(stdout, "结算完成，客户 %s 的 %s 已封账：\n\n", customerID, month)
+	}
+	printBill(b, cust, s)
+	return nil
+}
+
+// computeBill 归集客户某 UTC 自然月（左闭右开 [月初, 下月初)）的全部用量，
+// 按该账期的计费规则生成新账单（只计算，不落盘）：固定单价客户以
+// 数量×单价逐条计费，阶梯客户按账期有效方案从零累计分档计价。
+// 无用量或计价溢出时返回错误，调用方保证不封账。
+func computeBill(s *state, cust *customer, month string) (*bill, error) {
 	var inMonthRecs []*usageRecord
 	for _, u := range s.Usage {
-		if u.CustomerID == customerID && inMonth(u.Time, month) {
+		if u.CustomerID == cust.ID && inMonth(u.Time, month) {
 			inMonthRecs = append(inMonthRecs, u)
 		}
 	}
 	if len(inMonthRecs) == 0 {
-		return fmt.Errorf("客户 %s 在 %s 没有用量，拒绝结算且不封账", customerID, month)
+		return nil, fmt.Errorf("客户 %s 在 %s 没有用量，拒绝结算且不封账", cust.ID, month)
 	}
 	sortByInstant(inMonthRecs)
 
 	// 绑定阶梯方案的客户走按月累计分档计价；固定单价客户保持原路径。
 	if cust.PlanID != "" {
-		return settleTiered(s, cust, month, inMonthRecs)
+		return priceTieredBill(s, cust, month, inMonthRecs)
 	}
 
 	lines := make([]billLine, 0, len(inMonthRecs))
@@ -476,15 +505,15 @@ func cmdBillSettle(dir, customerID, month string) error {
 	for _, u := range inMonthRecs {
 		lineFee, err := mul64(u.Quantity, cust.Price)
 		if err != nil {
-			return fmt.Errorf("用量 %s：数量 %d × 单价 %d 金额溢出，拒绝结算且不封账", u.ID, u.Quantity, cust.Price)
+			return nil, fmt.Errorf("用量 %s：数量 %d × 单价 %d 金额溢出，拒绝结算且不封账", u.ID, u.Quantity, cust.Price)
 		}
 		totalQty, err = add64(totalQty, u.Quantity)
 		if err != nil {
-			return fmt.Errorf("汇总数量溢出有符号 64 位整数范围，拒绝结算且不封账")
+			return nil, fmt.Errorf("汇总数量溢出有符号 64 位整数范围，拒绝结算且不封账")
 		}
 		totalFee, err = add64(totalFee, lineFee)
 		if err != nil {
-			return fmt.Errorf("汇总金额溢出有符号 64 位整数范围，拒绝结算且不封账")
+			return nil, fmt.Errorf("汇总金额溢出有符号 64 位整数范围，拒绝结算且不封账")
 		}
 		lines = append(lines, billLine{
 			UsageID:  u.ID,
@@ -494,26 +523,16 @@ func cmdBillSettle(dir, customerID, month string) error {
 		})
 	}
 
-	b := &bill{
-		ID:         stableBillID(customerID, month),
-		CustomerID: customerID,
+	return &bill{
+		ID:         stableBillID(cust.ID, month),
+		CustomerID: cust.ID,
 		Month:      month,
 		TotalQty:   totalQty,
 		UnitPrice:  cust.Price,
 		TotalFee:   totalFee,
 		Lines:      lines,
 		CreatedAt:  time.Now().UTC().Format(time.RFC3339),
-	}
-	s.Bills[key] = b
-
-	// 账单与封账状态在同一次原子保存中一起持久化；保存失败则一切不生效。
-	if err := s.save(); err != nil {
-		delete(s.Bills, key)
-		return err
-	}
-	fmt.Fprintf(stdout, "结算完成，客户 %s 的 %s 已封账：\n\n", customerID, month)
-	printBill(b, cust, s)
-	return nil
+	}, nil
 }
 
 func cmdBillShow(dir, customerID, month string) error {

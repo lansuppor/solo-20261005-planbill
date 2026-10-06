@@ -3037,3 +3037,231 @@ func TestOldStateFileWithoutPlanChanges(t *testing.T) {
 		t.Fatalf("旧账单在变更后异常:\n%s", show)
 	}
 }
+
+// --- 批量结算（bill settle-batch） ---
+
+func TestSettleBatchHappyPathMixedNewAndExisting(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("customer", "add", "c1", "固定客户", "150")
+	h.mustRun("plan", "add", "std", "标准阶梯", "100:10", "500:8", "-:5")
+	h.mustRun("customer", "add-plan", "c2", "阶梯客户", "std")
+	f := h.writeFile("u.csv", csvHeader+
+		"u1,c1,2026-09-15T10:00:00Z,3\n"+
+		"u2,c1,2026-10-01T00:00:00Z,2\n"+
+		"u3,c2,2026-09-10T00:00:00Z,150\n"+
+		"u4,c2,2026-09-11T00:00:00Z,400\n")
+	h.mustRun("usage", "import", f)
+
+	// 先用单笔结算一项，批量清单混合已结算与未结算项。
+	single := h.mustRun("bill", "settle", "c1", "2026-09")
+	singleID := extractBillID(single)
+
+	out := h.mustRun("bill", "settle-batch", "c1:2026-09", "c2:2026-09", "c1:2026-10")
+	for _, want := range []string{
+		"新增 2 项", "已有 1 项", "共 3 项",
+		"第 1 项：客户 c1 月份 2026-09 账单 " + singleID + " 原总金额 450 分",
+		"第 2 项：客户 c2 月份 2026-09 账单 BILL-",
+		"原总金额 4450 分",
+		"第 3 项：客户 c1 月份 2026-10 账单 BILL-",
+		"原总金额 300 分",
+		"已有（返回原账单，未重新计费）", "新增（已封账）",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("批量结算输出缺少 %q:\n%s", want, out)
+		}
+	}
+
+	// 完整明细可由 bill show 读回：阶梯账单保留方案快照与跨档分段。
+	show := h.mustRun("bill", "show", "c2", "2026-09")
+	for _, want := range []string{"计价类型：阶梯计费", "方案：std（标准阶梯）", "总数量：550", "总金额：4450 分", "分段"} {
+		if !strings.Contains(show, want) {
+			t.Fatalf("阶梯账单缺少 %q:\n%s", want, show)
+		}
+	}
+	// 已有账单的标识与金额不因批量结算改变。
+	show1 := h.mustRun("bill", "show", "c1", "2026-09")
+	if extractBillID(show1) != singleID || !strings.Contains(show1, "总金额：450 分") {
+		t.Fatalf("已有账单被改变:\n%s", show1)
+	}
+	// 批量结算不占用操作序号。
+	data, err := os.ReadFile(h.statePath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(data), "\"next_seq\": 0") {
+		t.Fatalf("批量结算不应占用操作序号:\n%s", data)
+	}
+}
+
+func TestSettleBatchAllExistingDoesNotRewrite(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("customer", "add", "c1", "甲方", "100")
+	f := h.writeFile("u.csv", csvHeader+
+		"u1,c1,2026-09-15T10:00:00Z,2\n"+
+		"u2,c1,2026-10-01T00:00:00Z,1\n")
+	h.mustRun("usage", "import", f)
+	h.mustRun("bill", "settle-batch", "c1:2026-09", "c1:2026-10")
+
+	before, err := os.ReadFile(h.statePath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 全部项目已结算：成功返回且不改写存档；清单换序结果相同。
+	out := h.mustRun("bill", "settle-batch", "c1:2026-10", "c1:2026-09")
+	if !strings.Contains(out, "新增 0 项") || !strings.Contains(out, "已有 2 项") {
+		t.Fatal(out)
+	}
+	after, err := os.ReadFile(h.statePath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(before) != string(after) {
+		t.Fatal("全部已结算时存档被改写")
+	}
+}
+
+func TestSettleBatchRejectsWholeBatch(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("customer", "add", "c1", "甲方", "100")
+	f := h.writeFile("u.csv", csvHeader+"u1,c1,2026-09-15T10:00:00Z,2\n")
+	h.mustRun("usage", "import", f)
+
+	cases := []struct {
+		name string
+		args []string
+		want []string
+	}{
+		{"清单重复", []string{"c1:2026-09", "c1:2026-09"}, []string{"第 2 项", "重复", "第 1 项"}},
+		{"客户不存在", []string{"ghost:2026-09", "c1:2026-09"}, []string{"第 1 项", "ghost", "不存在"}},
+		{"月份非法", []string{"c1:2026-13"}, []string{"第 1 项", "2026-13", "无效"}},
+		{"格式非法", []string{"c1-2026-09"}, []string{"第 1 项", "格式非法"}},
+		{"无用量", []string{"c1:2026-10", "c1:2026-09"}, []string{"第 1 项", "2026-10", "没有用量"}},
+	}
+	for _, tc := range cases {
+		msg := h.runExpectErr(append([]string{"bill", "settle-batch"}, tc.args...)...)
+		for _, want := range append(tc.want, "整批未生效") {
+			if !strings.Contains(msg, want) {
+				t.Fatalf("%s：错误输出缺少 %q:\n%s", tc.name, want, msg)
+			}
+		}
+		// 整批拒绝：合法的 c1:2026-09 也不得被结算或封账。
+		h.runExpectErr("bill", "show", "c1", "2026-09")
+	}
+	// 未封账：9 月仍可补录用量并单笔结算。
+	more := h.writeFile("more.csv", csvHeader+"u2,c1,2026-09-20T10:00:00Z,1\n")
+	h.mustRun("usage", "import", more)
+	h.mustRun("bill", "settle", "c1", "2026-09")
+
+	// 空清单是用法错误（退出码 2）。
+	if _, err := h.run("bill", "settle-batch"); err == nil {
+		t.Fatal("空清单应失败")
+	} else {
+		var ue usageErrorf
+		if !errors.As(err, &ue) {
+			t.Fatalf("空清单应为用法错误(2)，得到 %v", err)
+		}
+	}
+}
+
+func TestSettleBatchOverflowRejectsWholeBatch(t *testing.T) {
+	h := newHarness(t)
+	// 单条金额合法、汇总溢出：两条 2^62 分小计相加越出 int64。
+	h.mustRun("customer", "add", "big", "大客户", "4611686018427387904")
+	h.mustRun("customer", "add", "c1", "甲方", "100")
+	f := h.writeFile("u.csv", csvHeader+
+		"u1,big,2026-09-01T00:00:00Z,1\n"+
+		"u2,big,2026-09-02T00:00:00Z,1\n"+
+		"u3,c1,2026-09-01T00:00:00Z,1\n")
+	h.mustRun("usage", "import", f)
+
+	msg := h.runExpectErr("bill", "settle-batch", "big:2026-09", "c1:2026-09")
+	if !strings.Contains(msg, "溢出") || !strings.Contains(msg, "第 1 项") {
+		t.Fatal(msg)
+	}
+	// 整批不生效：两项都未结算、未封账。
+	h.runExpectErr("bill", "show", "big", "2026-09")
+	h.runExpectErr("bill", "show", "c1", "2026-09")
+}
+
+func TestSettleBatchZeroFeeAndSealing(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("customer", "add", "free", "免费客户", "0")
+	f := h.writeFile("u.csv", csvHeader+"u1,free,2026-09-15T10:00:00Z,5\n")
+	h.mustRun("usage", "import", f)
+
+	// 零费用账单正常生成并封账。
+	out := h.mustRun("bill", "settle-batch", "free:2026-09")
+	if !strings.Contains(out, "原总金额 0 分") || !strings.Contains(out, "新增 1 项") {
+		t.Fatal(out)
+	}
+	// 封账规则生效：拒绝新用量，相同用量重放仍跳过。
+	intruder := h.writeFile("new.csv", csvHeader+"u2,free,2026-09-20T10:00:00Z,1\n")
+	if msg := h.runExpectErr("usage", "import", intruder); !strings.Contains(msg, "已封账") {
+		t.Fatal(msg)
+	}
+	if out := h.mustRun("usage", "import", f); !strings.Contains(out, "重复跳过 1 条") {
+		t.Fatal(out)
+	}
+}
+
+func TestSettleBatchPlanChangeAndStableIDs(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("plan", "add", "p1", "旧阶梯", "-:10")
+	h.mustRun("plan", "add", "p2", "新阶梯", "-:20")
+	h.mustRun("customer", "add-plan", "c1", "阶梯客户", "p1")
+	h.mustRun("plan", "change", "c1", "2026-10", "p2", "续期新价")
+	f := h.writeFile("u.csv", csvHeader+
+		"u1,c1,2026-09-10T00:00:00Z,2\n"+
+		"u2,c1,2026-10-10T00:00:00Z,2\n")
+	h.mustRun("usage", "import", f)
+
+	// 各项独立采用账期有效方案：9 月 p1、10 月 p2，不共享累计量。
+	out := h.mustRun("bill", "settle-batch", "c1:2026-10", "c1:2026-09")
+	if !strings.Contains(out, "原总金额 20 分") || !strings.Contains(out, "原总金额 40 分") {
+		t.Fatal(out)
+	}
+	sep := h.mustRun("bill", "show", "c1", "2026-09")
+	oct := h.mustRun("bill", "show", "c1", "2026-10")
+	if !strings.Contains(sep, "方案：p1（旧阶梯）") || !strings.Contains(oct, "方案：p2（新阶梯）") {
+		t.Fatalf("账期有效方案快照异常:\n%s\n%s", sep, oct)
+	}
+	// 账单标识与单笔结算一致（身份由客户与月份确定，与清单顺序无关）。
+	single := h.mustRun("bill", "settle", "c1", "2026-09")
+	if extractBillID(single) != extractBillID(sep) {
+		t.Fatal("批量与单笔结算的账单标识不一致")
+	}
+}
+
+func TestTrailingContentAfterJSONRejected(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("customer", "add", "c1", "甲方", "100")
+	good, err := os.ReadFile(h.statePath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 完整 JSON 后的任何非空白内容（含单独的 ] 或 }）都按损坏拒绝，
+	// 且原文件保留。
+	for _, suffix := range []string{"}", "]", "x", "{}", " ] "} {
+		content := append(append([]byte{}, good...), suffix...)
+		if err := os.WriteFile(h.statePath(), content, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		msg := h.runExpectErr("bill", "settle-batch", "c1:2026-09")
+		if !strings.Contains(msg, "损坏") {
+			t.Fatalf("尾随 %q 未报损坏: %s", suffix, msg)
+		}
+		got, err := os.ReadFile(h.statePath())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if string(got) != string(content) {
+			t.Fatalf("尾随 %q 时原文件被改写", suffix)
+		}
+	}
+	// 合法尾随空白仍可读取。
+	ws := append(append([]byte{}, good...), ' ', '\n', '\t')
+	if err := os.WriteFile(h.statePath(), ws, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h.mustRun("customer", "add", "c2", "乙方", "200")
+}

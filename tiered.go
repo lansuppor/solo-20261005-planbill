@@ -258,15 +258,16 @@ func cmdCustomerAddPlan(dir, id, name, planID string) error {
 	return nil
 }
 
-// settleTiered 对绑定阶梯方案的客户按 UTC 自然月累计用量分档计价并封账。
-// 采用账期月的有效方案（初始绑定被生效月不晚于账期月的最后一次变更替换）。
-// recs 已按计价顺序（时间点升序、同一时间按标识字典序）排列。
-// 月累计数量、分档金额或总额溢出时拒绝结算且不封账。
-func settleTiered(s *state, cust *customer, month string, recs []*usageRecord) error {
+// priceTieredBill 对绑定阶梯方案的客户按 UTC 自然月累计用量分档计价，
+// 返回新账单（只计算，不落盘）。采用账期月的有效方案（初始绑定被生效月
+// 不晚于账期月的最后一次变更替换）。recs 已按计价顺序（时间点升序、
+// 同一时间按标识字典序）排列。月累计数量、分档金额或总额溢出时返回错误，
+// 调用方保证不封账。
+func priceTieredBill(s *state, cust *customer, month string, recs []*usageRecord) (*bill, error) {
 	p := s.Plans[s.effectivePlanID(cust, month)] // 载入时已校验存在
 	priced, err := tieredPrice(p.Tiers, recs)
 	if err != nil {
-		return fmt.Errorf("客户 %s 的 %s 阶梯计价失败，拒绝结算且不封账: %w", cust.ID, month, err)
+		return nil, fmt.Errorf("客户 %s 的 %s 阶梯计价失败，拒绝结算且不封账: %w", cust.ID, month, err)
 	}
 
 	lines := make([]billLine, len(recs))
@@ -286,7 +287,7 @@ func settleTiered(s *state, cust *customer, month string, recs []*usageRecord) e
 	// 账单保存方案标识、名称与完整规则快照，之后计价与校验只依赖账单自身。
 	tiersCopy := make([]tier, len(p.Tiers))
 	copy(tiersCopy, p.Tiers)
-	b := &bill{
+	return &bill{
 		ID:         stableBillID(cust.ID, month),
 		CustomerID: cust.ID,
 		Month:      month,
@@ -299,16 +300,5 @@ func settleTiered(s *state, cust *customer, month string, recs []*usageRecord) e
 		TotalFee:   priced.totalFee,
 		Lines:      lines,
 		CreatedAt:  time.Now().UTC().Format(time.RFC3339),
-	}
-	key := billKey(cust.ID, month)
-	s.Bills[key] = b
-
-	// 账单与封账状态在同一次原子保存中一起持久化；保存失败则一切不生效。
-	if err := s.save(); err != nil {
-		delete(s.Bills, key)
-		return err
-	}
-	fmt.Fprintf(stdout, "结算完成，客户 %s 的 %s 已封账（阶梯计费）：\n\n", cust.ID, month)
-	printBill(b, cust, s)
-	return nil
+	}, nil
 }
