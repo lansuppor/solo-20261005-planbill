@@ -68,11 +68,15 @@ func cmdCustomerSuspend(dir, customerID, startMonth, endMonth, reason string) er
 				startMonth, endMonth, customerID, su.StartMonth, su.EndMonth)
 		}
 	}
-	// 登记前检查区间内已导入用量：存在任一条就拒绝并指出冲突记录，
-	// 不删除或改写任何用量。
+	// 登记前检查区间内已导入的有效（未撤回）用量：存在任一条就拒绝并指出
+	// 冲突记录，不删除或改写任何用量；已撤回记录不参与冲突判断，可存在于
+	// 随后暂停的月份。
 	var conflicts []string
 	conflictMonths := make(map[string]bool)
 	for _, u := range s.Usage {
+		if s.isWithdrawn(u.ID) {
+			continue
+		}
 		if u.CustomerID != customerID {
 			continue
 		}

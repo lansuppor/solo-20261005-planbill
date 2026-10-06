@@ -106,7 +106,7 @@ func runCmd(args []string, dataDir string) error {
 
 	case "usage":
 		if len(args) < 2 {
-			return usageError("缺少子命令，应为：usage import <文件>")
+			return usageError("缺少子命令，应为：usage import|withdraw|show ...")
 		}
 		switch args[1] {
 		case "import":
@@ -114,8 +114,18 @@ func runCmd(args []string, dataDir string) error {
 				return usageError("用法：usage import <文件>（- 表示标准输入）")
 			}
 			return cmdUsageImport(dataDir, args[2])
+		case "withdraw":
+			if len(args) != 4 {
+				return usageError("用法：usage withdraw <用量标识> <原因>")
+			}
+			return cmdUsageWithdraw(dataDir, args[2], args[3])
+		case "show":
+			if len(args) != 3 {
+				return usageError("用法：usage show <用量标识>")
+			}
+			return cmdUsageShow(dataDir, args[2])
 		default:
-			return usageError("未知 usage 子命令 %q；可用：import", args[1])
+			return usageError("未知 usage 子命令 %q；可用：import、withdraw、show", args[1])
 		}
 
 	case "bill":
@@ -275,9 +285,30 @@ func cmdUsageImport(dir, file string) error {
 			problems = append(problems, fmt.Sprintf("第 %d 行：客户标识 %q 不存在", r.line, r.rec.CustomerID))
 			continue
 		}
+
+		// 去重判定同时对“库中已有”和“本文件内已出现”生效，且先于暂停、
+		// 封账与金额预检：已存在记录（含已撤回记录）按客户、解析后的时间点
+		// 和数量与原内容判重，相同重放计入重复跳过——即使该月后来已封账、
+		// 暂停或后续方案计价会溢出也不受阻；已撤回记录的重放不会恢复记录。
+		var existing *usageRecord
+		if inStore, ok := s.Usage[r.rec.ID]; ok {
+			existing = inStore
+		} else if inBatch, ok := accepted[r.rec.ID]; ok {
+			existing = &inBatch.rec
+		}
+		if existing != nil {
+			if !sameUsage(existing, &r.rec, r.t) {
+				problems = append(problems, fmt.Sprintf("第 %d 行：用量标识 %q 已存在但内容不同（已有客户=%s 时间=%s 数量=%d）",
+					r.line, r.rec.ID, existing.CustomerID, existing.Time, existing.Quantity))
+				continue
+			}
+			dupCount++
+			continue
+		}
+
+		// 以下为全新用量：暂停、封账及当前方案下金额预检只约束全新用量。
 		// 暂停月的新用量一律拒绝：按记录时间换算的 UTC 月份判断，处于任一
-		// 暂停区间（含起月、不含结束月）即整批失败并指出行号；库中已有的
-		// 相同记录仍按下面的去重规则处理（合法存档的暂停月不会已有用量）。
+		// 暂停区间（含起月、不含结束月）即整批失败并指出行号。
 		rowMonth := r.t.UTC().Format("2006-01")
 		if s.isSuspendedMonth(r.rec.CustomerID, rowMonth) {
 			problems = append(problems, fmt.Sprintf("第 %d 行：客户 %s 的 %s 处于暂停区间，暂停服务期间不接收用量（新用量 %q 被拒绝）",
@@ -301,29 +332,10 @@ func cmdUsageImport(dir, file string) error {
 			}
 		}
 
-		// 去重判定同时对“库中已有”和“本文件内已出现”生效。
-		var existing *usageRecord
-		if inStore, ok := s.Usage[r.rec.ID]; ok {
-			existing = inStore
-		} else if inBatch, ok := accepted[r.rec.ID]; ok {
-			existing = &inBatch.rec
-		}
-
-		if existing != nil {
-			if !sameUsage(existing, &r.rec, r.t) {
-				problems = append(problems, fmt.Sprintf("第 %d 行：用量标识 %q 已存在但内容不同（已有客户=%s 时间=%s 数量=%d）",
-					r.line, r.rec.ID, existing.CustomerID, existing.Time, existing.Quantity))
-				continue
-			}
-			dupCount++
-			continue
-		}
-
 		// 全新标识：不得进入该客户已封账的 UTC 自然月。
-		month := r.t.UTC().Format("2006-01")
-		if s.sealed(r.rec.CustomerID, month) {
+		if s.sealed(r.rec.CustomerID, rowMonth) {
 			problems = append(problems, fmt.Sprintf("第 %d 行：客户 %s 的 %s 已封账，新用量 %q 不得进入",
-				r.line, r.rec.CustomerID, month, r.rec.ID))
+				r.line, r.rec.CustomerID, rowMonth, r.rec.ID))
 			continue
 		}
 
@@ -488,9 +500,10 @@ func cmdBillSettle(dir, customerID, month string) error {
 		return nil
 	}
 
-	// 归集该客户 UTC 自然月内的全部用量，区间为左闭右开 [月初, 下月初)。
-	// 有效方案月费大于 0 的阶梯客户即使无用量也须出账（收取一次整月月费）；
-	// 月费为 0 的方案与固定单价客户无用量时仍拒绝结算且不封账。
+	// 归集该客户 UTC 自然月内的全部有效（未撤回）用量，区间为左闭右开
+	// [月初, 下月初)。有效方案月费大于 0 的阶梯客户即使无用量也须出账
+	// （收取一次整月月费）；月费为 0 的方案与固定单价客户无用量时仍拒绝
+	// 结算且不封账。
 	inMonthRecs := monthUsage(s, customerID, month)
 	if len(inMonthRecs) == 0 && !monthlyFeeBillable(s, cust, month) {
 		return fmt.Errorf("客户 %s 在 %s 没有用量，拒绝结算且不封账", customerID, month)
@@ -538,10 +551,15 @@ func cmdBillShow(dir, customerID, month string) error {
 }
 
 // monthUsage 归集客户在某 UTC 自然月（左闭右开 [月初, 下月初)）内的全部
-// 用量，并按计价顺序（解析后的时间点升序、同一时间按标识字典序）排列。
+// 有效（未撤回）用量，并按计价顺序（解析后的时间点升序、同一时间按标识
+// 字典序）排列。已撤回用量不计费用，不参与单笔及批量结算；阶梯计价将剩余
+// 记录按原有时间点及标识顺序从零累计重新分档。
 func monthUsage(s *state, customerID, month string) []*usageRecord {
 	var recs []*usageRecord
 	for _, u := range s.Usage {
+		if s.isWithdrawn(u.ID) {
+			continue
+		}
 		if u.CustomerID == customerID && inMonth(u.Time, month) {
 			recs = append(recs, u)
 		}
