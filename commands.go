@@ -49,7 +49,7 @@ func runCmd(args []string, dataDir string) error {
 
 	case "plan":
 		if len(args) < 2 {
-			return usageError("缺少子命令，应为：plan add|show|list ...")
+			return usageError("缺少子命令，应为：plan add|show|list|change|schedule ...")
 		}
 		switch args[1] {
 		case "add":
@@ -67,8 +67,22 @@ func runCmd(args []string, dataDir string) error {
 				return usageError("用法：plan list")
 			}
 			return cmdPlanList(dataDir)
+		case "change":
+			if len(args) != 6 {
+				return usageError("用法：plan change <客户标识> <YYYY-MM> <方案标识> <原因>")
+			}
+			return cmdPlanChange(dataDir, args[2], args[3], args[4], args[5])
+		case "schedule":
+			if len(args) != 3 && len(args) != 4 {
+				return usageError("用法：plan schedule <客户标识> [YYYY-MM]")
+			}
+			month, hasMonth := "", false
+			if len(args) == 4 {
+				month, hasMonth = args[3], true
+			}
+			return cmdPlanSchedule(dataDir, args[2], month, hasMonth)
 		default:
-			return usageError("未知 plan 子命令 %q；可用：add、show、list", args[1])
+			return usageError("未知 plan 子命令 %q；可用：add、show、list、change、schedule", args[1])
 		}
 
 	case "usage":
@@ -240,8 +254,9 @@ func cmdUsageImport(dir, file string) error {
 			problems = append(problems, fmt.Sprintf("第 %d 行：客户标识 %q 不存在", r.line, r.rec.CustomerID))
 			continue
 		}
-		// 金额可行性预检：固定单价客户检查 数量×单价；阶梯客户以单条
-		// 数量从零计价，检查分段金额不溢出（金额单位：分）。
+		// 金额可行性预检：固定单价客户检查 数量×单价；阶梯客户按记录时间
+		// 换算的 UTC 月份的有效方案，以单条数量从零计价，检查分段金额不
+		// 溢出（金额单位：分）。
 		if cust.PlanID == "" {
 			if _, err := mul64(r.rec.Quantity, cust.Price); err != nil {
 				problems = append(problems, fmt.Sprintf("第 %d 行：数量 %d × 单价 %d 金额溢出有符号 64 位整数范围", r.line, r.rec.Quantity, cust.Price))
@@ -249,8 +264,10 @@ func cmdUsageImport(dir, file string) error {
 			}
 		} else {
 			rec := r.rec
-			if _, err := tieredPrice(s.Plans[cust.PlanID].Tiers, []*usageRecord{&rec}); err != nil {
-				problems = append(problems, fmt.Sprintf("第 %d 行：按方案 %q 对单条数量从零计价失败：%v", r.line, cust.PlanID, err))
+			month := r.t.UTC().Format("2006-01")
+			planID := s.effectivePlanID(cust, month)
+			if _, err := tieredPrice(s.Plans[planID].Tiers, []*usageRecord{&rec}); err != nil {
+				problems = append(problems, fmt.Sprintf("第 %d 行：按 %s 月有效方案 %q 对单条数量从零计价失败：%v", r.line, month, planID, err))
 				continue
 			}
 		}
@@ -406,6 +423,13 @@ func inMonth(rfc3339, month string) bool {
 		return false
 	}
 	return t.UTC().Format("2006-01") == month
+}
+
+// utcMonth 返回 RFC3339 时间换算 UTC 后的自然月（YYYY-MM）。
+// 入参时间均已在载入/导入时校验为 RFC3339。
+func utcMonth(rfc3339 string) string {
+	t, _ := time.Parse(time.RFC3339, rfc3339)
+	return t.UTC().Format("2006-01")
 }
 
 func cmdBillSettle(dir, customerID, month string) error {

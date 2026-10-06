@@ -2413,19 +2413,19 @@ func TestPlanAddShowListAndPersistence(t *testing.T) {
 func TestPlanAddValidation(t *testing.T) {
 	h := newHarness(t)
 	cases := [][]string{
-		{"plan", "add", "p1", "名称"},                              // 缺少阶梯（用法错误）
-		{"plan", "add", "p1", "名称", "abc"},                       // 格式非法
-		{"plan", "add", "p1", "名称", "100:1", "100:2", "-:3"},     // 上限未严格递增
-		{"plan", "add", "p1", "名称", "200:1", "100:2", "-:3"},     // 上限倒退
-		{"plan", "add", "p1", "名称", "0:1", "-:2"},                // 上限非正
-		{"plan", "add", "p1", "名称", "-5:1", "-:2"},               // 上限为负
-		{"plan", "add", "p1", "名称", "100:-1", "-:2"},             // 单价为负
-		{"plan", "add", "p1", "名称", "100:1", "200:2"},            // 最后一档有上限
-		{"plan", "add", "p1", "名称", "-:1", "100:2"},              // 无上限档不在最后
-		{"plan", "add", "p1", "名称", "100", "-:2"},                // 缺少冒号
-		{"plan", "add", "p1", "名称", "100:abc", "-:2"},            // 单价非整数
-		{"plan", "add", "p1", "", "100:1", "-:2"},                  // 空名称
-		{"plan", "add", "", "名称", "100:1", "-:2"},                // 空标识
+		{"plan", "add", "p1", "名称"},                          // 缺少阶梯（用法错误）
+		{"plan", "add", "p1", "名称", "abc"},                   // 格式非法
+		{"plan", "add", "p1", "名称", "100:1", "100:2", "-:3"}, // 上限未严格递增
+		{"plan", "add", "p1", "名称", "200:1", "100:2", "-:3"}, // 上限倒退
+		{"plan", "add", "p1", "名称", "0:1", "-:2"},            // 上限非正
+		{"plan", "add", "p1", "名称", "-5:1", "-:2"},           // 上限为负
+		{"plan", "add", "p1", "名称", "100:-1", "-:2"},         // 单价为负
+		{"plan", "add", "p1", "名称", "100:1", "200:2"},        // 最后一档有上限
+		{"plan", "add", "p1", "名称", "-:1", "100:2"},          // 无上限档不在最后
+		{"plan", "add", "p1", "名称", "100", "-:2"},            // 缺少冒号
+		{"plan", "add", "p1", "名称", "100:abc", "-:2"},        // 单价非整数
+		{"plan", "add", "p1", "", "100:1", "-:2"},            // 空名称
+		{"plan", "add", "", "名称", "100:1", "-:2"},            // 空标识
 	}
 	for _, args := range cases {
 		h.runExpectErr(args...)
@@ -2651,13 +2651,13 @@ func TestTieredCorruptStateRejected(t *testing.T) {
 		t.Fatal(err)
 	}
 	cases := []struct{ old, new string }{
-		{`"line_fee_fen": 600`, `"line_fee_fen": 601`}, // 明细小计与计价规则不符
-		{`"fee_fen": 400`, `"fee_fen": 401`},            // 分段小计被篡改
-		{`"quantity": 100`, `"quantity": 101`},          // 分档合计被篡改
+		{`"line_fee_fen": 600`, `"line_fee_fen": 601`},     // 明细小计与计价规则不符
+		{`"fee_fen": 400`, `"fee_fen": 401`},               // 分段小计被篡改
+		{`"quantity": 100`, `"quantity": 101`},             // 分档合计被篡改
 		{`"total_fee_fen": 1200`, `"total_fee_fen": 1201`}, // 总金额被篡改
-		{`"plan_id": "p1"`, `"plan_id": "ghost"`},       // 方案引用失效
-		{`"plan_name": "标准阶梯"`, `"plan_name": "改名"`},   // 方案名称快照不符
-		{`"limit": 100`, `"limit": 101`},                // 方案规则快照不符
+		{`"plan_id": "p1"`, `"plan_id": "ghost"`},          // 方案引用失效
+		{`"plan_name": "标准阶梯"`, `"plan_name": "改名"`},       // 方案名称快照不符
+		{`"limit": 100`, `"limit": 101`},                   // 方案规则快照不符
 	}
 	for _, tc := range cases {
 		broken := strings.Replace(string(good), tc.old, tc.new, 1)
@@ -2706,5 +2706,334 @@ func TestOldStateFileWithoutPlans(t *testing.T) {
 	show := h.mustRun("bill", "show", "c1", "2026-09")
 	if !strings.Contains(show, "总金额：30 分") {
 		t.Fatalf("旧账单重启后异常:\n%s", show)
+	}
+}
+
+// --- 阶梯客户按月生效的方案变更 ---
+
+func TestPlanChangeHappyPathAndSchedule(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("plan", "add", "p1", "标准阶梯", "100:10", "-:5")
+	h.mustRun("plan", "add", "p2", "续期阶梯", "50:20", "-:8")
+	h.mustRun("customer", "add-plan", "c1", "客户一", "p1")
+
+	// 变更前查询：仅初始方案。
+	out := h.mustRun("plan", "schedule", "c1")
+	for _, want := range []string{"初始方案：p1（标准阶梯）", "方案变更：无"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("变更前安排查询缺少 %q:\n%s", want, out)
+		}
+	}
+
+	out = h.mustRun("plan", "change", "c1", "2026-11", "p2", "续期采用新价格")
+	for _, want := range []string{"已登记方案变更", "生效月：2026-11", "目标方案：p2（续期阶梯）", "原因：续期采用新价格"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("登记变更输出缺少 %q:\n%s", want, out)
+		}
+	}
+
+	// 安排查询：初始方案 + 按生效月排列的变更及原因。
+	out = h.mustRun("plan", "schedule", "c1")
+	if !strings.Contains(out, "初始方案：p1（标准阶梯）") ||
+		!strings.Contains(out, "自 2026-11 起改用 p2（续期阶梯）") ||
+		!strings.Contains(out, "原因：续期采用新价格") {
+		t.Fatalf("安排查询输出异常:\n%s", out)
+	}
+	// 指定月份说明该月有效方案：生效月（含）起用新方案，之前月份不受影响。
+	if out = h.mustRun("plan", "schedule", "c1", "2026-10"); !strings.Contains(out, "月份 2026-10 的有效方案：p1（标准阶梯）") {
+		t.Fatalf("生效月前的有效方案异常:\n%s", out)
+	}
+	if out = h.mustRun("plan", "schedule", "c1", "2026-11"); !strings.Contains(out, "月份 2026-11 的有效方案：p2（续期阶梯）") {
+		t.Fatalf("生效月的有效方案异常:\n%s", out)
+	}
+	if out = h.mustRun("plan", "schedule", "c1", "2027-03"); !strings.Contains(out, "月份 2027-03 的有效方案：p2（续期阶梯）") {
+		t.Fatalf("生效月后的有效方案异常:\n%s", out)
+	}
+	// 固定单价客户无方案安排；不存在的客户拒绝。
+	h.mustRun("customer", "add", "c9", "客户九", "10")
+	if out = h.mustRun("plan", "schedule", "c9"); !strings.Contains(out, "固定单价客户") {
+		t.Fatalf("固定单价客户安排查询异常:\n%s", out)
+	}
+	h.runExpectErr("plan", "schedule", "ghost")
+	h.runExpectErr("plan", "schedule", "c1", "2026-13")
+}
+
+func TestPlanChangeSettlementAcrossMonths(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("plan", "add", "p1", "旧阶梯", "100:10", "-:5")
+	h.mustRun("plan", "add", "p2", "新阶梯", "100:1", "-:1")
+	h.mustRun("customer", "add-plan", "c1", "客户一", "p1")
+	f := h.writeFile("u.csv", csvHeader+
+		"u1,c1,2026-10-05T00:00:00Z,60\n"+
+		"u2,c1,2026-11-05T00:00:00Z,60\n")
+	h.mustRun("usage", "import", f)
+
+	// 先按初始方案结算 2026-10 并封账：60×10=600。
+	out := h.mustRun("bill", "settle", "c1", "2026-10")
+	if !strings.Contains(out, "方案：p1（旧阶梯）") || !strings.Contains(out, "总金额：600 分") {
+		t.Fatalf("变更前结算异常:\n%s", out)
+	}
+	// 登记自 2026-11 起的变更；生效月晚于已封账的 2026-10，合法。
+	h.mustRun("plan", "change", "c1", "2026-11", "p2", "续期新价")
+	// 2026-11 按新方案结算：60×1=60；账单保存实际使用方案的快照。
+	out = h.mustRun("bill", "settle", "c1", "2026-11")
+	for _, want := range []string{"方案：p2（新阶梯）", "第 1 档：累计上限 100，单价 1 分", "总金额：60 分"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("变更后结算缺少 %q:\n%s", want, out)
+		}
+	}
+	// 历史账单不重算：bill show 与重复 settle 保留原快照、金额。
+	show10 := h.mustRun("bill", "show", "c1", "2026-10")
+	if !strings.Contains(show10, "方案：p1（旧阶梯）") || !strings.Contains(show10, "总金额：600 分") {
+		t.Fatalf("历史账单被变更影响:\n%s", show10)
+	}
+	// 账后行为保持：调整、收款与流水在新旧账单上均正常。
+	h.mustRun("bill", "adjust", "c1", "2026-11", "adj-1", "40", "补收")
+	h.mustRun("bill", "pay", "c1", "2026-11", "pay-1", "100", "转账")
+	ledger := h.mustRun("bill", "ledger", "c1", "2026-11")
+	if !strings.Contains(ledger, "截止时余额：应付 100 分") {
+		t.Fatalf("变更后账单流水异常:\n%s", ledger)
+	}
+}
+
+func TestPlanChangeSettleOldMonthAfterChange(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("plan", "add", "p1", "旧阶梯", "-:10")
+	h.mustRun("plan", "add", "p2", "新阶梯", "-:1")
+	h.mustRun("customer", "add-plan", "c1", "客户一", "p1")
+	f := h.writeFile("u.csv", csvHeader+
+		"u1,c1,2026-10-05T00:00:00Z,10\n"+
+		"u2,c1,2026-12-05T00:00:00Z,10\n")
+	h.mustRun("usage", "import", f)
+	// 先登记变更，再结算生效月之前的月份：仍按初始方案，之前月份不受影响。
+	h.mustRun("plan", "change", "c1", "2026-11", "p2", "续期新价")
+	out := h.mustRun("bill", "settle", "c1", "2026-10")
+	if !strings.Contains(out, "方案：p1（旧阶梯）") || !strings.Contains(out, "总金额：100 分") {
+		t.Fatalf("变更后结算之前月份未用初始方案:\n%s", out)
+	}
+	out = h.mustRun("bill", "settle", "c1", "2026-12")
+	if !strings.Contains(out, "方案：p2（新阶梯）") || !strings.Contains(out, "总金额：10 分") {
+		t.Fatalf("变更后结算生效月之后月份未用新方案:\n%s", out)
+	}
+}
+
+func TestPlanChangeIdempotentAndConflict(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("plan", "add", "p1", "旧阶梯", "-:10")
+	h.mustRun("plan", "add", "p2", "新阶梯", "-:1")
+	h.mustRun("customer", "add-plan", "c1", "客户一", "p1")
+	h.mustRun("plan", "change", "c1", "2026-11", "p2", "续期新价")
+
+	// 相同目标方案和原因的重放返回原记录，不重复生效。
+	out := h.mustRun("plan", "change", "c1", "2026-11", "p2", "续期新价")
+	if !strings.Contains(out, "内容相同，返回原记录") {
+		t.Fatalf("重放未幂等返回:\n%s", out)
+	}
+	// 追加后续变更、封账之后重放仍返回原记录。
+	h.mustRun("plan", "change", "c1", "2027-01", "p1", "恢复旧价")
+	f := h.writeFile("u.csv", csvHeader+"u1,c1,2026-11-05T00:00:00Z,3\n")
+	h.mustRun("usage", "import", f)
+	h.mustRun("bill", "settle", "c1", "2026-11")
+	out = h.mustRun("plan", "change", "c1", "2026-11", "p2", "续期新价")
+	if !strings.Contains(out, "内容相同，返回原记录") {
+		t.Fatalf("封账后重放未幂等返回:\n%s", out)
+	}
+	// 同一项内容不同（目标方案或原因不同）拒绝，已有变更不可改写。
+	if msg := h.runExpectErr("plan", "change", "c1", "2026-11", "p1", "续期新价"); !strings.Contains(msg, "不可改写") {
+		t.Fatal(msg)
+	}
+	if msg := h.runExpectErr("plan", "change", "c1", "2026-11", "p2", "另一个原因"); !strings.Contains(msg, "不可改写") {
+		t.Fatal(msg)
+	}
+	// 其他客户可使用相同月份。
+	h.mustRun("customer", "add-plan", "c2", "客户二", "p1")
+	h.mustRun("plan", "change", "c2", "2026-11", "p2", "其他客户同期变更")
+	// 安排不被重放与冲突影响。
+	out = h.mustRun("plan", "schedule", "c1")
+	if !strings.Contains(out, "自 2026-11 起改用 p2") || !strings.Contains(out, "自 2027-01 起改用 p1") {
+		t.Fatalf("安排异常:\n%s", out)
+	}
+}
+
+func TestPlanChangeValidation(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("plan", "add", "p1", "旧阶梯", "-:10")
+	h.mustRun("plan", "add", "p2", "新阶梯", "-:1")
+	h.mustRun("customer", "add-plan", "c1", "客户一", "p1")
+	h.mustRun("customer", "add", "c9", "客户九", "10")
+
+	h.runExpectErr("plan", "change", "c1", "2026-13", "p2", "原因")    // 月份非法
+	h.runExpectErr("plan", "change", "c1", "2026-1", "p2", "原因")     // 月份格式
+	h.runExpectErr("plan", "change", "c1", "2026-11", "p2", "  ")    // 空原因
+	h.runExpectErr("plan", "change", "ghost", "2026-11", "p2", "原因") // 客户不存在
+	h.runExpectErr("plan", "change", "c1", "2026-11", "ghost", "原因") // 目标方案不存在
+	// 仅限已绑定阶梯方案的客户。
+	if msg := h.runExpectErr("plan", "change", "c9", "2026-11", "p2", "原因"); !strings.Contains(msg, "固定单价") {
+		t.Fatal(msg)
+	}
+	// 失败不占用客户月份，可重试。
+	h.mustRun("plan", "change", "c1", "2026-11", "p2", "续期新价")
+	// 新变更只能按生效月递增追加。
+	if msg := h.runExpectErr("plan", "change", "c1", "2026-10", "p1", "回退"); !strings.Contains(msg, "递增追加") {
+		t.Fatal(msg)
+	}
+	// 生效月须晚于所有已封账月份。
+	f := h.writeFile("u.csv", csvHeader+"u1,c1,2026-12-05T00:00:00Z,3\n")
+	h.mustRun("usage", "import", f)
+	h.mustRun("bill", "settle", "c1", "2026-12")
+	if msg := h.runExpectErr("plan", "change", "c1", "2026-12", "p1", "太晚"); !strings.Contains(msg, "已封账") {
+		t.Fatal(msg)
+	}
+	// 晚于所有已封账月份且按生效月递增的变更合法。
+	h.mustRun("plan", "change", "c1", "2027-01", "p1", "再次变更")
+}
+
+func TestPlanChangeOverflowPrecheck(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("plan", "add", "cheap", "低价", "-:1")
+	h.mustRun("plan", "add", "spike", "天价", "-:9223372036854775807")
+	h.mustRun("customer", "add-plan", "c1", "客户一", "cheap")
+	// 生效月起已导入的未封账用量按新方案单条从零计价溢出：整项拒绝并指出用量。
+	f := h.writeFile("u.csv", csvHeader+"u1,c1,2026-11-05T00:00:00Z,2\n")
+	h.mustRun("usage", "import", f)
+	msg := h.runExpectErr("plan", "change", "c1", "2026-11", "spike", "涨价")
+	if !strings.Contains(msg, "u1") || !strings.Contains(msg, "溢出") || !strings.Contains(msg, "整项变更拒绝") {
+		t.Fatal(msg)
+	}
+	// 用量未被修改，变更未生效：重复导入仍按重复跳过，安排无变更。
+	if out := h.mustRun("usage", "import", f); !strings.Contains(out, "新增 0 条，重复跳过 1 条") {
+		t.Fatalf("预检失败后用量状态变化:\n%s", out)
+	}
+	if out := h.mustRun("plan", "schedule", "c1"); !strings.Contains(out, "方案变更：无") {
+		t.Fatalf("预检失败后变更已生效:\n%s", out)
+	}
+	// 生效月之前的用量不参与预检：2026-12 起变更合法（u1 在 2026-11）。
+	h.mustRun("plan", "change", "c1", "2026-12", "spike", "涨价")
+}
+
+func TestPlanChangeImportUsesEffectivePlan(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("plan", "add", "spike", "天价", "-:9223372036854775807")
+	h.mustRun("plan", "add", "cheap", "低价", "-:1")
+	h.mustRun("customer", "add-plan", "c1", "客户一", "spike")
+	h.mustRun("plan", "change", "c1", "2026-11", "cheap", "续期降价")
+	// 后续导入按记录时间换算的 UTC 月份选择方案：2026-11 起用低价方案。
+	f := h.writeFile("u.csv", csvHeader+"u1,c1,2026-11-05T00:00:00Z,2\n")
+	h.mustRun("usage", "import", f)
+	// 生效月之前仍按初始（天价）方案预检：单条溢出，整批拒绝。
+	f2 := h.writeFile("u2.csv", csvHeader+"u2,c1,2026-10-05T00:00:00Z,2\n")
+	if msg := h.runExpectErr("usage", "import", f2); !strings.Contains(msg, "溢出") || !strings.Contains(msg, "整批未生效") {
+		t.Fatal(msg)
+	}
+}
+
+func TestPlanChangeDoesNotConsumeSeq(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("plan", "add", "p1", "阶梯", "-:10")
+	h.mustRun("plan", "add", "p2", "新阶梯", "-:1")
+	h.mustRun("customer", "add-plan", "c1", "客户一", "p1")
+	f := h.writeFile("u.csv", csvHeader+"u1,c1,2026-09-05T00:00:00Z,3\n")
+	h.mustRun("usage", "import", f)
+	h.mustRun("bill", "settle", "c1", "2026-09")
+	// 方案变更不产生账后流水事件、不占用全局操作序号。
+	h.mustRun("plan", "change", "c1", "2026-11", "p2", "续期新价")
+	h.mustRun("bill", "adjust", "c1", "2026-09", "adj-1", "5", "补收")
+	ledger := h.mustRun("bill", "ledger", "c1", "2026-09")
+	if !strings.Contains(ledger, "存档全局序号上限：1") || !strings.Contains(ledger, "序号 1 调整 adj-1") {
+		t.Fatalf("方案变更占用了操作序号:\n%s", ledger)
+	}
+}
+
+func TestPlanChangeCorruptStateRejected(t *testing.T) {
+	h := newHarness(t)
+	h.mustRun("plan", "add", "p1", "旧阶梯", "-:10")
+	h.mustRun("plan", "add", "p2", "新阶梯", "-:1")
+	h.mustRun("customer", "add-plan", "c1", "客户一", "p1")
+	h.mustRun("plan", "change", "c1", "2026-11", "p2", "续期新价")
+	f := h.writeFile("u.csv", csvHeader+"u1,c1,2026-11-05T00:00:00Z,3\n")
+	h.mustRun("usage", "import", f)
+	h.mustRun("bill", "settle", "c1", "2026-11")
+
+	good, err := os.ReadFile(h.statePath())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 篡改点都锚定在 plan_changes 节（键 + 6 空格缩进与账单字段区分）。
+	cases := []struct{ old, new string }{
+		{"\"month\": \"2026-11\",\n      \"plan_id\": \"p2\"",
+			"\"month\": \"2026-11\",\n      \"plan_id\": \"ghost\""}, // 变更引用失效的方案
+		{"\"c1|2026-11\": {\n      \"customer_id\": \"c1\",\n      \"month\": \"2026-11\"",
+			"\"c1|2026-11\": {\n      \"customer_id\": \"c1\",\n      \"month\": \"2026-13\""}, // 变更生效月非法
+		{`"reason": "续期新价"`, `"reason": "  "`}, // 变更原因为空
+		{"\"c1|2026-11\": {\n      \"customer_id\": \"c1\"",
+			"\"c1|2026-11\": {\n      \"customer_id\": \"ghost\""}, // 变更引用失效的客户
+	}
+	for _, tc := range cases {
+		broken := strings.Replace(string(good), tc.old, tc.new, 1)
+		if broken == string(good) {
+			t.Fatalf("替换 %q 未生效", tc.old)
+		}
+		if err := os.WriteFile(h.statePath(), []byte(broken), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		msg := h.runExpectErr("plan", "schedule", "c1")
+		if !strings.Contains(msg, "损坏") {
+			t.Fatalf("篡改 %q 未报损坏: %s", tc.old, msg)
+		}
+		got, _ := os.ReadFile(h.statePath())
+		if string(got) != broken {
+			t.Fatalf("篡改 %q 后文件被改写", tc.old)
+		}
+	}
+	// 账单方案须符合账期安排：把变更移到 2026-12 后，2026-11 的安排回到
+	// 初始方案 p1，而已封账账单仍是 p2，不一致即损坏。
+	broken := strings.Replace(string(good),
+		"\"c1|2026-11\": {\n      \"customer_id\": \"c1\",\n      \"month\": \"2026-11\"",
+		"\"c1|2026-12\": {\n      \"customer_id\": \"c1\",\n      \"month\": \"2026-12\"", 1)
+	if broken == string(good) {
+		t.Fatal("变更月份替换未生效")
+	}
+	if err := os.WriteFile(h.statePath(), []byte(broken), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if msg := h.runExpectErr("bill", "show", "c1", "2026-11"); !strings.Contains(msg, "损坏") {
+		t.Fatalf("账单方案与账期安排不一致未报损坏: %s", msg)
+	}
+	// 恢复完好存档后一切正常。
+	if err := os.WriteFile(h.statePath(), good, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	h.mustRun("plan", "schedule", "c1")
+	h.mustRun("bill", "show", "c1", "2026-11")
+}
+
+func TestOldStateFileWithoutPlanChanges(t *testing.T) {
+	h := newHarness(t)
+	// 旧格式存档：有方案与阶梯客户，但无 plan_changes 字段，沿用原绑定。
+	old := `{
+  "version": 1,
+  "customers": {"c1": {"id": "c1", "name": "老客户", "price_fen": 0, "plan_id": "p1"}},
+  "plans": {"p1": {"id": "p1", "name": "阶梯", "tiers": [{"limit": 0, "price_fen": 10}]}},
+  "usage": {"u1": {"id": "u1", "customer_id": "c1", "time": "2026-09-01T00:00:00Z", "quantity": 3}},
+  "bills": {}
+}
+`
+	if err := os.WriteFile(h.statePath(), []byte(old), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out := h.mustRun("plan", "schedule", "c1")
+	if !strings.Contains(out, "初始方案：p1（阶梯）") || !strings.Contains(out, "方案变更：无") {
+		t.Fatalf("旧存档安排查询异常:\n%s", out)
+	}
+	out = h.mustRun("bill", "settle", "c1", "2026-09")
+	if !strings.Contains(out, "方案：p1（阶梯）") || !strings.Contains(out, "总金额：30 分") {
+		t.Fatalf("旧存档结算异常:\n%s", out)
+	}
+	// 重启（重新载入）后安排、幂等与历史账单校验保持。
+	h.mustRun("plan", "add", "p2", "新阶梯", "-:1")
+	h.mustRun("plan", "change", "c1", "2026-10", "p2", "续期新价")
+	show := h.mustRun("bill", "show", "c1", "2026-09")
+	if !strings.Contains(show, "方案：p1（阶梯）") || !strings.Contains(show, "总金额：30 分") {
+		t.Fatalf("旧账单在变更后异常:\n%s", show)
 	}
 }
