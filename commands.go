@@ -130,7 +130,7 @@ func runCmd(args []string, dataDir string) error {
 
 	case "bill":
 		if len(args) < 2 {
-			return usageError("缺少子命令，应为：bill settle|settle-batch|show|adjust|revoke|pay|remit|correct|unpay|ledger|reconcile ...")
+			return usageError("缺少子命令，应为：bill settle|settle-batch|show|adjust|revoke|pay|remit|correct|unpay|refund|ledger|reconcile ...")
 		}
 		switch args[1] {
 		case "settle":
@@ -175,6 +175,11 @@ func runCmd(args []string, dataDir string) error {
 				return usageError("用法：bill unpay <收款标识> <原因>")
 			}
 			return cmdBillUnpay(dataDir, args[2], args[3])
+		case "refund":
+			if len(args) < 5 {
+				return usageError("用法：bill refund <收款标识> <退款标识> <原因> <YYYY-MM:金额分> [更多 月份:金额 ...]")
+			}
+			return cmdBillRefund(dataDir, args[2], args[3], args[4], args[5:])
 		case "ledger":
 			if len(args) != 4 && len(args) != 5 {
 				return usageError("用法：bill ledger <客户标识> <YYYY-MM> [截止操作序号]")
@@ -190,7 +195,7 @@ func runCmd(args []string, dataDir string) error {
 			}
 			return cmdBillReconcile(dataDir, args[2], args[3], args[4], args[5:])
 		default:
-			return usageError("未知 bill 子命令 %q；可用：settle、settle-batch、show、adjust、revoke、pay、remit、correct、unpay、ledger、reconcile", args[1])
+			return usageError("未知 bill 子命令 %q；可用：settle、settle-batch、show、adjust、revoke、pay、remit、correct、unpay、refund、ledger、reconcile", args[1])
 		}
 
 	default:
@@ -776,6 +781,15 @@ func paymentHistoryEvents(s *state, pays []*payment, month string) []string {
 			events = append(events, event{p.RevokeSeq, fmt.Sprintf("撤销收款 %s：原因：%s（关联收款 %s，总额 %d 分，本账单分配 %d 分）",
 				p.ID, p.RevokeReason, p.ID, p.Total, running)})
 		}
+		// 退款在其发生序号减少本账单实收；退款不可撤销，记录永久保留。
+		for _, r := range refundsFor(s, p.ID) {
+			amt := allocAmountFor(r.Allocations, month)
+			if amt <= 0 {
+				continue // 本次退款不涉及本账单
+			}
+			events = append(events, event{r.Seq, fmt.Sprintf("退款 %s：原因：%s（关联收款 %s，本账单退款 %d 分（%s））",
+				r.ID, r.Reason, p.ID, amt, moneyFen(amt))})
+		}
 	}
 	sort.Slice(events, func(i, j int) bool { return events[i].seq < events[j].seq })
 	out := make([]string, len(events))
@@ -1222,6 +1236,13 @@ func cmdBillUnpay(dir, payID, reason string) error {
 		return fmt.Errorf("收款 %q 已撤销（撤销原因 %q），改用其他原因重复撤销被拒绝", payID, p.RevokeReason)
 	}
 
+	// 首次退款后该收款的最新分配固定，拒绝整笔撤销；退款记录永久保留且
+	// 不可撤销，实收按扣除退款后的余额继续计算。无退款的收款仍按原规则
+	// 处理。
+	if paymentHasRefunds(s, payID) {
+		return fmt.Errorf("收款 %q 已发生退款，最新分配已固定，拒绝整笔撤销；如需退回余款请继续登记部分退款", payID)
+	}
+
 	// 撤销整笔生效：取消该笔在全部分配月份上的最新实收（经更正的以最新
 	// 分配为准），不接受部分撤销；不改变应付、其他收款或调整，原收款、
 	// 分配、更正与撤销原因永久保留。
@@ -1272,6 +1293,19 @@ func printPayment(p *payment, s *state) {
 		fmt.Fprintf(stdout, "当前分配（经 %d 次更正，以最新为准）：%s\n",
 			len(corrs), formatAllocations(currentAllocations(s, p)))
 	}
+	if refs := refundsFor(s, p.ID); len(refs) > 0 {
+		current := currentAllocations(s, p)
+		fmt.Fprintf(stdout, "退款记录（%d 笔，永久保留、不可撤销；首次退款后最新分配已固定）：\n", len(refs))
+		for _, r := range refs {
+			fmt.Fprintf(stdout, "  退款 %s：%s，原因：%s\n", r.ID, formatAllocations(r.Allocations), r.Reason)
+		}
+		fmt.Fprintln(stdout, "各月剩余可退额（最新分配减累计退款）：")
+		for _, al := range current {
+			refunded := refundedForMonth(s, p.ID, al.Month)
+			fmt.Fprintf(stdout, "  月份 %s：分配 %d 分，累计已退 %d 分，剩余可退 %d 分（%s）\n",
+				al.Month, al.Amount, refunded, al.Amount-refunded, moneyFen(al.Amount-refunded))
+		}
+	}
 }
 
 // --- 收款分配更正 ---
@@ -1318,6 +1352,12 @@ func cmdBillCorrect(dir, payID, corrID, reason string, allocArgs []string) error
 	// 新增更正只允许未撤销收款。
 	if p.Revoked {
 		return fmt.Errorf("收款 %q 已撤销（撤销原因 %q），不能新增分配更正", payID, p.RevokeReason)
+	}
+
+	// 首次退款后该收款的最新分配固定，拒绝新增分配更正；已有更正的相同
+	// 重放已在上面按原记录返回，不受此限。无退款的收款仍按原规则处理。
+	if paymentHasRefunds(s, payID) {
+		return fmt.Errorf("收款 %q 已发生退款，最新分配已固定，拒绝新增分配更正", payID)
 	}
 
 	// 新分配合计必须等于原收款总额（不重复收钱也不多收），全程整数运算。
@@ -1444,20 +1484,21 @@ func printCorrection(c *correction, s *state) {
 // --- 账后对账流水 ---
 
 // ledgerEvent 是某张已结算账单账后流水中的一个事件：调整、撤销调整、收款、
-// 分配更正或撤销收款。事件按全局操作序号升序回放；撤销在其发生序号抵消
+// 分配更正、撤销收款或退款。事件按全局操作序号升序回放；撤销在其发生序号抵消
 // 对应原操作，已撤销记录在撤销之前仍计入，不按当前撤销状态删除原事件；
-// 更正在其发生序号把关联收款在本账单的分配由前值替换为后值。
+// 更正在其发生序号把关联收款在本账单的分配由前值替换为后值；退款在其发生
+// 序号减少本账单实收，不可撤销。
 type ledgerEvent struct {
-	seq           int64  // 全局操作序号（调整/收款/更正及其撤销共用）
-	kind          string // 事件类型：调整 / 撤销调整 / 收款 / 更正 / 撤销收款
+	seq           int64  // 全局操作序号（调整/收款/更正/退款及其撤销共用）
+	kind          string // 事件类型：调整 / 撤销调整 / 收款 / 更正 / 撤销收款 / 退款
 	refID         string // 原记录标识（调整标识、收款标识或更正标识）
 	deltaPayable  int64  // 对当前应付的影响（分，带符号）
 	deltaReceived int64  // 对实收的影响（分，带符号）
 	note          string // 原因（调整/更正类）或备注（收款类）
 	linkSeq       int64  // 撤销事件关联的原操作序号；非撤销事件为 0
 	payTotal      int64  // 收款类事件：汇款总额
-	payAlloc      int64  // 收款类事件：本账单分配（撤销收款事件为被取消的最新分配）
-	payID         string // 更正事件：关联收款标识
+	payAlloc      int64  // 收款类事件：本账单分配（撤销收款事件为被取消的最新分配；退款事件为本账单退款额）
+	payID         string // 更正/退款事件：关联收款标识
 	beforeAlloc   int64  // 更正事件：本账单更正前分配
 	afterAlloc    int64  // 更正事件：本账单更正后分配
 	afterPayable  int64  // 事件后的应付（回放时填充）
@@ -1539,6 +1580,19 @@ func billLedger(s *state, b *bill) ([]ledgerEvent, error) {
 				payTotal: p.Total, payAlloc: running,
 			})
 		}
+		// 退款在其发生序号减少本账单实收；退款月份必属于最新分配，故该收款
+		// 必然已被上面的“涉及本账单”判断纳入。
+		for _, r := range refundsFor(s, p.ID) {
+			amt := allocAmountFor(r.Allocations, b.Month)
+			if amt <= 0 {
+				continue // 本次退款不涉及本账单
+			}
+			events = append(events, ledgerEvent{
+				seq: r.Seq, kind: "退款", refID: r.ID,
+				deltaReceived: -amt, note: r.Reason,
+				payID: p.ID, payAlloc: amt,
+			})
+		}
 	}
 	sort.Slice(events, func(i, j int) bool { return events[i].seq < events[j].seq })
 
@@ -1597,7 +1651,7 @@ func cmdBillLedger(dir, customerID, month, cutoffText string, hasCutoff bool) er
 		return fmt.Errorf("客户 %s 的 %s 尚无账单（未结算）", customerID, month)
 	}
 
-	// 截止序号使用调整/收款及其撤销共用的已保存全局序号：省略表示最新，
+	// 截止序号使用调整/收款/更正/退款及其撤销共用的已保存全局序号：省略表示最新，
 	// 0 只返回初始余额，截止包含该序号；因其他客户或月份操作造成的序号
 	// 空档合法。负数、非整数或超过存档全局序号上限一律拒绝。
 	cutoff := s.NextSeq
@@ -1678,6 +1732,9 @@ func formatLedgerEvent(ev ledgerEvent) string {
 	case "更正":
 		return fmt.Sprintf("序号 %d 更正 %s：实收 %+d 分（%s，关联收款 %s，本账单分配 %d 分 → %d 分），原因：%s → %s",
 			ev.seq, ev.refID, ev.deltaReceived, moneyFen(ev.deltaReceived), ev.payID, ev.beforeAlloc, ev.afterAlloc, ev.note, after)
+	case "退款":
+		return fmt.Sprintf("序号 %d 退款 %s：实收 %+d 分（%s，关联收款 %s，本账单退款 %d 分），原因：%s → %s",
+			ev.seq, ev.refID, ev.deltaReceived, moneyFen(ev.deltaReceived), ev.payID, ev.payAlloc, ev.note, after)
 	default: // 撤销收款
 		return fmt.Sprintf("序号 %d 撤销收款 %s：实收 %+d 分（%s，关联序号 %d 的收款 %s，汇款总额 %d 分，取消本账单分配 %d 分），原因：%s → %s",
 			ev.seq, ev.refID, ev.deltaReceived, moneyFen(ev.deltaReceived), ev.linkSeq, ev.refID, ev.payTotal, ev.payAlloc, ev.note, after)

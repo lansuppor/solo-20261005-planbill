@@ -176,6 +176,20 @@ type correction struct {
 	CreatedAt   string              `json:"created_at"`
 }
 
+// refund 是对一笔已登记收款的部分退款登记：从该收款当前最新分配涉及的
+// 月份中实际退回资金，各月退款金额为正整数分，累计不得超过该笔在该月的
+// 分配。记录一旦写入永不删除、不可撤销；首次退款后该收款的最新分配固定，
+// 不得再新增分配更正或整笔撤销。退款标识与收款、调整、更正标识命名空间
+// 相互独立，可同名。
+type refund struct {
+	ID          string              `json:"id"`
+	PaymentID   string              `json:"payment_id"` // 目标收款标识
+	Reason      string              `json:"reason"`
+	Allocations []paymentAllocation `json:"allocations"` // 各月退款金额，至少一项，月份不重复，按月份升序保存
+	Seq         int64               `json:"seq"`         // 全局递增操作序号，与调整/收款/更正及其撤销共用
+	CreatedAt   string              `json:"created_at"`
+}
+
 // planChange 是阶梯客户的一次按月生效的方案变更：自生效月（UTC 自然月，
 // 含）起改用目标方案，直到下一次变更；生效月之前的月份不受影响。记录一旦
 // 写入永不修改或删除；变更不产生账后流水事件，也不占用全局操作序号。
@@ -219,10 +233,11 @@ type state struct {
 	Adjustments map[string]*adjustment  `json:"adjustments"`           // 全局唯一调整标识 -> 记录
 	Payments    map[string]*payment     `json:"payments"`              // 全局唯一收款标识 -> 记录（与调整标识相互独立，可同名）
 	Corrections map[string]*correction  `json:"corrections"`           // 全局唯一更正标识 -> 记录（与收款、调整标识相互独立，可同名）
+	Refunds     map[string]*refund      `json:"refunds,omitempty"`     // 全局唯一退款标识 -> 记录（与收款、调整、更正标识相互独立，可同名；不可撤销）
 	PlanChanges map[string]*planChange  `json:"plan_changes"`          // 客户 + "|" + 生效月 -> 方案变更（按生效月递增追加，不可改写）
 	Suspensions map[string]*suspension  `json:"suspensions,omitempty"` // 客户 + "|" + 起月 -> 暂停区间（不可改写）
 	Withdrawals map[string]*withdrawal  `json:"withdrawals,omitempty"` // 用量标识 -> 撤回标记（不可恢复，标识不可复用）
-	NextSeq     int64                   `json:"next_seq"`              // 已分配的最大操作序号（调整/收款/更正及其撤销共用；方案变更、暂停与用量撤回不占用）
+	NextSeq     int64                   `json:"next_seq"`              // 已分配的最大操作序号（调整/收款/更正/退款及其撤销共用；方案变更、暂停与用量撤回不占用）
 	path        string                  `json:"-"`
 }
 
@@ -256,9 +271,9 @@ func loadStore(dir string) (*state, error) {
 	if err := s.validate(); err != nil {
 		return nil, fmt.Errorf("数据文件已损坏: %w", err)
 	}
-	// 旧版本数据文件没有 plans/adjustments/payments/corrections/plan_changes/
-	// suspensions/withdrawals/next_seq 字段：视为零方案、零调整、零实收、零更正、
-	// 零方案变更、零暂停、零撤回（全部用量有效）。
+	// 旧版本数据文件没有 plans/adjustments/payments/corrections/refunds/
+	// plan_changes/suspensions/withdrawals/next_seq 字段：视为零方案、零调整、
+	// 零实收、零更正、零退款、零方案变更、零暂停、零撤回（全部用量有效）。
 	if s.Plans == nil {
 		s.Plans = map[string]*plan{}
 	}
@@ -270,6 +285,9 @@ func loadStore(dir string) (*state, error) {
 	}
 	if s.Corrections == nil {
 		s.Corrections = map[string]*correction{}
+	}
+	if s.Refunds == nil {
+		s.Refunds = map[string]*refund{}
 	}
 	if s.PlanChanges == nil {
 		s.PlanChanges = map[string]*planChange{}
@@ -294,6 +312,7 @@ func newState(p string) *state {
 		Adjustments: map[string]*adjustment{},
 		Payments:    map[string]*payment{},
 		Corrections: map[string]*correction{},
+		Refunds:     map[string]*refund{},
 		PlanChanges: map[string]*planChange{},
 		Suspensions: map[string]*suspension{},
 		Withdrawals: map[string]*withdrawal{},
@@ -754,9 +773,94 @@ func (s *state) validate() error {
 		}
 		seenSeq[c.Seq] = "更正 " + id
 	}
+	// 退款记录：标识、目标收款、原因、各月退款与序号都必须自洽。退款标识与
+	// 收款、调整、更正标识命名空间相互独立，允许同名。退款只作用于未撤销
+	// 收款的最新分配涉及的月份；首次退款后该收款不得再更正或整笔撤销，
+	// 因此全部退款都以当前最新分配为准核验，累计不得超退。旧文件缺少退款
+	// 记录视为无退款（Refunds 已在载入时补为空表）。
+	for id, r := range s.Refunds {
+		if r == nil {
+			return fmt.Errorf("退款 %q 的数据为空", id)
+		}
+		if r.ID != id {
+			return fmt.Errorf("退款标识不一致: 键 %q / 记录 %q", id, r.ID)
+		}
+		if r.ID == "" {
+			return errors.New("存在空的退款标识")
+		}
+		p, ok := s.Payments[r.PaymentID]
+		if !ok {
+			return fmt.Errorf("退款 %q 引用了不存在的收款 %q（退款目标失效）", id, r.PaymentID)
+		}
+		if strings.TrimSpace(r.Reason) == "" {
+			return fmt.Errorf("退款 %q 的原因为空", id)
+		}
+		if len(r.Allocations) == 0 {
+			return fmt.Errorf("退款 %q 没有月份金额清单", id)
+		}
+		current := currentAllocations(s, p)
+		seenMonths := make(map[string]bool)
+		for _, al := range r.Allocations {
+			if !validMonth(al.Month) {
+				return fmt.Errorf("退款 %q 的月份 %q 无效", id, al.Month)
+			}
+			if seenMonths[al.Month] {
+				return fmt.Errorf("退款 %q 的月份 %s 重复", id, al.Month)
+			}
+			seenMonths[al.Month] = true
+			if al.Amount <= 0 {
+				return fmt.Errorf("退款 %q 在 %s 的金额不是正整数", id, al.Month)
+			}
+			if allocAmountFor(current, al.Month) <= 0 {
+				return fmt.Errorf("退款 %q 的月份 %s 不在收款 %q 的最新分配中（仅允许退最新分配涉及的月份）", id, al.Month, r.PaymentID)
+			}
+		}
+		if r.Seq <= p.Seq || r.Seq > s.NextSeq {
+			return fmt.Errorf("退款 %q 的操作序号越界", id)
+		}
+		if prev, dup := seenSeq[r.Seq]; dup {
+			return fmt.Errorf("退款 %q 与 %q 的操作序号重复", id, prev)
+		}
+		seenSeq[r.Seq] = "退款 " + id
+	}
+	// 逐收款核验退款相关约束：已退款的收款不得被整笔撤销；首次退款后不得
+	// 再出现更正（最新分配已固定）；各月累计退款不得超过该笔在该月的最新
+	// 分配（累计超退即余额异常）。
+	for pid, p := range s.Payments {
+		refs := refundsFor(s, pid)
+		if len(refs) == 0 {
+			continue
+		}
+		firstRefundSeq := refs[0].Seq // refundsFor 按序号升序
+		if p.Revoked {
+			return fmt.Errorf("收款 %q 已发生退款（首次退款序号 %d）却又被整笔撤销（序号 %d），操作先后非法", pid, firstRefundSeq, p.RevokeSeq)
+		}
+		for _, c := range s.Corrections {
+			if c.PaymentID == pid && c.Seq > firstRefundSeq {
+				return fmt.Errorf("更正 %q 的序号 %d 晚于收款 %q 的首次退款序号 %d（首次退款后最新分配已固定），操作先后非法", c.ID, c.Seq, pid, firstRefundSeq)
+			}
+		}
+		current := currentAllocations(s, p)
+		totals := make(map[string]int64)
+		for _, r := range refs {
+			for _, al := range r.Allocations {
+				sum, err := add64(totals[al.Month], al.Amount)
+				if err != nil {
+					return fmt.Errorf("收款 %q 在 %s 的累计退款溢出有符号 64 位整数范围，余额异常", pid, al.Month)
+				}
+				totals[al.Month] = sum
+			}
+		}
+		for month, refunded := range totals {
+			if alloc := allocAmountFor(current, month); refunded > alloc {
+				return fmt.Errorf("收款 %q 在 %s 的累计退款 %d 分超过该月分配 %d 分（累计超退），余额异常", pid, month, refunded, alloc)
+			}
+		}
+	}
 	// 每张账单：当前应付（原总金额 + 全部未撤销调整净额）必须介于
 	// 0 与有符号 64 位最大值之间；实收（全部未撤销收款按最新分配在该月
-	// 计入之和）必须满足 0 ≤ 实收 ≤ 当前应付。越界说明金额与记录不一致。
+	// 计入并扣除退款后的合计）必须满足 0 ≤ 实收 ≤ 当前应付。越界说明
+	// 金额与记录不一致。
 	for key, b := range s.Bills {
 		_, payable, err := billTotals(b, adjustmentsFor(s, b.CustomerID, b.Month))
 		if err != nil {
@@ -1108,15 +1212,16 @@ func paymentsEverFor(s *state, customerID, month string) []*payment {
 	return list
 }
 
-// paymentReceived 返回全部未撤销收款按最新分配在指定月份计入的实收之和。
-// 各笔分配均为正整数，用非负 64 位加法累加，溢出时返回错误。
+// paymentReceived 返回全部未撤销收款按最新分配在指定月份计入并扣除退款后
+// 的实收之和。各笔净额（分配减累计退款）均为非负整数，用非负 64 位加法
+// 累加，溢出时返回错误。
 func paymentReceived(s *state, customerID, month string) (int64, error) {
 	var received int64
 	for _, p := range s.Payments {
 		if p.CustomerID != customerID || p.Revoked {
 			continue
 		}
-		amt := allocAmountFor(currentAllocations(s, p), month)
+		amt := allocAmountFor(currentAllocations(s, p), month) - refundedForMonth(s, p.ID, month)
 		if amt <= 0 {
 			continue
 		}
@@ -1127,6 +1232,41 @@ func paymentReceived(s *state, customerID, month string) (int64, error) {
 		}
 	}
 	return received, nil
+}
+
+// refundsFor 返回某收款的全部退款，按操作序号升序。
+func refundsFor(s *state, paymentID string) []*refund {
+	var list []*refund
+	for _, r := range s.Refunds {
+		if r.PaymentID == paymentID {
+			list = append(list, r)
+		}
+	}
+	sort.Slice(list, func(i, j int) bool { return list[i].Seq < list[j].Seq })
+	return list
+}
+
+// refundedForMonth 返回某收款在指定月份的累计退款金额（分）；无退款时为 0。
+// 数据在载入时已校验累计不超退，合计不超过该月分配，不会溢出。
+func refundedForMonth(s *state, paymentID, month string) int64 {
+	var total int64
+	for _, r := range s.Refunds {
+		if r.PaymentID == paymentID {
+			total += allocAmountFor(r.Allocations, month)
+		}
+	}
+	return total
+}
+
+// paymentHasRefunds 报告某收款是否已发生退款。首次退款后该收款的最新分配
+// 固定，不得再新增分配更正或整笔撤销。
+func paymentHasRefunds(s *state, paymentID string) bool {
+	for _, r := range s.Refunds {
+		if r.PaymentID == paymentID {
+			return true
+		}
+	}
+	return false
 }
 
 // errPayableOutOfRange 表示当前应付越出 [0, 有符号 64 位最大值]。
