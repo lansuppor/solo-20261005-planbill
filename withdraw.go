@@ -88,7 +88,8 @@ func cmdUsageShow(dir, usageID string) error {
 }
 
 // printUsageRecord 输出一条用量记录的原始内容（标识、客户、时间、数量）、
-// 换算后的 UTC 自然月，以及是否撤回与撤回原因。
+// 换算后的 UTC 自然月，以及是否撤回与撤回原因；此外展示该记录在用量更正链
+// 上的直接前身、后继及对应更正原因，无任何更正关联时明确说明。
 func printUsageRecord(s *state, u *usageRecord) {
 	cust := s.Customers[u.CustomerID] // 载入时已校验存在
 	fmt.Fprintf(stdout, "用量标识：%s\n", u.ID)
@@ -100,5 +101,17 @@ func printUsageRecord(s *state, u *usageRecord) {
 		fmt.Fprintf(stdout, "当前状态：已撤回（撤回原因：%s；不参与结算与冲突检查，不可恢复）\n", w.Reason)
 	} else {
 		fmt.Fprintln(stdout, "当前状态：有效（参与结算与冲突检查）")
+	}
+	// 直接前身：本记录是哪条原用量的更正替代。
+	if pred := predecessorCorrection(s, u.ID); pred != nil {
+		fmt.Fprintf(stdout, "直接前身：%s（由用量更正替代而来，更正原因：%s）\n", pred.UsageID, pred.Reason)
+	} else {
+		fmt.Fprintln(stdout, "直接前身：无（不是任何用量更正的替代记录）")
+	}
+	// 直接后继：本记录被更正后产生的替代记录。
+	if succ := successorCorrection(s, u.ID); succ != nil {
+		fmt.Fprintf(stdout, "直接后继：%s（本记录已被用量更正替代，更正原因：%s；更正不可撤销）\n", succ.ReplacementID, succ.Reason)
+	} else {
+		fmt.Fprintln(stdout, "直接后继：无（本记录未曾被更正）")
 	}
 }
