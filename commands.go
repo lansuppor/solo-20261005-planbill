@@ -130,7 +130,7 @@ func runCmd(args []string, dataDir string) error {
 
 	case "bill":
 		if len(args) < 2 {
-			return usageError("缺少子命令，应为：bill settle|settle-batch|show|adjust|revoke|pay|remit|correct|unpay|refund|ledger|reconcile ...")
+			return usageError("缺少子命令，应为：bill settle|settle-batch|show|adjust|revoke|pay|remit|remit-auto|correct|unpay|refund|ledger|reconcile ...")
 		}
 		switch args[1] {
 		case "settle":
@@ -165,6 +165,11 @@ func runCmd(args []string, dataDir string) error {
 				return usageError("用法：bill remit <客户标识> <收款标识> <总金额分> <备注> <YYYY-MM:金额分> [更多 月份:金额 ...]")
 			}
 			return cmdBillRemit(dataDir, args[2], args[3], args[4], args[5], args[6:])
+		case "remit-auto":
+			if len(args) != 6 {
+				return usageError("用法：bill remit-auto <客户标识> <收款标识> <总金额分> <备注>")
+			}
+			return cmdBillRemitAuto(dataDir, args[2], args[3], args[4], args[5])
 		case "correct":
 			if len(args) < 6 {
 				return usageError("用法：bill correct <收款标识> <更正标识> <原因> <YYYY-MM:金额分> [更多 月份:金额 ...]")
@@ -195,7 +200,7 @@ func runCmd(args []string, dataDir string) error {
 			}
 			return cmdBillReconcile(dataDir, args[2], args[3], args[4], args[5:])
 		default:
-			return usageError("未知 bill 子命令 %q；可用：settle、settle-batch、show、adjust、revoke、pay、remit、correct、unpay、refund、ledger、reconcile", args[1])
+			return usageError("未知 bill 子命令 %q；可用：settle、settle-batch、show、adjust、revoke、pay、remit、remit-auto、correct、unpay、refund、ledger、reconcile", args[1])
 		}
 
 	default:
@@ -1052,6 +1057,161 @@ func cmdBillRemit(dir, customerID, payID, totalText, note string, allocArgs []st
 	return registerPayment(dir, customerID, payID, total, note, allocs)
 }
 
+// --- 自动分配汇款（bill remit-auto） ---
+
+// cmdBillRemitAuto 登记一笔自动分配汇款：调用方只提供客户、收款标识、总金额
+// 与备注，月份金额由工具确定——首次登记只选择该客户当前已有账单，按 UTC
+// 账期月升序依次偿还当前未收余额（调整、最新收款分配、撤销及退款后的净额），
+// 跳过余额为 0 的月份，前一月份还清后才分配下一月，最后一月可部分偿还；
+// 不补结算、不跨客户、不留未分配款项。无欠款或总金额超过全部欠款时整笔拒绝。
+func cmdBillRemitAuto(dir, customerID, payID, totalText, note string) error {
+	total, err := parsePositiveAmount(totalText)
+	if err != nil {
+		return err
+	}
+	if strings.TrimSpace(payID) == "" {
+		return fmt.Errorf("收款标识不能为空")
+	}
+	if strings.TrimSpace(note) == "" {
+		return fmt.Errorf("收款备注不能为空")
+	}
+
+	s, err := loadStore(dir)
+	if err != nil {
+		return err
+	}
+	if _, ok := s.Customers[customerID]; !ok {
+		return fmt.Errorf("客户标识 %q 不存在", customerID)
+	}
+
+	if existing, ok := s.Payments[payID]; ok {
+		// 自动登记按客户、总金额、备注判重：相同请求返回原收款及当前状态，
+		// 不写盘、不重新分配、不增加序号；已撤销或已退款的仍返回当前状态，
+		// 不恢复旧分配或已退、已撤销金额。
+		if existing.Auto && existing.CustomerID == customerID &&
+			existing.Total == total && existing.Note == note {
+			fmt.Fprintf(stdout, "收款 %q 已存在且内容相同（自动分配登记），返回原收款及当前状态（不写盘、不重新分配、不增加序号）：\n\n", payID)
+			printAutoPayment(s, existing)
+			return nil
+		}
+		// 同一标识在自动与显式分配登记间复用拒绝；内容不同同样拒绝。
+		if !existing.Auto {
+			return fmt.Errorf("收款标识 %q 已由显式分配登记占用（已有：客户=%s 总额=%d 备注=%q 分配=%s），自动与显式分配登记之间不得复用，拒绝",
+				payID, existing.CustomerID, existing.Total, existing.Note, formatAllocations(existing.Allocations))
+		}
+		return fmt.Errorf("收款标识 %q 已存在但内容不同（已有：客户=%s 总额=%d 备注=%q），拒绝复用",
+			payID, existing.CustomerID, existing.Total, existing.Note)
+	}
+
+	// 首次登记：归集该客户当前已有账单的月份，按 UTC 账期月升序排列
+	// （YYYY-MM 字典序即时间序）。不补结算，只有已存在账单参与分配。
+	var months []string
+	for _, b := range s.Bills {
+		if b.CustomerID == customerID {
+			months = append(months, b.Month)
+		}
+	}
+	sort.Strings(months)
+
+	// 依次偿还当前未收余额：跳过余额为 0 的月份，前一月份还清后才分配
+	// 下一月，最后一月可部分偿还。每月未收余额 = 当前应付 − 实收，均在
+	// [0, 有符号 64 位最大值] 内；remaining 从总额（正整数分）起只减不增，
+	// 各月余额与分配全程整数计算——即使全部账单欠款合计超过 64 位上限，
+	// 分配过程也只涉及不超过总额的中间值，不会误拒合法金额。
+	remaining := total
+	var allocs []paymentAllocation
+	for _, m := range months {
+		if remaining == 0 {
+			break
+		}
+		b := s.Bills[billKey(customerID, m)]
+		_, payable, err := billTotals(b, adjustmentsFor(s, customerID, m))
+		if err != nil {
+			return fmt.Errorf("客户 %s 的 %s 当前应付异常，拒绝登记收款: %w", customerID, m, err)
+		}
+		received, err := paymentReceived(s, customerID, m)
+		if err != nil {
+			return fmt.Errorf("客户 %s 的 %s 实收累计溢出有符号 64 位整数范围，拒绝登记收款: %w", customerID, m, err)
+		}
+		outstanding := payable - received // 不变量保证 0 ≤ 实收 ≤ 当前应付
+		if outstanding <= 0 {
+			continue // 跳过余额为 0 的月份
+		}
+		amt := outstanding
+		if amt > remaining {
+			amt = remaining // 最后一月可部分偿还
+		}
+		allocs = append(allocs, paymentAllocation{Month: m, Amount: amt})
+		remaining -= amt
+	}
+	if len(allocs) == 0 {
+		return fmt.Errorf("客户 %s 当前没有欠款（全部已存在账单的未收余额均为 0），整笔拒绝；不补结算、不跨客户、不留未分配款项", customerID)
+	}
+	if remaining > 0 {
+		return fmt.Errorf("收款总额 %d 分超过客户 %s 全部已存在账单的欠款合计 %d 分，整笔拒绝；不补结算、不跨客户、不留未分配款项",
+			total, customerID, total-remaining)
+	}
+
+	// 成功保存为一笔普通收款及首次自动分配：占用一个账后全局序号，
+	// 不按月份拆成多笔；可沿用分配更正、整笔撤销、部分退款及退款后
+	// 固定分配的规则。
+	p := &payment{
+		ID:          payID,
+		CustomerID:  customerID,
+		Total:       total,
+		Note:        note,
+		Allocations: allocs,
+		Auto:        true,
+		CreatedAt:   time.Now().UTC().Format(time.RFC3339),
+	}
+	s.NextSeq++
+	p.Seq = s.NextSeq
+	s.Payments[payID] = p
+
+	// 收款记录、首次分配与序号在同一次原子保存中持久化；保存失败则一切
+	// 不生效，该收款标识与序号不被占用，可原样重试。
+	if err := s.save(); err != nil {
+		delete(s.Payments, payID)
+		s.NextSeq--
+		return err
+	}
+	fmt.Fprintf(stdout, "已按最早欠款账期自动分配并登记收款 %q（总额 %d 分，%s；一次操作，占用一个账后序号）：\n\n",
+		payID, total, moneyFen(total))
+	printAutoPayment(s, p)
+	return nil
+}
+
+// printAutoPayment 输出一笔自动分配登记的收款：收款标识、总额、备注、当前
+// 状态、首次分配与最新分配，以及这两份分配所涉月份的当前余额。首次分配
+// 永久保留；最新分配经更正变化时以最新为准，退款与撤销不改变首次分配。
+func printAutoPayment(s *state, p *payment) {
+	current := currentAllocations(s, p)
+	fmt.Fprintf(stdout, "收款标识：%s\n", p.ID)
+	fmt.Fprintf(stdout, "客户：%s\n", p.CustomerID)
+	fmt.Fprintf(stdout, "收款总额：%d 分（%s）\n", p.Total, moneyFen(p.Total))
+	fmt.Fprintf(stdout, "备注：%s\n", p.Note)
+	if p.Revoked {
+		fmt.Fprintf(stdout, "当前状态：已撤销（撤销原因：%s）\n", p.RevokeReason)
+	} else {
+		fmt.Fprintf(stdout, "当前状态：实收中\n")
+	}
+	fmt.Fprintf(stdout, "首次分配（登记时按最早欠款账期自动确定，永久保留）：%s\n", formatAllocations(p.Allocations))
+	if sameAllocations(current, p.Allocations) {
+		fmt.Fprintf(stdout, "最新分配：%s（与首次分配相同）\n", formatAllocations(current))
+	} else {
+		fmt.Fprintf(stdout, "最新分配（经更正，以最新为准）：%s\n", formatAllocations(current))
+	}
+	fmt.Fprintln(stdout, "首次与最新分配所涉月份当前余额：")
+	for _, m := range unionMonths(p.Allocations, current) {
+		b := s.Bills[billKey(p.CustomerID, m)] // 载入时已校验存在
+		_, payable, _ := billTotals(b, adjustmentsFor(s, p.CustomerID, m))
+		received, _ := paymentReceived(s, p.CustomerID, m)
+		fmt.Fprintf(stdout, "  月份 %s：首次分配 %d 分，最新分配 %d 分；当前应付 %d 分（%s），实收 %d 分（%s），未收余额 %d 分（%s）\n",
+			m, allocAmountFor(p.Allocations, m), allocAmountFor(current, m),
+			payable, moneyFen(payable), received, moneyFen(received), payable-received, moneyFen(payable-received))
+	}
+}
+
 // parseAllocations 解析 <YYYY-MM:金额分> 形式的分配列表：至少一项，
 // 月份不得重复，每项金额为正整数分。
 func parseAllocations(args []string) ([]paymentAllocation, error) {
@@ -1108,6 +1268,12 @@ func registerPayment(dir, customerID, payID string, total int64, note string, al
 	}
 
 	if existing, ok := s.Payments[payID]; ok {
+		// 自动与显式分配登记之间不得复用同一收款标识：标识由 bill remit-auto
+		// 占用时，bill pay / bill remit 一律拒绝（即使内容碰巧相同）。
+		if existing.Auto {
+			return fmt.Errorf("收款标识 %q 已由自动分配登记占用（已有：客户=%s 总额=%d 备注=%q 分配=%s），自动与显式分配登记之间不得复用，拒绝",
+				payID, existing.CustomerID, existing.Total, existing.Note, formatAllocations(existing.Allocations))
+		}
 		// 相同标识按客户、总额、备注与月份-金额对应关系判断重复：内容相同
 		// 返回已保存记录，不再次计入实收，也不受当前余额变化影响；
 		// 已撤销的重放仍返回已撤销状态，不恢复实收。
