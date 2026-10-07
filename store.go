@@ -229,6 +229,22 @@ type withdrawal struct {
 	CreatedAt string `json:"created_at"`
 }
 
+// usageCorrection 是对一条未封账用量的原子更正登记：用一条全新的替代
+// 记录替换错误的客户、时间或数量。成功后原记录（OldUsageID）按更正原因
+// 标记撤回（同时登记在 Withdrawals 中，使其退出结算），替代记录
+// （NewUsageID）作为普通有效用量入账，并在本表永久保存两者的关联。
+// 更正不可撤销、不占用账后操作序号；每条原用量只能更正一次，以原标识
+// 识别该项更正，相同（新标识、客户、解析后的时间点、数量与原因）重放
+// 返回原更正且不写盘。替代记录可继续更正或按原规则撤回，形成的更正链
+// 不得成环。
+type usageCorrection struct {
+	OldUsageID string `json:"old_usage_id"` // 被更正的原用量标识（与键一致），更正后处于撤回状态
+	NewUsageID string `json:"new_usage_id"` // 替代用量标识（全局唯一，从未使用过）
+	NewTime    string `json:"new_time"`     // 替代记录时间（RFC3339，与替代用量记录一致）
+	Reason     string `json:"reason"`       // 更正原因，非空（同时作为原记录的撤回原因）
+	CreatedAt  string `json:"created_at"`
+}
+
 type state struct {
 	Version     int                     `json:"version"`
 	Customers   map[string]*customer    `json:"customers"`
@@ -242,8 +258,11 @@ type state struct {
 	PlanChanges map[string]*planChange  `json:"plan_changes"`          // 客户 + "|" + 生效月 -> 方案变更（按生效月递增追加，不可改写）
 	Suspensions map[string]*suspension  `json:"suspensions,omitempty"` // 客户 + "|" + 起月 -> 暂停区间（不可改写）
 	Withdrawals map[string]*withdrawal  `json:"withdrawals,omitempty"` // 用量标识 -> 撤回标记（不可恢复，标识不可复用）
-	NextSeq     int64                   `json:"next_seq"`              // 已分配的最大操作序号（调整/收款/更正/退款及其撤销共用；方案变更、暂停与用量撤回不占用）
-	path        string                  `json:"-"`
+	// 用量原子更正：被更正的原用量标识 -> 更正登记（原记录按更正原因撤回、
+	// 替代记录入账并永久保存关联）。旧存档缺少本节视为无更正。
+	UsageCorrections map[string]*usageCorrection `json:"usage_corrections,omitempty"`
+	NextSeq          int64                       `json:"next_seq"` // 已分配的最大操作序号（调整/收款/更正/退款及其撤销共用；方案变更、暂停与用量撤回/更正不占用）
+	path             string                      `json:"-"`
 }
 
 // loadStore 读取数据目录；目录不存在时按需创建并视为空库。
@@ -277,8 +296,9 @@ func loadStore(dir string) (*state, error) {
 		return nil, fmt.Errorf("数据文件已损坏: %w", err)
 	}
 	// 旧版本数据文件没有 plans/adjustments/payments/corrections/refunds/
-	// plan_changes/suspensions/withdrawals/next_seq 字段：视为零方案、零调整、
-	// 零实收、零更正、零退款、零方案变更、零暂停、零撤回（全部用量有效）。
+	// plan_changes/suspensions/withdrawals/usage_corrections/next_seq 字段：
+	// 视为零方案、零调整、零实收、零更正、零退款、零方案变更、零暂停、
+	// 零撤回、零用量更正（全部用量有效）。
 	if s.Plans == nil {
 		s.Plans = map[string]*plan{}
 	}
@@ -303,25 +323,29 @@ func loadStore(dir string) (*state, error) {
 	if s.Withdrawals == nil {
 		s.Withdrawals = map[string]*withdrawal{}
 	}
+	if s.UsageCorrections == nil {
+		s.UsageCorrections = map[string]*usageCorrection{}
+	}
 	s.path = p
 	return &s, nil
 }
 
 func newState(p string) *state {
 	return &state{
-		Version:     stateVersion,
-		Customers:   map[string]*customer{},
-		Plans:       map[string]*plan{},
-		Usage:       map[string]*usageRecord{},
-		Bills:       map[string]*bill{},
-		Adjustments: map[string]*adjustment{},
-		Payments:    map[string]*payment{},
-		Corrections: map[string]*correction{},
-		Refunds:     map[string]*refund{},
-		PlanChanges: map[string]*planChange{},
-		Suspensions: map[string]*suspension{},
-		Withdrawals: map[string]*withdrawal{},
-		path:        p,
+		Version:          stateVersion,
+		Customers:        map[string]*customer{},
+		Plans:            map[string]*plan{},
+		Usage:            map[string]*usageRecord{},
+		Bills:            map[string]*bill{},
+		Adjustments:      map[string]*adjustment{},
+		Payments:         map[string]*payment{},
+		Corrections:      map[string]*correction{},
+		Refunds:          map[string]*refund{},
+		PlanChanges:      map[string]*planChange{},
+		Suspensions:      map[string]*suspension{},
+		Withdrawals:      map[string]*withdrawal{},
+		UsageCorrections: map[string]*usageCorrection{},
+		path:             p,
 	}
 }
 
@@ -428,6 +452,71 @@ func (s *state) validate() error {
 		}
 		if strings.TrimSpace(w.Reason) == "" {
 			return fmt.Errorf("用量 %q 的撤回原因为空", w.UsageID)
+		}
+	}
+	// 用量原子更正：键与记录一致、原记录与替代记录均存在（关联引用缺失即
+	// 损坏）、原记录确已撤回且撤回原因与更正原因一致、替代记录内容与更正
+	// 登记一致；同一替代记录只能有一个来源；更正链（原记录 -> 替代记录）
+	// 不得成环。替代记录后来被合法撤回或继续更正都属正常状态，不在此判损。
+	// 旧文件缺少更正记录视为无更正（UsageCorrections 已在载入时补为空表）。
+	replacementSource := make(map[string]string) // 替代用量标识 -> 来源（原用量标识）
+	for id, uc := range s.UsageCorrections {
+		if uc == nil {
+			return fmt.Errorf("用量更正 %q 的数据为空", id)
+		}
+		if uc.OldUsageID != id {
+			return fmt.Errorf("用量更正键不一致: 键 %q / 原用量标识 %q", id, uc.OldUsageID)
+		}
+		if uc.OldUsageID == "" || uc.NewUsageID == "" {
+			return errors.New("存在空用量标识的更正记录")
+		}
+		if uc.OldUsageID == uc.NewUsageID {
+			return fmt.Errorf("用量更正 %q 的原标识与替代标识相同（关联成环）", id)
+		}
+		if _, ok := s.Usage[uc.OldUsageID]; !ok {
+			return fmt.Errorf("用量更正 %q 引用了不存在的原用量 %q（关联引用缺失）", id, uc.OldUsageID)
+		}
+		nu, ok := s.Usage[uc.NewUsageID]
+		if !ok {
+			return fmt.Errorf("用量更正 %q 引用了不存在的替代用量 %q（关联引用缺失）", id, uc.NewUsageID)
+		}
+		if strings.TrimSpace(uc.Reason) == "" {
+			return fmt.Errorf("用量更正 %q 的原因为空", id)
+		}
+		w, withdrawn := s.Withdrawals[uc.OldUsageID]
+		if !withdrawn {
+			return fmt.Errorf("用量更正 %q 的原用量 %q 未撤回", id, uc.OldUsageID)
+		}
+		if w.Reason != uc.Reason {
+			return fmt.Errorf("用量更正 %q 的撤回原因 %q 与更正原因 %q 不符", id, w.Reason, uc.Reason)
+		}
+		if nu.Time != uc.NewTime {
+			return fmt.Errorf("用量更正 %q 登记的时间 %q 与替代记录 %q 的时间 %q 不一致",
+				id, uc.NewTime, uc.NewUsageID, nu.Time)
+		}
+		if _, err := time.Parse(time.RFC3339, uc.NewTime); err != nil {
+			return fmt.Errorf("用量更正 %q 的时间不是 RFC3339: %w", id, err)
+		}
+		if src, dup := replacementSource[uc.NewUsageID]; dup {
+			return fmt.Errorf("替代用量 %q 同时是更正 %q 与 %q 的替代记录（同一替代记录有多个来源）",
+				uc.NewUsageID, src, id)
+		}
+		replacementSource[uc.NewUsageID] = id
+	}
+	// 更正链成环检测：沿“原记录 -> 替代记录”前进，重复经过同一节点即环。
+	for id := range s.UsageCorrections {
+		seen := map[string]bool{id: true}
+		cur := id
+		for {
+			uc, ok := s.UsageCorrections[cur]
+			if !ok {
+				break // 链终点：替代记录未再被更正
+			}
+			if seen[uc.NewUsageID] {
+				return fmt.Errorf("用量更正链在 %q 处成环（从更正 %q 出发）", uc.NewUsageID, id)
+			}
+			seen[uc.NewUsageID] = true
+			cur = uc.NewUsageID
 		}
 	}
 	for key, b := range s.Bills {
@@ -1141,6 +1230,23 @@ func (s *state) sealed(customerID, month string) bool {
 func (s *state) isWithdrawn(usageID string) bool {
 	_, ok := s.Withdrawals[usageID]
 	return ok
+}
+
+// correctionOfUsage 返回以指定用量为原记录的更正登记；无则返回 nil。
+// 每条原用量至多有一条更正（以原标识识别该项更正）。
+func (s *state) correctionOfUsage(usageID string) *usageCorrection {
+	return s.UsageCorrections[usageID]
+}
+
+// correctionByReplacement 返回以指定用量为替代记录的更正登记；无则 nil。
+// 载入时已校验同一替代记录只有一个来源。
+func (s *state) correctionByReplacement(usageID string) *usageCorrection {
+	for _, uc := range s.UsageCorrections {
+		if uc.NewUsageID == usageID {
+			return uc
+		}
+	}
+	return nil
 }
 
 // adjustmentsFor 返回某客户某月账单的全部调整，按操作序号升序。

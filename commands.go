@@ -106,7 +106,7 @@ func runCmd(args []string, dataDir string) error {
 
 	case "usage":
 		if len(args) < 2 {
-			return usageError("缺少子命令，应为：usage import|withdraw|show ...")
+			return usageError("缺少子命令，应为：usage import|withdraw|correct|show ...")
 		}
 		switch args[1] {
 		case "import":
@@ -119,13 +119,18 @@ func runCmd(args []string, dataDir string) error {
 				return usageError("用法：usage withdraw <用量标识> <原因>")
 			}
 			return cmdUsageWithdraw(dataDir, args[2], args[3])
+		case "correct":
+			if len(args) != 8 {
+				return usageError("用法：usage correct <原用量标识> <新用量标识> <新客户> <RFC3339 时间> <正整数数量> <非空原因>")
+			}
+			return cmdUsageCorrect(dataDir, args[2], args[3], args[4], args[5], args[6], args[7])
 		case "show":
 			if len(args) != 3 {
 				return usageError("用法：usage show <用量标识>")
 			}
 			return cmdUsageShow(dataDir, args[2])
 		default:
-			return usageError("未知 usage 子命令 %q；可用：import、withdraw、show", args[1])
+			return usageError("未知 usage 子命令 %q；可用：import、withdraw、correct、show", args[1])
 		}
 
 	case "bill":

@@ -90,15 +90,39 @@ func cmdUsageShow(dir, usageID string) error {
 // printUsageRecord 输出一条用量记录的原始内容（标识、客户、时间、数量）、
 // 换算后的 UTC 自然月，以及是否撤回与撤回原因。
 func printUsageRecord(s *state, u *usageRecord) {
+	printUsageRecordIndented(s, u, "")
+}
+
+// printUsageRecordIndented 是 printUsageRecord 的缩进版本，每行加 prefix；
+// 除原有信息外展示该记录的直接前身、后继及对应更正原因，无关联时明确说明。
+func printUsageRecordIndented(s *state, u *usageRecord, prefix string) {
 	cust := s.Customers[u.CustomerID] // 载入时已校验存在
-	fmt.Fprintf(stdout, "用量标识：%s\n", u.ID)
-	fmt.Fprintf(stdout, "客户：%s（%s）\n", cust.ID, cust.Name)
-	fmt.Fprintf(stdout, "时间：%s\n", u.Time)
-	fmt.Fprintf(stdout, "UTC 月份：%s（UTC 自然月，左闭右开）\n", utcMonth(u.Time))
-	fmt.Fprintf(stdout, "数量：%d\n", u.Quantity)
+	fmt.Fprintf(stdout, "%s用量标识：%s\n", prefix, u.ID)
+	fmt.Fprintf(stdout, "%s客户：%s（%s）\n", prefix, cust.ID, cust.Name)
+	fmt.Fprintf(stdout, "%s时间：%s\n", prefix, u.Time)
+	fmt.Fprintf(stdout, "%sUTC 月份：%s（UTC 自然月，左闭右开）\n", prefix, utcMonth(u.Time))
+	fmt.Fprintf(stdout, "%s数量：%d\n", prefix, u.Quantity)
 	if w, ok := s.Withdrawals[u.ID]; ok {
-		fmt.Fprintf(stdout, "当前状态：已撤回（撤回原因：%s；不参与结算与冲突检查，不可恢复）\n", w.Reason)
+		if s.correctionOfUsage(u.ID) != nil {
+			fmt.Fprintf(stdout, "%s当前状态：已撤回（用量更正撤回，更正原因：%s；不参与结算与冲突检查，不可恢复）\n", prefix, w.Reason)
+		} else {
+			fmt.Fprintf(stdout, "%s当前状态：已撤回（撤回原因：%s；不参与结算与冲突检查，不可恢复）\n", prefix, w.Reason)
+		}
 	} else {
-		fmt.Fprintln(stdout, "当前状态：有效（参与结算与冲突检查）")
+		fmt.Fprintf(stdout, "%s当前状态：有效（参与结算与冲突检查）\n", prefix)
+	}
+	// 直接前身：本记录是某条更正的替代记录时，展示被替换的原记录与原因。
+	if pred := s.correctionByReplacement(u.ID); pred != nil {
+		fmt.Fprintf(stdout, "%s直接前身：%s（经用量更正被本记录替代，更正原因：%s）\n",
+			prefix, pred.OldUsageID, pred.Reason)
+	} else {
+		fmt.Fprintf(stdout, "%s直接前身：无（本记录不是任何用量更正的替代记录）\n", prefix)
+	}
+	// 直接后继：本记录作为原记录被更正时，展示替代记录与原因。
+	if succ := s.correctionOfUsage(u.ID); succ != nil {
+		fmt.Fprintf(stdout, "%s直接后继：%s（经用量更正替代本记录，更正原因：%s）\n",
+			prefix, succ.NewUsageID, succ.Reason)
+	} else {
+		fmt.Fprintf(stdout, "%s直接后继：无（本记录未被用量更正）\n", prefix)
 	}
 }
