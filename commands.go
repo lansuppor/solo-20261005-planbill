@@ -1505,133 +1505,29 @@ type ledgerEvent struct {
 	afterReceived int64  // 事件后的实收（回放时填充）
 }
 
-// billLedger 把目标账单的调整、调整撤销、收款、分配更正与收款撤销合并为
-// 一条按操作序号升序的流水，并以原总金额为初始应付、零实收为起点逐步回放，
-// 填充每个事件之后的三项余额。回放覆盖完整流水（不受查询截止序号限制）：
-// 序号重复、撤销先于原操作，或任一事件之后不满足 0 ≤ 实收 ≤ 应付 ≤ 有符号
-// 64 位最大值，都视为数据异常并拒绝——只检查最终余额会放过中间越界的存档。
+// billLedger 返回目标账单的一条按操作序号升序的账后流水，事件之后的三项
+// 余额已逐步填充。业务归属、金额影响（调整/撤销/收款/更正/撤销收款/退款）
+// 与完整性核验都来自与 bill reconcile 共用的 postbill 计算，本处只取该账单
+// 那一条流水：
+//
+//   - 以原总金额为初始应付、零实收为起点；
+//   - 回放覆盖完整流水（不受查询截止序号限制），序号重复、撤销先于原操作，
+//     或任一事件之后不满足 0 ≤ 实收 ≤ 应付 ≤ 有符号 64 位最大值，都视为
+//     数据异常并拒绝，即使异常发生在截止序号之后——只检查最终余额会放过
+//     中间越界的存档；
+//   - 曾涉及该账单的收款在被更正移出该月后，仍保留零金额撤销事件。
+//
 // 只读：不修改库、不占用序号、不新增记录。
 func billLedger(s *state, b *bill) ([]ledgerEvent, error) {
-	var events []ledgerEvent
-	for _, a := range s.Adjustments {
-		if a.CustomerID != b.CustomerID || a.Month != b.Month {
-			continue
-		}
-		events = append(events, ledgerEvent{
-			seq: a.Seq, kind: "调整", refID: a.ID,
-			deltaPayable: a.Amount, note: a.Reason,
-		})
-		if a.Revoked {
-			neg, err := neg64(a.Amount)
-			if err != nil {
-				return nil, fmt.Errorf("调整 %q 的金额 %d 分无法抵消（越界），数据异常，拒绝输出流水", a.ID, a.Amount)
-			}
-			events = append(events, ledgerEvent{
-				seq: a.RevokeSeq, kind: "撤销调整", refID: a.ID,
-				deltaPayable: neg, note: a.RevokeReason, linkSeq: a.Seq,
-			})
-		}
+	ops, err := postbillOps(s, b.CustomerID)
+	if err != nil {
+		return nil, err
 	}
-	for _, p := range s.Payments {
-		if p.CustomerID != b.CustomerID {
-			continue
-		}
-		// 多月汇款只以本账单分配改变实收；更正在其发生序号把本账单分配
-		// 由前值替换为后值；整笔撤销在同一序号取消撤销时的最新分配。
-		// 首次登记或任一次更正涉及本账单的，该收款的后续事件都纳入流水。
-		alloc := p.amountFor(b.Month)
-		corrs := correctionsFor(s, p.ID)
-		involved := alloc > 0
-		if !involved {
-			for _, c := range corrs {
-				if allocAmountFor(c.Allocations, b.Month) > 0 {
-					involved = true
-					break
-				}
-			}
-		}
-		if !involved {
-			continue
-		}
-		if alloc > 0 {
-			events = append(events, ledgerEvent{
-				seq: p.Seq, kind: "收款", refID: p.ID,
-				deltaReceived: alloc, note: p.Note,
-				payTotal: p.Total, payAlloc: alloc,
-			})
-		}
-		running := alloc
-		for _, c := range corrs {
-			after := allocAmountFor(c.Allocations, b.Month)
-			if running == 0 && after == 0 {
-				continue // 本次更正不涉及本账单
-			}
-			events = append(events, ledgerEvent{
-				seq: c.Seq, kind: "更正", refID: c.ID,
-				deltaReceived: after - running, note: c.Reason,
-				payID: p.ID, beforeAlloc: running, afterAlloc: after,
-			})
-			running = after
-		}
-		if p.Revoked {
-			events = append(events, ledgerEvent{
-				seq: p.RevokeSeq, kind: "撤销收款", refID: p.ID,
-				deltaReceived: -running, note: p.RevokeReason, linkSeq: p.Seq,
-				payTotal: p.Total, payAlloc: running,
-			})
-		}
-		// 退款在其发生序号减少本账单实收；退款月份必属于最新分配，故该收款
-		// 必然已被上面的“涉及本账单”判断纳入。
-		for _, r := range refundsFor(s, p.ID) {
-			amt := allocAmountFor(r.Allocations, b.Month)
-			if amt <= 0 {
-				continue // 本次退款不涉及本账单
-			}
-			events = append(events, ledgerEvent{
-				seq: r.Seq, kind: "退款", refID: r.ID,
-				deltaReceived: -amt, note: r.Reason,
-				payID: p.ID, payAlloc: amt,
-			})
-		}
+	ledgers, err := verifyPostbillLedgers(ops, []*bill{b})
+	if err != nil {
+		return nil, err
 	}
-	sort.Slice(events, func(i, j int) bool { return events[i].seq < events[j].seq })
-
-	// 逐步回放并核验：只把每个事件的金额影响加到运行余额上，不对发生额
-	// 做累计求和，因此累计补收/收款发生额超过 64 位上限但每步余额合法时
-	// 仍能成功。
-	payable := b.TotalFee
-	var received int64
-	seen := make(map[int64]string, len(events))
-	for i := range events {
-		ev := &events[i]
-		desc := ev.kind + " " + ev.refID
-		if prev, dup := seen[ev.seq]; dup {
-			return nil, fmt.Errorf("流水序号 %d 重复（%s 与 %s），数据异常，拒绝输出流水", ev.seq, prev, desc)
-		}
-		seen[ev.seq] = desc
-		if ev.linkSeq != 0 && ev.linkSeq >= ev.seq {
-			return nil, fmt.Errorf("%s 的撤销序号 %d 不晚于原操作序号 %d，数据异常，拒绝输出流水", desc, ev.seq, ev.linkSeq)
-		}
-		var err error
-		if payable, err = addSigned64(payable, ev.deltaPayable); err != nil {
-			return nil, fmt.Errorf("序号 %d（%s）之后应付越出有符号 64 位整数范围，数据异常，拒绝输出流水", ev.seq, desc)
-		}
-		if received, err = addSigned64(received, ev.deltaReceived); err != nil {
-			return nil, fmt.Errorf("序号 %d（%s）之后实收越出有符号 64 位整数范围，数据异常，拒绝输出流水", ev.seq, desc)
-		}
-		if payable < 0 {
-			return nil, fmt.Errorf("序号 %d（%s）之后应付为 %d 分（小于 0），数据异常，拒绝输出流水", ev.seq, desc, payable)
-		}
-		if received < 0 {
-			return nil, fmt.Errorf("序号 %d（%s）之后实收为 %d 分（小于 0），数据异常，拒绝输出流水", ev.seq, desc, received)
-		}
-		if received > payable {
-			return nil, fmt.Errorf("序号 %d（%s）之后实收 %d 分超过应付 %d 分，数据异常，拒绝输出流水", ev.seq, desc, received, payable)
-		}
-		ev.afterPayable = payable
-		ev.afterReceived = received
-	}
-	return events, nil
+	return ledgers[b.Month], nil
 }
 
 func cmdBillLedger(dir, customerID, month, cutoffText string, hasCutoff bool) error {

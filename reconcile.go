@@ -106,26 +106,35 @@ func cmdBillReconcile(dir, customerID, startMonth, endMonth string, seqArgs []st
 	}
 	sort.Strings(months)
 
-	// 输出前核验所有选中账单的完整流水：任何异常（即使发生在终点序号之后）
-	// 都拒绝，不输出部分报表。逐月两端余额取自同一批已核验流水，与相同截止
-	// 序号的 bill ledger 一致。
+	// 输出前核验所有选中账单的完整流水：业务归属、金额影响与逐步核验都由
+	// 与 bill ledger 共用的 postbill 计算一次性完成。任何异常（即使发生在
+	// 终点序号之后）都拒绝，不输出部分报表。逐月两端余额取自同一批已核验
+	// 流水，与相同截止序号的 bill ledger 一致。
+	ops, err := postbillOps(s, customerID)
+	if err != nil {
+		return err
+	}
+	selected := make([]*bill, 0, len(months))
+	for _, m := range months {
+		selected = append(selected, s.Bills[billKey(customerID, m)])
+	}
+	ledgers, err := verifyPostbillLedgers(ops, selected)
+	if err != nil {
+		return err
+	}
 	bills := make([]reconBill, 0, len(months))
 	for _, m := range months {
 		b := s.Bills[billKey(customerID, m)]
-		events, err := billLedger(s, b)
-		if err != nil {
-			return err
-		}
+		events := ledgers[m]
 		rb := reconBill{b: b}
 		rb.startPay, rb.startRecv = ledgerBalanceAt(b, events, startSeq)
 		rb.endPay, rb.endRecv = ledgerBalanceAt(b, events, endSeq)
 		bills = append(bills, rb)
 	}
 
-	ops, err := reconcileEvents(s, customerID, startMonth, endMonth, startSeq, endSeq)
-	if err != nil {
-		return err
-	}
+	// 区间内操作与逐月余额来自同一套共享计算：范围筛选只决定哪些操作、哪些
+	// 账期参与展示，不重复推导业务归属与金额影响。
+	opsInRange := postbillRangeEvents(ops, startMonth, endMonth, startSeq, endSeq)
 
 	// 汇总以 128 位整数精确累加：单账单余额保证在有符号 64 位内，多账单
 	// 合计可能超出有符号 64 位上限，仍须精确输出。
@@ -142,12 +151,12 @@ func cmdBillReconcile(dir, customerID, startMonth, endMonth string, seqArgs []st
 
 	// 回放区间内操作，填充每次操作后的范围内汇总余额。
 	curPay, curRecv := startPaySum, startRecvSum
-	for i := range ops {
-		for _, ch := range ops[i].changes {
+	for i := range opsInRange {
+		for _, ch := range opsInRange[i].changes {
 			curPay = curPay.add(int128Of(ch.deltaPayable))
 			curRecv = curRecv.add(int128Of(ch.deltaReceived))
 		}
-		ops[i].afterPay, ops[i].afterRecv = curPay, curRecv
+		opsInRange[i].afterPay, opsInRange[i].afterRecv = curPay, curRecv
 	}
 	// 操作变化与逐月余额来自同一批已核验流水，终点处必然一致。
 	if curPay != endPaySum || curRecv != endRecvSum {
@@ -155,7 +164,7 @@ func cmdBillReconcile(dir, customerID, startMonth, endMonth string, seqArgs []st
 	}
 
 	printReconcile(cust, startMonth, endMonth, startSeq, endSeq, seqDesc, s.NextSeq,
-		bills, sumOrig, startPaySum, startRecvSum, endPaySum, endRecvSum, ops)
+		bills, sumOrig, startPaySum, startRecvSum, endPaySum, endRecvSum, opsInRange)
 	return nil
 }
 
@@ -182,124 +191,6 @@ func ledgerBalanceAt(b *bill, events []ledgerEvent, seq int64) (payable, receive
 		payable, received = ev.afterPayable, ev.afterReceived
 	}
 	return payable, received
-}
-
-// reconcileEvents 把区间内（起点之后、终点以内）涉及范围内账期的调整、
-// 调整撤销、收款、分配更正、收款撤销与退款合并为按全局操作序号升序的列表。
-// 调整仅纳入所属账期在范围内的操作；收款按登记时分配、撤销按撤销时最新
-// 分配、更正按前后分配、退款按各月退款额判断是否涉及范围；终点之后的操作
-// 不提前影响结果。
-func reconcileEvents(s *state, customerID, startMonth, endMonth string, startSeq, endSeq int64) ([]reconEvent, error) {
-	inRange := func(m string) bool { return m >= startMonth && m <= endMonth }
-	inInterval := func(seq int64) bool { return seq > startSeq && seq <= endSeq }
-
-	var ops []reconEvent
-	for _, a := range s.Adjustments {
-		if a.CustomerID != customerID || !inRange(a.Month) {
-			continue
-		}
-		if inInterval(a.Seq) {
-			ops = append(ops, reconEvent{
-				seq: a.Seq, kind: "调整", refID: a.ID, note: a.Reason,
-				changes: []reconMonthChange{{month: a.Month, deltaPayable: a.Amount}},
-			})
-		}
-		if a.Revoked && inInterval(a.RevokeSeq) {
-			neg, err := neg64(a.Amount)
-			if err != nil {
-				return nil, fmt.Errorf("调整 %q 的金额 %d 分无法抵消（越界），数据异常，拒绝输出报表", a.ID, a.Amount)
-			}
-			ops = append(ops, reconEvent{
-				seq: a.RevokeSeq, kind: "撤销调整", refID: a.ID, note: a.RevokeReason, linkSeq: a.Seq,
-				changes: []reconMonthChange{{month: a.Month, deltaPayable: neg}},
-			})
-		}
-	}
-	for _, p := range s.Payments {
-		if p.CustomerID != customerID {
-			continue
-		}
-		if inInterval(p.Seq) {
-			// 多月汇款只按范围内分配计入实收，不按汇款总额重复累加。
-			var changes []reconMonthChange
-			for _, al := range p.Allocations {
-				if inRange(al.Month) {
-					changes = append(changes, reconMonthChange{month: al.Month, deltaReceived: al.Amount, alloc: al.Amount})
-				}
-			}
-			if len(changes) > 0 {
-				ops = append(ops, reconEvent{
-					seq: p.Seq, kind: "收款", refID: p.ID, note: p.Note, payTotal: p.Total, changes: changes,
-				})
-			}
-		}
-		// 以登记分配为起点按序号回放更正：每次更正按前后分配判断是否涉及
-		// 范围——范围内转移即使汇总变化为 0 也保留，跨范围转入或转出按
-		// 实际差额计入。
-		running := p.Allocations
-		for _, c := range correctionsFor(s, p.ID) {
-			before := running
-			running = c.Allocations
-			if !inInterval(c.Seq) {
-				continue
-			}
-			var changes []reconMonthChange
-			for _, m := range unionMonths(before, c.Allocations) {
-				if !inRange(m) {
-					continue
-				}
-				b4, af := allocAmountFor(before, m), allocAmountFor(c.Allocations, m)
-				if b4 == 0 && af == 0 {
-					continue
-				}
-				changes = append(changes, reconMonthChange{
-					month: m, deltaReceived: af - b4, beforeAlloc: b4, afterAlloc: af,
-				})
-			}
-			if len(changes) > 0 {
-				ops = append(ops, reconEvent{
-					seq: c.Seq, kind: "更正", refID: c.ID, note: c.Reason, payID: p.ID, changes: changes,
-				})
-			}
-		}
-		// 撤销取消的是撤销发生时的最新分配（更正序号均先于撤销序号，
-		// 终点之后的操作不会提前影响结果）。
-		if p.Revoked && inInterval(p.RevokeSeq) {
-			var changes []reconMonthChange
-			for _, al := range running {
-				if inRange(al.Month) {
-					changes = append(changes, reconMonthChange{month: al.Month, deltaReceived: -al.Amount, alloc: al.Amount})
-				}
-			}
-			if len(changes) > 0 {
-				ops = append(ops, reconEvent{
-					seq: p.RevokeSeq, kind: "撤销收款", refID: p.ID, note: p.RevokeReason,
-					linkSeq: p.Seq, payTotal: p.Total, changes: changes,
-				})
-			}
-		}
-		// 跨月退款作为一次操作：只按范围内各月退款额减少实收，不按整笔
-		// 总额重复累减；退款不可撤销，记录永久保留。
-		for _, r := range refundsFor(s, p.ID) {
-			if !inInterval(r.Seq) {
-				continue
-			}
-			var changes []reconMonthChange
-			for _, al := range r.Allocations {
-				if inRange(al.Month) {
-					changes = append(changes, reconMonthChange{month: al.Month, deltaReceived: -al.Amount, alloc: al.Amount})
-				}
-			}
-			if len(changes) > 0 {
-				ops = append(ops, reconEvent{
-					seq: r.Seq, kind: "退款", refID: r.ID, note: r.Reason, payID: p.ID, changes: changes,
-				})
-			}
-		}
-	}
-	// 全局操作序号唯一，按序号排序即得到确定性的展示顺序。
-	sort.Slice(ops, func(i, j int) bool { return ops[i].seq < ops[j].seq })
-	return ops, nil
 }
 
 func printReconcile(cust *customer, startMonth, endMonth string, startSeq, endSeq int64, seqDesc string, nextSeq int64,
