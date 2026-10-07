@@ -130,7 +130,7 @@ func runCmd(args []string, dataDir string) error {
 
 	case "bill":
 		if len(args) < 2 {
-			return usageError("缺少子命令，应为：bill settle|settle-batch|show|adjust|revoke|pay|remit|correct|unpay|ledger ...")
+			return usageError("缺少子命令，应为：bill settle|settle-batch|show|adjust|revoke|pay|remit|correct|unpay|ledger|report ...")
 		}
 		switch args[1] {
 		case "settle":
@@ -184,8 +184,13 @@ func runCmd(args []string, dataDir string) error {
 				cutoff, hasCutoff = args[4], true
 			}
 			return cmdBillLedger(dataDir, args[2], args[3], cutoff, hasCutoff)
+		case "report":
+			if len(args) != 5 && len(args) != 7 {
+				return usageError("用法：bill report <客户标识> <起月 YYYY-MM> <末月 YYYY-MM> [起始操作序号 截止操作序号]")
+			}
+			return cmdBillReport(dataDir, args[2], args[3], args[4], args[5:])
 		default:
-			return usageError("未知 bill 子命令 %q；可用：settle、settle-batch、show、adjust、revoke、pay、remit、correct、unpay、ledger", args[1])
+			return usageError("未知 bill 子命令 %q；可用：settle、settle-batch、show、adjust、revoke、pay、remit、correct、unpay、ledger、report", args[1])
 		}
 
 	default:
