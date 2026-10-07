@@ -30,23 +30,23 @@ type reconMonthChange struct {
 	month         string
 	deltaPayable  int64 // 对应付的影响（分，带符号）
 	deltaReceived int64 // 对实收的影响（分，带符号）
-	alloc         int64 // 收款：登记分配；撤销收款：被取消的最新分配
+	alloc         int64 // 收款：登记分配；撤销收款：被取消的最新分配；退款：该月退款金额
 	beforeAlloc   int64 // 更正：更正前分配
 	afterAlloc    int64 // 更正：更正后分配
 }
 
 // reconEvent 是报表中合并展示的一次账后操作：调整、撤销调整、收款、
-// 分配更正或撤销收款。每次操作只出现一次，范围内各月的变化合并在同一
-// 条目下；同名的调整、收款与更正标识属于不同类型的记录，按类型区分，
-// 互不混淆。
+// 分配更正、撤销收款或退款。每次操作只出现一次，范围内各月的变化合并在同一
+// 条目下（跨月退款作为一次操作列出逐月变化，不重复减去整笔总额）；同名的
+// 调整、收款、更正与退款标识属于不同类型的记录，按类型区分，互不混淆。
 type reconEvent struct {
 	seq       int64
-	kind      string // 调整 / 撤销调整 / 收款 / 更正 / 撤销收款
-	refID     string // 记录标识（调整、收款或更正标识）
-	note      string // 原因（调整/更正/撤销类）或备注（收款）
+	kind      string // 调整 / 撤销调整 / 收款 / 更正 / 撤销收款 / 退款
+	refID     string // 记录标识（调整、收款、更正或退款标识）
+	note      string // 原因（调整/更正/退款/撤销类）或备注（收款）
 	linkSeq   int64  // 撤销事件关联的原操作序号；非撤销为 0
 	payTotal  int64  // 收款类事件：汇款总额
-	payID     string // 更正事件：关联收款标识
+	payID     string // 更正/退款事件：关联收款标识
 	changes   []reconMonthChange
 	afterPay  int128 // 事件后范围内汇总应付（回放时填充）
 	afterRecv int128 // 事件后范围内汇总实收（回放时填充）
@@ -184,9 +184,10 @@ func ledgerBalanceAt(b *bill, events []ledgerEvent, seq int64) (payable, receive
 }
 
 // reconcileEvents 把区间内（起点之后、终点以内）涉及范围内账期的调整、
-// 调整撤销、收款、分配更正与收款撤销合并为按全局操作序号升序的列表。
+// 调整撤销、收款、分配更正、收款撤销与退款合并为按全局操作序号升序的列表。
 // 调整仅纳入所属账期在范围内的操作；收款按登记时分配、撤销按撤销时最新
-// 分配、更正按前后分配判断是否涉及范围；终点之后的操作不提前影响结果。
+// 分配、更正按前后分配、退款按其月份金额清单判断是否涉及范围；终点之后的
+// 操作不提前影响结果。
 func reconcileEvents(s *state, customerID, startMonth, endMonth string, startSeq, endSeq int64) ([]reconEvent, error) {
 	inRange := func(m string) bool { return m >= startMonth && m <= endMonth }
 	inInterval := func(seq int64) bool { return seq > startSeq && seq <= endSeq }
@@ -277,6 +278,25 @@ func reconcileEvents(s *state, customerID, startMonth, endMonth string, startSeq
 			}
 		}
 	}
+	// 跨月退款作为一次操作：只按范围内各月退款金额减少对应月实收，
+	// 不重复减去整笔总额。
+	for _, r := range s.Refunds {
+		p := s.Payments[r.PaymentID] // 载入时已校验存在
+		if p.CustomerID != customerID || !inInterval(r.Seq) {
+			continue
+		}
+		var changes []reconMonthChange
+		for _, al := range r.Allocations {
+			if inRange(al.Month) {
+				changes = append(changes, reconMonthChange{month: al.Month, deltaReceived: -al.Amount, alloc: al.Amount})
+			}
+		}
+		if len(changes) > 0 {
+			ops = append(ops, reconEvent{
+				seq: r.Seq, kind: "退款", refID: r.ID, note: r.Reason, payID: r.PaymentID, changes: changes,
+			})
+		}
+	}
 	// 全局操作序号唯一，按序号排序即得到确定性的展示顺序。
 	sort.Slice(ops, func(i, j int) bool { return ops[i].seq < ops[j].seq })
 	return ops, nil
@@ -339,6 +359,8 @@ func formatReconEvent(ev reconEvent) string {
 			parts[i] = fmt.Sprintf("%s 实收 %+d 分（分配 %d 分）", ch.month, ch.deltaReceived, ch.alloc)
 		case "更正":
 			parts[i] = fmt.Sprintf("%s 实收 %+d 分（分配 %d 分 → %d 分）", ch.month, ch.deltaReceived, ch.beforeAlloc, ch.afterAlloc)
+		case "退款":
+			parts[i] = fmt.Sprintf("%s 实收 %+d 分（退款 %d 分）", ch.month, ch.deltaReceived, ch.alloc)
 		default: // 撤销收款
 			parts[i] = fmt.Sprintf("%s 实收 %+d 分（取消分配 %d 分）", ch.month, ch.deltaReceived, ch.alloc)
 		}
@@ -358,6 +380,9 @@ func formatReconEvent(ev reconEvent) string {
 			ev.seq, ev.refID, ev.note, ev.payTotal, moneyFen(ev.payTotal), changes, after)
 	case "更正":
 		return fmt.Sprintf("序号 %d 更正 %s（关联收款 %s）：原因：%s；范围内变化：%s → %s",
+			ev.seq, ev.refID, ev.payID, ev.note, changes, after)
+	case "退款":
+		return fmt.Sprintf("序号 %d 退款 %s（关联收款 %s）：原因：%s；范围内变化：%s → %s",
 			ev.seq, ev.refID, ev.payID, ev.note, changes, after)
 	default: // 撤销收款
 		return fmt.Sprintf("序号 %d 撤销收款 %s（关联序号 %d 的收款 %s）：原因：%s；汇款总额 %d 分（%s）；范围内变化：%s → %s",
