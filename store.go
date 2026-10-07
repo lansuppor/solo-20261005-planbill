@@ -120,17 +120,22 @@ type paymentAllocation struct {
 // 记录一旦写入永不删除；撤销只是追加撤销信息，整笔撤销全部分配并保留
 // 原记录，撤销后该笔不再计入实收，也不会因重放而恢复。
 type payment struct {
-	ID           string              `json:"id"`
-	CustomerID   string              `json:"customer_id"`
-	Total        int64               `json:"total_fen"` // 收款总额，正整数分，等于分配合计
-	Note         string              `json:"note"`
-	Allocations  []paymentAllocation `json:"allocations"` // 至少一项，月份不重复，按月份升序保存
-	Seq          int64               `json:"seq"`         // 全局递增操作序号，决定历史展示顺序
-	CreatedAt    string              `json:"created_at"`
-	Revoked      bool                `json:"revoked"`
-	RevokeReason string              `json:"revoke_reason,omitempty"`
-	RevokeSeq    int64               `json:"revoke_seq,omitempty"`
-	RevokedAt    string              `json:"revoked_at,omitempty"`
+	ID          string              `json:"id"`
+	CustomerID  string              `json:"customer_id"`
+	Total       int64               `json:"total_fen"` // 收款总额，正整数分，等于分配合计
+	Note        string              `json:"note"`
+	Allocations []paymentAllocation `json:"allocations"` // 至少一项，月份不重复，按月份升序保存
+	// Auto 为 true 表示该收款由 bill remit-auto 自动分配登记：首次分配由工具
+	// 按最早欠款账期确定，判重只看客户、总额与备注；false（含旧存档缺字段）
+	// 表示 bill pay / bill remit 的显式分配登记，仍按月份-金额对应关系判重。
+	// 自动与显式分配登记之间不得复用同一收款标识。
+	Auto         bool   `json:"auto,omitempty"`
+	Seq          int64  `json:"seq"` // 全局递增操作序号，决定历史展示顺序
+	CreatedAt    string `json:"created_at"`
+	Revoked      bool   `json:"revoked"`
+	RevokeReason string `json:"revoke_reason,omitempty"`
+	RevokeSeq    int64  `json:"revoke_seq,omitempty"`
+	RevokedAt    string `json:"revoked_at,omitempty"`
 }
 
 // UnmarshalJSON 兼容旧版单账单收款格式（month + amount_fen，无 allocations）：
