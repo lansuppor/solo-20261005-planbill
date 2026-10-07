@@ -140,7 +140,7 @@ func runCmd(args []string, dataDir string) error {
 
 	case "bill":
 		if len(args) < 2 {
-			return usageError("缺少子命令，应为：bill settle|settle-batch|show|adjust|revoke|pay|remit|remit-auto|correct|unpay|refund|ledger|reconcile ...")
+			return usageError("缺少子命令，应为：bill settle|settle-batch|show|adjust|revoke|pay|remit|remit-auto|remit-import|correct|unpay|refund|ledger|reconcile ...")
 		}
 		switch args[1] {
 		case "settle":
@@ -180,6 +180,11 @@ func runCmd(args []string, dataDir string) error {
 				return usageError("用法：bill remit-auto <客户标识> <收款标识> <总金额分> <备注>")
 			}
 			return cmdBillRemitAuto(dataDir, args[2], args[3], args[4], args[5])
+		case "remit-import":
+			if len(args) != 3 {
+				return usageError("用法：bill remit-import <文件>（- 表示标准输入）")
+			}
+			return cmdBillRemitImport(dataDir, args[2])
 		case "correct":
 			if len(args) < 6 {
 				return usageError("用法：bill correct <收款标识> <更正标识> <原因> <YYYY-MM:金额分> [更多 月份:金额 ...]")
@@ -210,7 +215,7 @@ func runCmd(args []string, dataDir string) error {
 			}
 			return cmdBillReconcile(dataDir, args[2], args[3], args[4], args[5:])
 		default:
-			return usageError("未知 bill 子命令 %q；可用：settle、settle-batch、show、adjust、revoke、pay、remit、remit-auto、correct、unpay、refund、ledger、reconcile", args[1])
+			return usageError("未知 bill 子命令 %q；可用：settle、settle-batch、show、adjust、revoke、pay、remit、remit-auto、remit-import、correct、unpay、refund、ledger、reconcile", args[1])
 		}
 
 	default:
@@ -276,7 +281,7 @@ func cmdUsageImport(dir, file string) error {
 	var reader io.ReadCloser
 	var source string
 	if file == "-" {
-		reader = io.NopCloser(os.Stdin)
+		reader = io.NopCloser(stdin)
 		source = "标准输入"
 	} else {
 		f, err := os.Open(file)
@@ -1113,53 +1118,11 @@ func cmdBillRemitAuto(dir, customerID, payID, totalText, note string) error {
 			payID, existing.CustomerID, existing.Total, existing.Note)
 	}
 
-	// 首次登记：归集该客户当前已有账单的月份，按 UTC 账期月升序排列
-	// （YYYY-MM 字典序即时间序）。不补结算，只有已存在账单参与分配。
-	var months []string
-	for _, b := range s.Bills {
-		if b.CustomerID == customerID {
-			months = append(months, b.Month)
-		}
-	}
-	sort.Strings(months)
-
-	// 依次偿还当前未收余额：跳过余额为 0 的月份，前一月份还清后才分配
-	// 下一月，最后一月可部分偿还。每月未收余额 = 当前应付 − 实收，均在
-	// [0, 有符号 64 位最大值] 内；remaining 从总额（正整数分）起只减不增，
-	// 各月余额与分配全程整数计算——即使全部账单欠款合计超过 64 位上限，
-	// 分配过程也只涉及不超过总额的中间值，不会误拒合法金额。
-	remaining := total
-	var allocs []paymentAllocation
-	for _, m := range months {
-		if remaining == 0 {
-			break
-		}
-		b := s.Bills[billKey(customerID, m)]
-		_, payable, err := billTotals(b, adjustmentsFor(s, customerID, m))
-		if err != nil {
-			return fmt.Errorf("客户 %s 的 %s 当前应付异常，拒绝登记收款: %w", customerID, m, err)
-		}
-		received, err := paymentReceived(s, customerID, m)
-		if err != nil {
-			return fmt.Errorf("客户 %s 的 %s 实收累计溢出有符号 64 位整数范围，拒绝登记收款: %w", customerID, m, err)
-		}
-		outstanding := payable - received // 不变量保证 0 ≤ 实收 ≤ 当前应付
-		if outstanding <= 0 {
-			continue // 跳过余额为 0 的月份
-		}
-		amt := outstanding
-		if amt > remaining {
-			amt = remaining // 最后一月可部分偿还
-		}
-		allocs = append(allocs, paymentAllocation{Month: m, Amount: amt})
-		remaining -= amt
-	}
-	if len(allocs) == 0 {
-		return fmt.Errorf("客户 %s 当前没有欠款（全部已存在账单的未收余额均为 0），整笔拒绝；不补结算、不跨客户、不留未分配款项", customerID)
-	}
-	if remaining > 0 {
-		return fmt.Errorf("收款总额 %d 分超过客户 %s 全部已存在账单的欠款合计 %d 分，整笔拒绝；不补结算、不跨客户、不留未分配款项",
-			total, customerID, total-remaining)
+	// 首次登记：归集该客户当前已有账单的月份，按 UTC 账期月升序自动偿还
+	// 当前未收余额。整批导入与本命令共用同一分配核心与判重身份。
+	allocs, err := autoAllocate(s, customerID, total)
+	if err != nil {
+		return err
 	}
 
 	// 成功保存为一笔普通收款及首次自动分配：占用一个账后全局序号，
