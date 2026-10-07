@@ -2,7 +2,9 @@ package main
 
 import (
 	"errors"
+	"fmt"
 	"math"
+	"math/big"
 	"math/bits"
 	"strconv"
 )
@@ -89,6 +91,65 @@ func moneyFen(fen int64) string {
 	}
 	whole, frac := s[:len(s)-2], s[len(s)-2:]
 	out := whole + "." + frac + " 元"
+	if neg {
+		out = "-" + out
+	}
+	return out
+}
+
+// int128 是有符号 128 位整数（二进制补码：hi 为高 64 位、lo 为低 64 位）。
+// 单账单的应付/实收/未收余额保证在有符号 64 位内，但跨账期报表的多账单
+// 合计可能超出有符号 64 位上限，汇总必须精确输出，故用 128 位整数累加；
+// 全程整数运算，不经过浮点（math/big 仅用于十进制格式化）。
+type int128 struct {
+	hi int64
+	lo uint64
+}
+
+// int128Of 把有符号 64 位整数符号扩展为 128 位。
+func int128Of(v int64) int128 {
+	if v < 0 {
+		return int128{hi: -1, lo: uint64(v)}
+	}
+	return int128{hi: 0, lo: uint64(v)}
+}
+
+// add 返回 a+b（二进制补码加法，精确）。账单数量级（每月一张）远不足以
+// 让合法余额的合计溢出 128 位，故无需溢出检查。
+func (a int128) add(b int128) int128 {
+	lo, carry := bits.Add64(a.lo, b.lo, 0)
+	hi, _ := bits.Add64(uint64(a.hi), uint64(b.hi), carry)
+	return int128{hi: int64(hi), lo: lo}
+}
+
+// neg 返回 -a（二进制补码取负）。
+func (a int128) neg() int128 {
+	lo, carry := bits.Add64(^a.lo, 1, 0)
+	hi, _ := bits.Add64(uint64(^a.hi), 0, carry)
+	return int128{hi: int64(hi), lo: lo}
+}
+
+// sub 返回 a-b。
+func (a int128) sub(b int128) int128 { return a.add(b.neg()) }
+
+// big 转换为 big.Int 以便十进制格式化（仅用于输出，不参与计算）。
+func (a int128) big() *big.Int {
+	v := new(big.Int).SetInt64(a.hi)
+	v.Lsh(v, 64)
+	return v.Add(v, new(big.Int).SetUint64(a.lo))
+}
+
+func (a int128) String() string { return a.big().String() }
+
+// moneyFen128 将 128 位“分”渲染为人民币金额，规则与 moneyFen 相同。
+func moneyFen128(fen int128) string {
+	b := fen.big()
+	neg := b.Sign() < 0
+	if neg {
+		b.Neg(b)
+	}
+	whole, frac := new(big.Int).QuoRem(b, big.NewInt(100), new(big.Int))
+	out := fmt.Sprintf("%s.%02d 元", whole.String(), frac.Int64())
 	if neg {
 		out = "-" + out
 	}
