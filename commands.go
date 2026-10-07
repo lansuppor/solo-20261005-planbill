@@ -30,7 +30,7 @@ func runCmd(args []string, dataDir string) error {
 	switch args[0] {
 	case "customer":
 		if len(args) < 2 {
-			return usageError("缺少子命令，应为：customer add|add-plan|suspend|suspensions ...")
+			return usageError("缺少子命令，应为：customer add|add-plan|suspend|resume|suspensions ...")
 		}
 		switch args[1] {
 		case "add":
@@ -48,6 +48,11 @@ func runCmd(args []string, dataDir string) error {
 				return usageError("用法：customer suspend <客户标识> <起月 YYYY-MM> <结束月 YYYY-MM> <原因>")
 			}
 			return cmdCustomerSuspend(dataDir, args[2], args[3], args[4], args[5])
+		case "resume":
+			if len(args) != 6 {
+				return usageError("用法：customer resume <客户标识> <原起月 YYYY-MM> <恢复月 YYYY-MM> <原因>")
+			}
+			return cmdCustomerResume(dataDir, args[2], args[3], args[4], args[5])
 		case "suspensions":
 			if len(args) != 3 && len(args) != 4 {
 				return usageError("用法：customer suspensions <客户标识> [YYYY-MM]")
@@ -58,7 +63,7 @@ func runCmd(args []string, dataDir string) error {
 			}
 			return cmdCustomerSuspensions(dataDir, args[2], month, hasMonth)
 		default:
-			return usageError("未知 customer 子命令 %q；可用：add、add-plan、suspend、suspensions", args[1])
+			return usageError("未知 customer 子命令 %q；可用：add、add-plan、suspend、resume、suspensions", args[1])
 		}
 
 	case "plan":

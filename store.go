@@ -213,10 +213,24 @@ type planChange struct {
 // 操作序号。固定单价客户不适用暂停。
 type suspension struct {
 	CustomerID string `json:"customer_id"`
-	StartMonth string `json:"start_month"` // YYYY-MM（UTC），暂停起月（含）
-	EndMonth   string `json:"end_month"`   // YYYY-MM（UTC），结束月（不含），严格晚于起月
+	StartMonth string `json:"start_month"` // YYYY-MM（UTC），暂停原起月（含）
+	EndMonth   string `json:"end_month"`   // YYYY-MM（UTC），原结束月（不含），严格晚于起月；提前恢复后仍永久保留原结束月
 	Reason     string `json:"reason"`
 	CreatedAt  string `json:"created_at"`
+}
+
+// suspensionResume 是一项暂停的按月提前恢复登记：以客户与原起月（即目标
+// 暂停的 StartMonth）共同标识，把该暂停的当前有效区间由 [原起月, 原结束月)
+// 缩短为 [原起月, 恢复月)；恢复月（含）起不再受该项暂停限制，客户无需等到
+// 原结束月即可重新使用服务。记录一旦写入永不修改、不可改写或撤销，原暂停
+// 区间与原因也永久保留；恢复不产生账后流水事件，也不占用全局操作序号。
+// 每项暂停只能登记一次提前恢复；仅适用于绑定阶梯方案的客户。
+type suspensionResume struct {
+	CustomerID  string `json:"customer_id"`
+	StartMonth  string `json:"start_month"`  // YYYY-MM（UTC），目标暂停的原起月（含），与键一致
+	ResumeMonth string `json:"resume_month"` // YYYY-MM（UTC），恢复月（含）；原起月 < 恢复月 < 原结束月
+	Reason      string `json:"reason"`       // 提前恢复原因，非空（与暂停原因相互独立）
+	CreatedAt   string `json:"created_at"`
 }
 
 // withdrawal 是一条用量记录的撤回标记：原记录（客户、时间、数量、标识）永久
@@ -257,8 +271,12 @@ type state struct {
 	Corrections map[string]*correction  `json:"corrections"`           // 全局唯一更正标识 -> 记录（与收款、调整标识相互独立，可同名）
 	Refunds     map[string]*refund      `json:"refunds,omitempty"`     // 全局唯一退款标识 -> 记录（与收款、调整、更正标识相互独立，可同名；不可撤销）
 	PlanChanges map[string]*planChange  `json:"plan_changes"`          // 客户 + "|" + 生效月 -> 方案变更（按生效月递增追加，不可改写）
-	Suspensions map[string]*suspension  `json:"suspensions,omitempty"` // 客户 + "|" + 起月 -> 暂停区间（不可改写）
-	Withdrawals map[string]*withdrawal  `json:"withdrawals,omitempty"` // 用量标识 -> 撤回标记（不可恢复，标识不可复用）
+	Suspensions map[string]*suspension  `json:"suspensions,omitempty"` // 客户 + "|" + 原起月 -> 暂停区间（原区间不可改写）
+	// SuspensionResumes 以客户 + "|" + 原起月为键保存暂停的提前恢复登记；
+	// 原暂停区间与原因仍保留在 Suspensions 中，当前有效区间缩短为
+	// [原起月, 恢复月)。旧存档缺少本字段视为从未提前恢复（沿用原区间）。
+	SuspensionResumes map[string]*suspensionResume `json:"suspension_resumes,omitempty"`
+	Withdrawals       map[string]*withdrawal       `json:"withdrawals,omitempty"` // 用量标识 -> 撤回标记（不可恢复，标识不可复用）
 	// UsageCorrections 以原用量标识为键保存用量更正关联；原记录同时在
 	// Withdrawals 中按更正原因标记撤回。旧存档缺少本字段视为无更正。
 	UsageCorrections map[string]*usageCorrection `json:"usage_corrections,omitempty"`
@@ -297,9 +315,10 @@ func loadStore(dir string) (*state, error) {
 		return nil, fmt.Errorf("数据文件已损坏: %w", err)
 	}
 	// 旧版本数据文件没有 plans/adjustments/payments/corrections/refunds/
-	// plan_changes/suspensions/withdrawals/usage_corrections/next_seq 字段：
+	// plan_changes/suspensions/suspension_resumes/withdrawals/
+	// usage_corrections/next_seq 字段：
 	// 视为零方案、零调整、零实收、零更正、零退款、零方案变更、零暂停、
-	// 零撤回、零用量更正（全部用量有效）。
+	// 零提前恢复（沿用原暂停区间）、零撤回、零用量更正（全部用量有效）。
 	if s.Plans == nil {
 		s.Plans = map[string]*plan{}
 	}
@@ -321,6 +340,9 @@ func loadStore(dir string) (*state, error) {
 	if s.Suspensions == nil {
 		s.Suspensions = map[string]*suspension{}
 	}
+	if s.SuspensionResumes == nil {
+		s.SuspensionResumes = map[string]*suspensionResume{}
+	}
 	if s.Withdrawals == nil {
 		s.Withdrawals = map[string]*withdrawal{}
 	}
@@ -333,20 +355,21 @@ func loadStore(dir string) (*state, error) {
 
 func newState(p string) *state {
 	return &state{
-		Version:          stateVersion,
-		Customers:        map[string]*customer{},
-		Plans:            map[string]*plan{},
-		Usage:            map[string]*usageRecord{},
-		Bills:            map[string]*bill{},
-		Adjustments:      map[string]*adjustment{},
-		Payments:         map[string]*payment{},
-		Corrections:      map[string]*correction{},
-		Refunds:          map[string]*refund{},
-		PlanChanges:      map[string]*planChange{},
-		Suspensions:      map[string]*suspension{},
-		Withdrawals:      map[string]*withdrawal{},
-		UsageCorrections: map[string]*usageCorrection{},
-		path:             p,
+		Version:           stateVersion,
+		Customers:         map[string]*customer{},
+		Plans:             map[string]*plan{},
+		Usage:             map[string]*usageRecord{},
+		Bills:             map[string]*bill{},
+		Adjustments:       map[string]*adjustment{},
+		Payments:          map[string]*payment{},
+		Corrections:       map[string]*correction{},
+		Refunds:           map[string]*refund{},
+		PlanChanges:       map[string]*planChange{},
+		Suspensions:       map[string]*suspension{},
+		SuspensionResumes: map[string]*suspensionResume{},
+		Withdrawals:       map[string]*withdrawal{},
+		UsageCorrections:  map[string]*usageCorrection{},
+		path:              p,
 	}
 }
 
@@ -657,9 +680,8 @@ func (s *state) validate() error {
 		}
 	}
 
-	// 暂停区间：键、客户（须为绑定阶梯方案的客户）、区间与原因都必须自洽；
-	// 同一客户的区间不得重叠（可以相接）；暂停月内不得存在有效（未撤回）
-	// 用量或账单。
+	// 暂停区间：键、客户（须为绑定阶梯方案的客户）、原区间与原因都必须
+	// 自洽；原区间一旦写入不因提前恢复而改写。
 	// 旧文件缺少暂停记录视为正常服务（Suspensions 已在载入时补为空表）。
 	for key, su := range s.Suspensions {
 		if su == nil {
@@ -685,29 +707,58 @@ func (s *state) validate() error {
 			return fmt.Errorf("暂停区间 %q 的原因为空", key)
 		}
 	}
+	// 提前恢复记录：键与客户、原起月一致；目标暂停必须存在；恢复月为
+	// YYYY-MM 且严格介于原起月与原结束月之间；原因非空。恢复记录永久保留、
+	// 不可改写或撤销。旧文件缺少恢复记录视为沿用原区间（SuspensionResumes
+	// 已在载入时补为空表）。
+	for key, r := range s.SuspensionResumes {
+		if r == nil {
+			return fmt.Errorf("暂停提前恢复 %q 的数据为空", key)
+		}
+		if suspensionKey(r.CustomerID, r.StartMonth) != key {
+			return fmt.Errorf("暂停提前恢复键不一致: 键 %q / 客户起月 %s|%s", key, r.CustomerID, r.StartMonth)
+		}
+		su, ok := s.Suspensions[key]
+		if !ok {
+			return fmt.Errorf("暂停提前恢复 %q 引用了不存在的暂停（客户 %q 原起月 %q，恢复目标缺失）", key, r.CustomerID, r.StartMonth)
+		}
+		if !validMonth(r.ResumeMonth) || r.ResumeMonth <= r.StartMonth || r.ResumeMonth >= su.EndMonth {
+			return fmt.Errorf("暂停提前恢复 %q 的恢复月 %q 越界（必须满足原起月 %s < 恢复月 < 原结束月 %s）",
+				key, r.ResumeMonth, r.StartMonth, su.EndMonth)
+		}
+		if strings.TrimSpace(r.Reason) == "" {
+			return fmt.Errorf("暂停提前恢复 %q 的原因为空", key)
+		}
+	}
+	// 同一客户的当前有效区间不得重叠（可以相接，相接视为连续暂停）；有效
+	// 暂停月内不得存在有效（未撤回）用量或账单。有效区间为
+	// [原起月, 有效结束月)，已提前恢复的区间有效结束月即恢复月——原区间
+	// [恢复月, 原结束月) 已释放，其中存在用量或账单属正常状态。
 	for customerID := range s.Customers {
 		list := s.suspensionsFor(customerID)
 		for i := 1; i < len(list); i++ {
-			if list[i].StartMonth < list[i-1].EndMonth {
-				return fmt.Errorf("客户 %s 的暂停区间 %s..%s 与 %s..%s 重叠（区间可以相接但不得重叠）",
-					customerID, list[i-1].StartMonth, list[i-1].EndMonth, list[i].StartMonth, list[i].EndMonth)
+			prevEnd := s.effectiveEndMonth(list[i-1])
+			if list[i].StartMonth < prevEnd {
+				return fmt.Errorf("客户 %s 的暂停有效区间 %s..%s 与 %s..%s 重叠（区间可以相接但不得重叠）",
+					customerID, list[i-1].StartMonth, prevEnd, list[i].StartMonth, s.effectiveEndMonth(list[i]))
 			}
 		}
 		for _, su := range list {
+			end := s.effectiveEndMonth(su)
 			for _, u := range s.Usage {
 				// 已撤回用量不参与用量冲突判断，可存在于随后暂停的月份。
 				if _, withdrawn := s.Withdrawals[u.ID]; withdrawn {
 					continue
 				}
-				if u.CustomerID == customerID && monthInRange(utcMonth(u.Time), su.StartMonth, su.EndMonth) {
-					return fmt.Errorf("客户 %s 在暂停区间 %s..%s（不含结束月）内存在用量 %q（%s）",
-						customerID, su.StartMonth, su.EndMonth, u.ID, utcMonth(u.Time))
+				if u.CustomerID == customerID && monthInRange(utcMonth(u.Time), su.StartMonth, end) {
+					return fmt.Errorf("客户 %s 在暂停有效区间 %s..%s（不含结束月）内存在用量 %q（%s）",
+						customerID, su.StartMonth, end, u.ID, utcMonth(u.Time))
 				}
 			}
 			for _, b := range s.Bills {
-				if b.CustomerID == customerID && monthInRange(b.Month, su.StartMonth, su.EndMonth) {
-					return fmt.Errorf("客户 %s 在暂停区间 %s..%s（不含结束月）内存在账单（月份 %s），暂停月不得封账",
-						customerID, su.StartMonth, su.EndMonth, b.Month)
+				if b.CustomerID == customerID && monthInRange(b.Month, su.StartMonth, end) {
+					return fmt.Errorf("客户 %s 在暂停有效区间 %s..%s（不含结束月）内存在账单（月份 %s），暂停月不得封账",
+						customerID, su.StartMonth, end, b.Month)
 				}
 			}
 		}
@@ -1197,7 +1248,9 @@ func monthInRange(m, start, end string) bool {
 	return m >= start && m < end
 }
 
-// suspensionsFor 返回某客户的全部暂停区间，按起月升序。
+// suspensionsFor 返回某客户的全部暂停区间（原记录，按原起月升序）。
+// 展示原区间、登记判重使用本方法；判断月份是否暂停须使用 isSuspendedMonth，
+// 后者会把已提前恢复的区间按有效区间 [原起月, 恢复月) 缩短。
 func (s *state) suspensionsFor(customerID string) []*suspension {
 	var list []*suspension
 	for _, su := range s.Suspensions {
@@ -1209,11 +1262,26 @@ func (s *state) suspensionsFor(customerID string) []*suspension {
 	return list
 }
 
-// isSuspendedMonth 报告某客户的指定 UTC 自然月是否处于任一暂停区间内
-// （区间包含起月、不包含结束月；相接区间视为连续暂停）。
+// effectiveEndMonth 返回一项暂停的当前有效结束月（不含）：已登记提前恢复时
+// 为恢复月，否则为原结束月。有效区间恒为 [原起月, 有效结束月)。
+func (s *state) effectiveEndMonth(su *suspension) string {
+	if r, ok := s.SuspensionResumes[suspensionKey(su.CustomerID, su.StartMonth)]; ok {
+		return r.ResumeMonth
+	}
+	return su.EndMonth
+}
+
+// resumeFor 返回以客户与原起月标识的提前恢复记录；未登记时返回 nil。
+func (s *state) resumeFor(customerID, startMonth string) *suspensionResume {
+	return s.SuspensionResumes[suspensionKey(customerID, startMonth)]
+}
+
+// isSuspendedMonth 报告某客户的指定 UTC 自然月是否处于任一暂停的当前有效
+// 区间内：有效区间为 [原起月, 有效结束月)，已提前恢复的区间自恢复月（含）
+// 起不再限制；相接的有效区间视为连续暂停。
 func (s *state) isSuspendedMonth(customerID, month string) bool {
 	for _, su := range s.Suspensions {
-		if su.CustomerID == customerID && monthInRange(month, su.StartMonth, su.EndMonth) {
+		if su.CustomerID == customerID && monthInRange(month, su.StartMonth, s.effectiveEndMonth(su)) {
 			return true
 		}
 	}
