@@ -83,6 +83,13 @@ func cmdBillSettleBatch(dir string, args []string) error {
 				where, describeSuspension(s, customerID, month)))
 			continue
 		}
+		// 终止月（含）起不能结算：清单中任一项不早于客户终止月，整份清单即
+		// 拒绝，不新增账单或封账，不报告部分成功。
+		if s.isTerminatedMonth(customerID, month) {
+			problems = append(problems, fmt.Sprintf("%s：该月不早于客户终止月 %s，订阅已终止，不结算、不封账、不收月费",
+				where, s.Terminations[customerID].Month))
+			continue
+		}
 		if existing, ok := s.Bills[key]; ok {
 			// 已结算项返回原账单，不重新计费；已有账单的标识、快照、金额与
 			// 账后历史均不改变。

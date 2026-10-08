@@ -30,7 +30,7 @@ func runCmd(args []string, dataDir string) error {
 	switch args[0] {
 	case "customer":
 		if len(args) < 2 {
-			return usageError("缺少子命令，应为：customer add|add-plan|suspend|resume|suspensions ...")
+			return usageError("缺少子命令，应为：customer add|add-plan|suspend|resume|suspensions|terminate|termination ...")
 		}
 		switch args[1] {
 		case "add":
@@ -62,8 +62,22 @@ func runCmd(args []string, dataDir string) error {
 				month, hasMonth = args[3], true
 			}
 			return cmdCustomerSuspensions(dataDir, args[2], month, hasMonth)
+		case "terminate":
+			if len(args) != 5 {
+				return usageError("用法：customer terminate <客户标识> <终止月 YYYY-MM> <原因>")
+			}
+			return cmdCustomerTerminate(dataDir, args[2], args[3], args[4])
+		case "termination":
+			if len(args) != 3 && len(args) != 4 {
+				return usageError("用法：customer termination <客户标识> [YYYY-MM]")
+			}
+			month, hasMonth := "", false
+			if len(args) == 4 {
+				month, hasMonth = args[3], true
+			}
+			return cmdCustomerTermination(dataDir, args[2], month, hasMonth)
 		default:
-			return usageError("未知 customer 子命令 %q；可用：add、add-plan、suspend、resume、suspensions", args[1])
+			return usageError("未知 customer 子命令 %q；可用：add、add-plan、suspend、resume、suspensions、terminate、termination", args[1])
 		}
 
 	case "plan":
@@ -350,6 +364,12 @@ func cmdUsageImport(dir, file string) error {
 				r.line, r.rec.CustomerID, rowMonth, r.rec.ID))
 			continue
 		}
+		// 终止月（含）起的新用量一律拒绝：订阅已终止，永久结束后续服务。
+		if s.isTerminatedMonth(r.rec.CustomerID, rowMonth) {
+			problems = append(problems, fmt.Sprintf("第 %d 行：客户 %s 的 %s 不早于终止月 %s，订阅已终止不接收新用量（新用量 %q 被拒绝）",
+				r.line, r.rec.CustomerID, rowMonth, s.Terminations[r.rec.CustomerID].Month, r.rec.ID))
+			continue
+		}
 		// 金额可行性预检：固定单价客户检查 数量×单价；阶梯客户按记录时间
 		// 换算的 UTC 月份的有效方案，以单条数量从零计价，检查分段金额不
 		// 溢出（金额单位：分）。
@@ -524,6 +544,12 @@ func cmdBillSettle(dir, customerID, month string) error {
 	// 暂停月无论方案月费多少都拒绝结算：不封账、不生成零金额账单。
 	if s.isSuspendedMonth(customerID, month) {
 		return fmt.Errorf("客户 %s 的 %s 处于暂停区间，暂停服务期间不产生月费账单，拒绝结算且不封账", customerID, month)
+	}
+	// 终止月（含）起拒绝结算：订阅已终止，不结算、不封账、不收月费、不生成
+	// 零金额账单；终止前月份仍按原规则补结算。
+	if s.isTerminatedMonth(customerID, month) {
+		return fmt.Errorf("客户 %s 的 %s 不早于终止月 %s，订阅已终止：不结算、不封账、不收月费、不生成零金额账单",
+			customerID, month, s.Terminations[customerID].Month)
 	}
 
 	key := billKey(customerID, month)
