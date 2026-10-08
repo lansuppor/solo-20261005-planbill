@@ -159,7 +159,7 @@ func runCmd(args []string, dataDir string) error {
 
 	case "bill":
 		if len(args) < 2 {
-			return usageError("缺少子命令，应为：bill settle|settle-batch|show|adjust|revoke|pay|remit|remit-auto|remit-import|correct|reassign|unpay|refund|ledger|reconcile ...")
+			return usageError("缺少子命令，应为：bill settle|settle-batch|draft|draft-show|draft-confirm|show|adjust|revoke|pay|remit|remit-auto|remit-import|correct|reassign|unpay|refund|ledger|reconcile ...")
 		}
 		switch args[1] {
 		case "settle":
@@ -167,6 +167,21 @@ func runCmd(args []string, dataDir string) error {
 				return usageError("用法：bill settle <客户标识> <YYYY-MM>")
 			}
 			return cmdBillSettle(dataDir, args[2], args[3])
+		case "draft":
+			if len(args) != 5 {
+				return usageError("用法：bill draft <草案标识> <客户标识> <YYYY-MM>")
+			}
+			return cmdBillDraft(dataDir, args[2], args[3], args[4])
+		case "draft-show":
+			if len(args) != 3 {
+				return usageError("用法：bill draft-show <草案标识>")
+			}
+			return cmdBillDraftShow(dataDir, args[2])
+		case "draft-confirm":
+			if len(args) != 3 {
+				return usageError("用法：bill draft-confirm <草案标识>")
+			}
+			return cmdBillDraftConfirm(dataDir, args[2])
 		case "settle-batch":
 			return cmdBillSettleBatch(dataDir, args[2:])
 		case "show":
@@ -239,7 +254,7 @@ func runCmd(args []string, dataDir string) error {
 			}
 			return cmdBillReconcile(dataDir, args[2], args[3], args[4], args[5:])
 		default:
-			return usageError("未知 bill 子命令 %q；可用：settle、settle-batch、show、adjust、revoke、pay、remit、remit-auto、remit-import、correct、reassign、unpay、refund、ledger、reconcile", args[1])
+			return usageError("未知 bill 子命令 %q；可用：settle、settle-batch、draft、draft-show、draft-confirm、show、adjust、revoke、pay、remit、remit-auto、remit-import、correct、reassign、unpay、refund、ledger、reconcile", args[1])
 		}
 
 	default:

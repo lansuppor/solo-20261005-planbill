@@ -273,6 +273,60 @@ type termination struct {
 	CreatedAt  string `json:"created_at"`
 }
 
+// settlementDraft 是单客户单账期的结算草案：创建时只做只读计价核对并把
+// 完整计费输入与结果快照永久保存，不生成账单、不封账、不占账后序号，也不
+// 限制后续用量、方案或生命周期操作；不同草案可指向同一客户月份。确认时按
+// 确认当时状态逐项（而非仅总额）核对快照，全部一致才原子生成正式账单并
+// 封账。待确认草案因后续操作过时是合法状态，不视为存档损坏。
+type settlementDraft struct {
+	ID         string `json:"id"`          // 全局唯一草案标识，非空，创建失败不占用
+	CustomerID string `json:"customer_id"` // 目标客户
+	Month      string `json:"month"`       // 目标账期 YYYY-MM（UTC 自然月，左闭右开）
+	// Inputs 保存创建时该客户该账期参与计价的完整计费输入：全部有效（未
+	// 撤回）用量的标识、原始 RFC3339 时间（确认时按解析后的时间点比较）与
+	// 数量，按计价顺序（时间点升序、同一时间按标识字典序）排列。无用量
+	// 仅月费草案时为空列表。
+	Inputs []draftUsageInput `json:"inputs"`
+	// Snapshot 保存创建时的完整计费快照：客户类型、固定单价或当月有效方案
+	// 的标识、名称、月费与完整阶梯规则、逐条小计与跨档分段、各档合计、
+	// 总数量与原总金额；确认时据此逐项重新计价核对。
+	Snapshot  draftBillSnapshot `json:"snapshot"`
+	CreatedAt string            `json:"created_at"`
+	// Confirmed 为 false 时草案待确认；确认成功后置为 true 并永久关联正式
+	// 账单（BillID 非空）。确认只发生一次，确认状态不可改写；确认重放只
+	// 返回关联账单与当前账后状态，不写盘、不重新收费。
+	Confirmed   bool   `json:"confirmed,omitempty"`
+	BillID      string `json:"bill_id,omitempty"`
+	ConfirmedAt string `json:"confirmed_at,omitempty"`
+}
+
+// draftUsageInput 是草案计费输入中的一条有效用量（标识、原始时间与数量）。
+// 时间以创建时的原始 RFC3339 字符串保存，确认时与当前用量按解析后的瞬间
+// 比较（Z 与 +00:00 等同一时刻写法视为相同）。
+type draftUsageInput struct {
+	UsageID  string `json:"usage_id"`
+	Time     string `json:"time"`
+	Quantity int64  `json:"quantity"`
+}
+
+// draftBillSnapshot 是草案创建时的完整计费快照：足以独立重建出一张与将来
+// 正式账单逐项一致的账单，而不依赖创建之后可能变化的客户、方案或用量。
+type draftBillSnapshot struct {
+	// Pricing 为 fixed 或 tiered，与账单计价类型一致。
+	Pricing    string      `json:"pricing"`
+	UnitPrice  int64       `json:"unit_price_fen,omitempty"` // 固定单价快照
+	PlanID     string      `json:"plan_id,omitempty"`        // 阶梯：当月有效方案标识
+	PlanName   string      `json:"plan_name,omitempty"`      // 阶梯：方案名称快照
+	PlanTiers  []tier      `json:"plan_tiers,omitempty"`     // 阶梯：完整方案规则快照
+	TierTotals []tierTotal `json:"tier_totals,omitempty"`    // 阶梯：各档实际数量与金额
+	MonthlyFee int64       `json:"monthly_fee_fen"`          // 有效方案月费快照（固定单价为 0）
+	TotalQty   int64       `json:"total_quantity"`
+	UsageFee   int64       `json:"usage_fee_fen"` // 全月用量费（逐条小计之和）
+	TotalFee   int64       `json:"total_fee_fen"` // 原总金额 = 月费 + 用量费
+	// Lines 与 Inputs 一一对应，保存逐条小计与跨档分段（阶梯）。
+	Lines []billLine `json:"lines"`
+}
+
 // withdrawal 是一条用量记录的撤回标记：原记录（客户、时间、数量、标识）永久
 // 保留在 Usage 中，撤回只追加状态与原因，用于纠正误导入的记录。撤回不可恢复、
 // 标识不可复用；已撤回用量不参与结算、方案变更预检与暂停区间冲突检查，但相同
@@ -326,8 +380,13 @@ type state struct {
 	// Terminations 以客户标识为键保存按月订阅终止登记；每客户至多一条，
 	// 永久保留、不可修改或撤销。旧存档缺少本字段视为未终止。
 	Terminations map[string]*termination `json:"terminations,omitempty"`
-	NextSeq      int64                   `json:"next_seq"` // 已分配的最大操作序号（调整/收款/更正/退款及其撤销共用；方案变更、暂停、用量撤回与用量更正不占用）
-	path         string                  `json:"-"`
+	// Drafts 以全局唯一草案标识为键保存单客户单账期的结算草案；草案创建时
+	// 保存完整计费快照但不生成账单、不封账、不占账后序号，确认时才按确认
+	// 当时状态逐项核对并原子出账封账。快照永久保留、不可改写；不同草案可
+	// 指向同一客户月份。旧存档缺少本字段视为无草案。
+	Drafts  map[string]*settlementDraft `json:"settlement_drafts,omitempty"`
+	NextSeq int64                       `json:"next_seq"` // 已分配的最大操作序号（调整/收款/更正/退款及其撤销共用；方案变更、暂停、用量撤回、用量更正与结算草案不占用）
+	path    string                      `json:"-"`
 }
 
 // loadStore 读取数据目录；目录不存在时按需创建并视为空库。
@@ -400,6 +459,9 @@ func loadStore(dir string) (*state, error) {
 	if s.Terminations == nil {
 		s.Terminations = map[string]*termination{}
 	}
+	if s.Drafts == nil {
+		s.Drafts = map[string]*settlementDraft{}
+	}
 	s.path = p
 	return &s, nil
 }
@@ -422,6 +484,7 @@ func newState(p string) *state {
 		Withdrawals:           map[string]*withdrawal{},
 		UsageCorrections:      map[string]*usageCorrection{},
 		Terminations:          map[string]*termination{},
+		Drafts:                map[string]*settlementDraft{},
 		path:                  p,
 	}
 }
@@ -1207,6 +1270,9 @@ func (s *state) validate() error {
 			return fmt.Errorf("账单 %q 的实收 %d 分超过当前应付 %d 分", key, received, payable)
 		}
 	}
+	if err := s.validateDrafts(); err != nil {
+		return err
+	}
 	return nil
 }
 
@@ -1395,6 +1461,201 @@ func (s *state) validatePostbillTimeline() error {
 			return fmt.Errorf("账单 %q 的账后回放终态（应付 %d、实收 %d）与当前余额（应付 %d、实收 %d）不一致，数据异常",
 				key, payable[key], received[key], wantPayable, wantReceived)
 		}
+	}
+	return nil
+}
+
+// validateDrafts 校验全部结算草案自洽：键与标识一致、客户存在、月份合法、
+// 快照能独立按保存的方案规则与输入重新计价复现（快照计价自洽）；已确认
+// 草案必须永久关联一张账单，且关联账单的客户、月份与全部计费快照逐项一致。
+// 待确认草案因后续用量、方案或生命周期操作而过时是合法状态，不按损坏处理
+// ——过时只在确认时拒绝。旧存档缺少草案节视为无草案。
+func (s *state) validateDrafts() error {
+	for id, d := range s.Drafts {
+		if d == nil {
+			return fmt.Errorf("结算草案 %q 的数据为空", id)
+		}
+		if d.ID != id {
+			return fmt.Errorf("结算草案标识不一致: 键 %q / 记录 %q", id, d.ID)
+		}
+		if strings.TrimSpace(d.ID) == "" {
+			return errors.New("存在空标识的结算草案")
+		}
+		cust, ok := s.Customers[d.CustomerID]
+		if !ok {
+			return fmt.Errorf("结算草案 %q 引用了不存在的客户 %q（草案引用缺失）", id, d.CustomerID)
+		}
+		if !validMonth(d.Month) {
+			return fmt.Errorf("结算草案 %q 的月份 %q 无效", id, d.Month)
+		}
+		snap := &d.Snapshot
+		if snap.Pricing != "fixed" && snap.Pricing != "tiered" {
+			return fmt.Errorf("结算草案 %q 的快照计价类型 %q 未知", id, snap.Pricing)
+		}
+		if snap.MonthlyFee < 0 {
+			return fmt.Errorf("结算草案 %q 的快照月费为负", id)
+		}
+		// 计费输入：条数与逐条明细一致，引用的用量必须存在、属于该客户、
+		// 落在账期内，且标识/时间/数量与快照输入一致。草案创建时只含有效
+		// （未撤回）用量；后来用量被撤回会使草案过时（确认时拒绝），但
+		// 输入引用本身不得缺失，缺失即损坏。
+		if len(d.Inputs) != len(snap.Lines) {
+			return fmt.Errorf("结算草案 %q 的计费输入 %d 条与逐条明细 %d 条不一致（快照不自洽）",
+				id, len(d.Inputs), len(snap.Lines))
+		}
+		for i, in := range d.Inputs {
+			u, exists := s.Usage[in.UsageID]
+			if !exists {
+				return fmt.Errorf("结算草案 %q 引用了不存在的用量 %q（草案引用缺失）", id, in.UsageID)
+			}
+			if u.CustomerID != d.CustomerID {
+				return fmt.Errorf("结算草案 %q 的输入用量 %q 不属于客户 %s", id, in.UsageID, d.CustomerID)
+			}
+			if !inMonth(u.Time, d.Month) {
+				return fmt.Errorf("结算草案 %q 的输入用量 %q 不在账期 %s 内", id, in.UsageID, d.Month)
+			}
+			if u.Time != in.Time || u.Quantity != in.Quantity {
+				return fmt.Errorf("结算草案 %q 的输入用量 %q 与当前记录不一致（计费输入快照损坏）", id, in.UsageID)
+			}
+			ln := snap.Lines[i]
+			if ln.UsageID != in.UsageID || ln.Time != in.Time || ln.Quantity != in.Quantity {
+				return fmt.Errorf("结算草案 %q 的第 %d 条明细与计费输入不一致（快照不自洽）", id, i+1)
+			}
+		}
+		// 快照计价自洽：按快照保存的客户类型、单价或方案规则，从快照输入
+		// 重新计价，逐条小计/跨档分段、各档合计、数量与金额必须完全复现。
+		recs := make([]*usageRecord, len(d.Inputs))
+		for i := range d.Inputs {
+			recs[i] = &usageRecord{ID: d.Inputs[i].UsageID, Time: d.Inputs[i].Time, Quantity: d.Inputs[i].Quantity}
+		}
+		if err := validateSnapshotPricing(s, cust, snap, recs); err != nil {
+			return fmt.Errorf("结算草案 %q 的快照计价不自洽: %w", id, err)
+		}
+
+		if !d.Confirmed {
+			if d.BillID != "" || d.ConfirmedAt != "" {
+				return fmt.Errorf("结算草案 %q 未确认但存在关联账单或确认时间", id)
+			}
+			continue
+		}
+		// 已确认草案必须永久关联一张正式账单。
+		if d.BillID == "" {
+			return fmt.Errorf("结算草案 %q 已确认但缺少关联账单标识", id)
+		}
+		if strings.TrimSpace(d.ConfirmedAt) == "" {
+			return fmt.Errorf("结算草案 %q 已确认但缺少确认时间", id)
+		}
+		b, exists := s.Bills[billKey(d.CustomerID, d.Month)]
+		if !exists {
+			return fmt.Errorf("结算草案 %q 已确认但关联账单（客户 %s 月份 %s）不存在（草案引用缺失）",
+				id, d.CustomerID, d.Month)
+		}
+		if b.ID != d.BillID {
+			return fmt.Errorf("结算草案 %q 关联账单标识 %q 与实际账单 %q 不符", id, d.BillID, b.ID)
+		}
+		// 关联账单的客户、月份（由键保证）及全部计费快照必须逐项一致。
+		if problems := compareDraftBilling(d, b); len(problems) > 0 {
+			return fmt.Errorf("结算草案 %q 的关联账单 %s 与计费快照不符（%s）", id, b.ID, strings.Join(problems, "；"))
+		}
+	}
+	return nil
+}
+
+// validateSnapshotPricing 按快照保存的客户类型与价格规则，对快照输入重新
+// 计价，核验快照的单价/方案信息、逐条小计与跨档分段、各档合计、总数量、
+// 用量费与原总金额完全自洽。
+func validateSnapshotPricing(s *state, cust *customer, snap *draftBillSnapshot, recs []*usageRecord) error {
+	var qty, usageFee int64
+	switch snap.Pricing {
+	case "fixed":
+		if cust.PlanID != "" {
+			return fmt.Errorf("客户 %s 绑定了阶梯方案但快照为固定单价", cust.ID)
+		}
+		if snap.UnitPrice != cust.Price {
+			return fmt.Errorf("固定单价快照 %d 分与客户单价 %d 分不符", snap.UnitPrice, cust.Price)
+		}
+		if snap.PlanID != "" || snap.PlanName != "" || len(snap.PlanTiers) > 0 || len(snap.TierTotals) > 0 || snap.MonthlyFee != 0 {
+			return errors.New("固定单价快照携带阶梯方案或月费信息")
+		}
+		for _, ln := range snap.Lines {
+			fee, err := mul64(ln.Quantity, snap.UnitPrice)
+			if err != nil {
+				return fmt.Errorf("明细 %q 小计溢出", ln.UsageID)
+			}
+			if ln.LineFee != fee || len(ln.Segments) > 0 {
+				return fmt.Errorf("明细 %q 小计与数量×单价不符", ln.UsageID)
+			}
+			qty, err = add64(qty, ln.Quantity)
+			if err != nil {
+				return errors.New("快照总数量溢出有符号 64 位整数范围")
+			}
+			usageFee, err = add64(usageFee, ln.LineFee)
+			if err != nil {
+				return errors.New("快照用量费溢出有符号 64 位整数范围")
+			}
+		}
+	case "tiered":
+		if cust.PlanID == "" {
+			return fmt.Errorf("客户 %s 是固定单价客户但快照为阶梯计费", cust.ID)
+		}
+		if snap.UnitPrice != 0 {
+			return errors.New("阶梯快照保存了统一单价")
+		}
+		if snap.PlanID == "" {
+			return errors.New("阶梯快照缺少方案标识")
+		}
+		// 方案不可修改或删除：快照引用的方案必须仍存在，且名称、月费与完整
+		// 规则与登记内容一致；随后再以快照保存的规则本身重放计价（不依赖
+		// 当前账期安排——草案创建后方案变更使草案过时是合法状态）。
+		p0, ok := s.Plans[snap.PlanID]
+		if !ok {
+			return fmt.Errorf("快照引用了不存在的方案 %q", snap.PlanID)
+		}
+		if snap.PlanName != p0.Name || snap.MonthlyFee != p0.MonthlyFee || !tiersEqual(snap.PlanTiers, p0.Tiers) {
+			return fmt.Errorf("方案 %q 的快照规则与已登记方案不符", snap.PlanID)
+		}
+		if err := validatePlanRules(&plan{ID: snap.PlanID, Name: snap.PlanName, MonthlyFee: snap.MonthlyFee, Tiers: snap.PlanTiers}); err != nil {
+			return err
+		}
+		if len(snap.TierTotals) != len(snap.PlanTiers) {
+			return errors.New("分档合计档数与方案规则不符")
+		}
+		// 明细必须按计价顺序排列。
+		if !sortedByInstant(recs) {
+			return errors.New("明细未按计价顺序（时间点升序、同一时间按标识字典序）排列")
+		}
+		priced, err := tieredPrice(snap.PlanTiers, recs)
+		if err != nil {
+			return err
+		}
+		for i, ln := range snap.Lines {
+			if !segmentsEqual(ln.Segments, priced.lines[i].segments) || ln.LineFee != priced.lines[i].fee {
+				return fmt.Errorf("明细 %q 的跨档分段或小计与方案规则不符", ln.UsageID)
+			}
+		}
+		for i, tt := range snap.TierTotals {
+			if tt != (tierTotal{Quantity: priced.tierQty[i], Fee: priced.tierFee[i]}) {
+				return fmt.Errorf("第 %d 档合计与方案规则不符", i+1)
+			}
+		}
+		qty = priced.totalQty
+		usageFee = priced.totalFee
+	default:
+		return fmt.Errorf("未知计价类型 %q", snap.Pricing)
+	}
+	if qty != snap.TotalQty {
+		return fmt.Errorf("总数量快照 %d 与明细汇总 %d 不符", snap.TotalQty, qty)
+	}
+	if usageFee != snap.UsageFee {
+		return fmt.Errorf("用量费快照 %d 分与逐条小计合计 %d 分不符", snap.UsageFee, usageFee)
+	}
+	total, err := add64(snap.MonthlyFee, usageFee)
+	if err != nil || total != snap.TotalFee {
+		return fmt.Errorf("原总金额快照 %d 分不等于月费 %d 分加用量费 %d 分", snap.TotalFee, snap.MonthlyFee, usageFee)
+	}
+	// 仅月费大于 0 的快照允许空明细。
+	if len(snap.Lines) == 0 && snap.MonthlyFee == 0 {
+		return errors.New("无明细且月费为 0 的快照不可结算")
 	}
 	return nil
 }
