@@ -37,20 +37,24 @@ type reconMonthChange struct {
 }
 
 // reconEvent 是报表中合并展示的一次账后操作：调整、撤销调整、收款、
-// 分配更正、撤销收款或退款。每次操作只出现一次，范围内各月的变化合并在同一
-// 条目下；同名的调整、收款、更正与退款标识属于不同类型的记录，按类型区分，
-// 互不混淆。跨月退款作为一次操作列出范围内逐月变化，不按整笔总额重复累减。
+// 分配更正、归属转出、归属转入、撤销收款或退款。每次操作只出现一次，范围
+// 内各月的变化合并在同一条目下；同名的调整、收款、更正与退款标识属于不同
+// 类型的记录，按类型区分，互不混淆。归属转出与归属转入共用同一全局序号，
+// 在两侧客户各自只出现一次、只计本侧金额；跨月退款作为一次操作列出逐月
+// 变化，不按整笔总额重复累减。
 type reconEvent struct {
-	seq       int64
-	kind      string // 调整 / 撤销调整 / 收款 / 更正 / 撤销收款 / 退款
-	refID     string // 记录标识（调整、收款、更正或退款标识）
-	note      string // 原因（调整/更正/退款/撤销类）或备注（收款）
-	linkSeq   int64  // 撤销事件关联的原操作序号；非撤销为 0
-	payTotal  int64  // 收款类事件：汇款总额
-	payID     string // 更正/退款事件：关联收款标识
-	changes   []reconMonthChange
-	afterPay  int128 // 事件后范围内汇总应付（回放时填充）
-	afterRecv int128 // 事件后范围内汇总实收（回放时填充）
+	seq          int64
+	kind         string // 调整 / 撤销调整 / 收款 / 更正 / 归属转出 / 归属转入 / 撤销收款 / 退款
+	refID        string // 记录标识（调整、收款、更正、归属更正或退款标识）
+	note         string // 原因（调整/更正/退款/撤销类）或备注（收款）
+	linkSeq      int64  // 撤销事件关联的原操作序号；非撤销为 0
+	payTotal     int64  // 收款类事件：汇款总额
+	payID        string // 更正/归属/退款事件：关联收款标识
+	fromCustomer string // 归属转入事件：转出客户
+	toCustomer   string // 归属转出事件：转入客户标识
+	changes      []reconMonthChange
+	afterPay     int128 // 事件后范围内汇总应付（回放时填充）
+	afterRecv    int128 // 事件后范围内汇总实收（回放时填充）
 }
 
 func cmdBillReconcile(dir, customerID, startMonth, endMonth string, seqArgs []string) error {
@@ -250,6 +254,10 @@ func formatReconEvent(ev reconEvent) string {
 			parts[i] = fmt.Sprintf("%s 实收 %+d 分（分配 %d 分）", ch.month, ch.deltaReceived, ch.alloc)
 		case "更正":
 			parts[i] = fmt.Sprintf("%s 实收 %+d 分（分配 %d 分 → %d 分）", ch.month, ch.deltaReceived, ch.beforeAlloc, ch.afterAlloc)
+		case "归属转出":
+			parts[i] = fmt.Sprintf("%s 实收 %+d 分（转出 %d 分至客户 %s）", ch.month, ch.deltaReceived, ch.alloc, ev.toCustomer)
+		case "归属转入":
+			parts[i] = fmt.Sprintf("%s 实收 %+d 分（转入 %d 分）", ch.month, ch.deltaReceived, ch.alloc)
 		case "退款":
 			parts[i] = fmt.Sprintf("%s 实收 %+d 分（退款 %d 分）", ch.month, ch.deltaReceived, ch.alloc)
 		default: // 撤销收款
@@ -272,6 +280,12 @@ func formatReconEvent(ev reconEvent) string {
 	case "更正":
 		return fmt.Sprintf("序号 %d 更正 %s（关联收款 %s）：原因：%s；范围内变化：%s → %s",
 			ev.seq, ev.refID, ev.payID, ev.note, changes, after)
+	case "归属转出":
+		return fmt.Sprintf("序号 %d 归属转出 %s（关联收款 %s，转入客户 %s）：原因：%s；汇款总额 %d 分（%s）；范围内变化：%s → %s",
+			ev.seq, ev.refID, ev.payID, ev.toCustomer, ev.note, ev.payTotal, moneyFen(ev.payTotal), changes, after)
+	case "归属转入":
+		return fmt.Sprintf("序号 %d 归属转入 %s（关联收款 %s，自客户 %s 转入）：原因：%s；汇款总额 %d 分（%s）；范围内变化：%s → %s",
+			ev.seq, ev.refID, ev.payID, ev.fromCustomer, ev.note, ev.payTotal, moneyFen(ev.payTotal), changes, after)
 	case "退款":
 		return fmt.Sprintf("序号 %d 退款 %s（关联收款 %s）：原因：%s；范围内变化：%s → %s",
 			ev.seq, ev.refID, ev.payID, ev.note, changes, after)

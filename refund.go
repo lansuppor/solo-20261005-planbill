@@ -101,13 +101,14 @@ func cmdBillRefund(dir, payID, refundID, reason string, allocArgs []string) erro
 }
 
 // printRefund 输出单笔退款记录：退款标识、关联收款、原因、各月退款及
-// 剩余可退额（该月分配减累计退款，取自当前库状态）。
+// 剩余可退额（该月分配减累计退款，按当前归属客户取当前库状态）。
 func printRefund(r *refund, s *state) {
 	p := s.Payments[r.PaymentID] // 载入时已校验存在
+	owner := paymentCurrentCustomer(s, p)
 	current := currentAllocations(s, p)
 	fmt.Fprintf(stdout, "退款标识：%s\n", r.ID)
-	fmt.Fprintf(stdout, "关联收款：%s（客户 %s，总额 %d 分（%s），备注：%s）\n",
-		p.ID, p.CustomerID, p.Total, moneyFen(p.Total), p.Note)
+	fmt.Fprintf(stdout, "关联收款：%s（首次登记客户 %s，当前归属客户 %s，总额 %d 分（%s），备注：%s）\n",
+		p.ID, p.CustomerID, owner, p.Total, moneyFen(p.Total), p.Note)
 	fmt.Fprintf(stdout, "原因：%s\n", r.Reason)
 	fmt.Fprintln(stdout, "各月退款与剩余可退额：")
 	for _, al := range r.Allocations {

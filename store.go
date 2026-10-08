@@ -158,16 +158,6 @@ func (p *payment) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-// amountFor 返回该收款在指定月份的分配金额；无分配时为 0。
-func (p *payment) amountFor(month string) int64 {
-	for _, al := range p.Allocations {
-		if al.Month == month {
-			return al.Amount
-		}
-	}
-	return 0
-}
-
 // correction 是对一笔未撤销收款的分配更正：客户、总额、备注、原账单及
 // 应付不变，仅把该笔收款当前生效的分配整体替换为完整新分配。记录一旦写入
 // 永不删除；首次登记内容永久保留，bill pay / bill remit 仍按原始分配判重，
@@ -193,6 +183,24 @@ type refund struct {
 	Allocations []paymentAllocation `json:"allocations"` // 各月退款金额，至少一项，月份不重复，按月份升序保存
 	Seq         int64               `json:"seq"`         // 全局递增操作序号，与调整/收款/更正及其撤销共用
 	CreatedAt   string              `json:"created_at"`
+}
+
+// ownershipTransfer 是一笔收款的归属客户更正：把登记给错误客户的汇款整笔
+// 转移给正确客户——撤去更正时当前归属客户最新分配的全部实收，按完整新分配
+// 计入目标客户已有账单，总额不变、不重复收钱。记录一旦写入永不删除、不可
+// 撤销，可连续更正（每笔收款可多次转移归属）。原登记客户、总额、备注、
+// 首次分配及自动/显式登记身份永久保留，不因转移改写。归属更正与 bill
+// correct 的分配更正共用同一个更正标识命名空间，同一标识不得跨类型复用；
+// 每次归属更正占用一个账后全局序号。
+type ownershipTransfer struct {
+	ID             string              `json:"id"`
+	PaymentID      string              `json:"payment_id"`            // 目标收款标识
+	FromCustomerID string              `json:"from_customer_id"`      // 更正时的当前归属客户
+	ToCustomerID   string              `json:"to_customer_id"`        // 目标客户（须存在且异于当前归属客户）
+	Reason         string              `json:"reason"`                // 非空原因
+	Allocations    []paymentAllocation `json:"allocations"`           // 目标客户新分配，至少一项，月份不重复，按月份升序
+	Seq            int64               `json:"seq"`                   // 全局递增操作序号
+	CreatedAt      string              `json:"created_at"`
 }
 
 // planChange 是阶梯客户的一次按月生效的方案变更：自生效月（UTC 自然月，
@@ -294,7 +302,11 @@ type state struct {
 	Bills       map[string]*bill        `json:"bills"`             // 客户 + "|" + 月份 -> 账单
 	Adjustments map[string]*adjustment  `json:"adjustments"`       // 全局唯一调整标识 -> 记录
 	Payments    map[string]*payment     `json:"payments"`          // 全局唯一收款标识 -> 记录（与调整标识相互独立，可同名）
-	Corrections map[string]*correction  `json:"corrections"`       // 全局唯一更正标识 -> 记录（与收款、调整标识相互独立，可同名）
+	Corrections map[string]*correction  `json:"corrections"`       // 全局唯一更正标识 -> 分配更正记录（与归属更正共用标识命名空间，不可跨类型复用）
+	// OwnershipTransfers 以更正标识为键保存收款归属更正：整笔把收款的当前
+	// 最新分配从当前归属客户转移给另一客户。旧存档缺少本字段视为无归属更正。
+	// 记录永久保留、不可撤销；与 Corrections 的标识全局唯一且不可跨类型复用。
+	OwnershipTransfers map[string]*ownershipTransfer `json:"ownership_transfers,omitempty"`
 	Refunds     map[string]*refund      `json:"refunds,omitempty"` // 全局唯一退款标识 -> 记录（与收款、调整、更正标识相互独立，可同名；不可撤销）
 	PlanChanges map[string]*planChange  `json:"plan_changes"`      // 客户 + "|" + 生效月 -> 方案变更（按生效月递增追加，不可改写；撤销后原记录仍保留）
 	// PlanChangeRevocations 以客户与目标变更生效月为键保存方案变更撤销登记；
@@ -346,10 +358,11 @@ func loadStore(dir string) (*state, error) {
 	if err := s.validate(); err != nil {
 		return nil, fmt.Errorf("数据文件已损坏: %w", err)
 	}
-	// 旧版本数据文件没有 plans/adjustments/payments/corrections/refunds/
-	// plan_changes/suspensions/withdrawals/usage_corrections/terminations/
-	// next_seq 字段：视为零方案、零调整、零实收、零更正、零退款、零方案变更、
-	// 零暂停、零撤回、零用量更正（全部用量有效）、未终止。
+	// 旧版本数据文件没有 plans/adjustments/payments/corrections/
+	// ownership_transfers/refunds/plan_changes/suspensions/withdrawals/
+	// usage_corrections/terminations/next_seq 字段：视为零方案、零调整、
+	// 零实收、零更正、零归属更正、零退款、零方案变更、零暂停、零撤回、
+	// 零用量更正（全部用量有效）、未终止。
 	if s.Plans == nil {
 		s.Plans = map[string]*plan{}
 	}
@@ -361,6 +374,9 @@ func loadStore(dir string) (*state, error) {
 	}
 	if s.Corrections == nil {
 		s.Corrections = map[string]*correction{}
+	}
+	if s.OwnershipTransfers == nil {
+		s.OwnershipTransfers = map[string]*ownershipTransfer{}
 	}
 	if s.Refunds == nil {
 		s.Refunds = map[string]*refund{}
@@ -400,6 +416,7 @@ func newState(p string) *state {
 		Adjustments:           map[string]*adjustment{},
 		Payments:              map[string]*payment{},
 		Corrections:           map[string]*correction{},
+		OwnershipTransfers:    map[string]*ownershipTransfer{},
 		Refunds:               map[string]*refund{},
 		PlanChanges:           map[string]*planChange{},
 		PlanChangeRevocations: map[string]*planChangeRevocation{},
@@ -997,8 +1014,10 @@ func (s *state) validate() error {
 			return fmt.Errorf("收款 %q 未撤销但存在撤销信息", id)
 		}
 	}
-	// 分配更正记录：标识、目标收款、原因、新分配与序号都必须自洽。
-	// 更正标识与收款、调整标识命名空间相互独立，允许同名。
+	// 分配更正（bill correct）记录自洽校验：标识、目标收款、原因、新分配与
+	// 序号。分配更正只作用于更正发生时的归属客户，故新分配引用的账单按当时
+	// 归属核验；归属迁移、操作先后与逐步余额在后面的统一时间线核验中把关。
+	// 分配更正标识与归属更正标识共用同一个命名空间，不得跨类型复用。
 	for id, c := range s.Corrections {
 		if c == nil {
 			return fmt.Errorf("更正 %q 的数据为空", id)
@@ -1008,6 +1027,9 @@ func (s *state) validate() error {
 		}
 		if c.ID == "" {
 			return errors.New("存在空的更正标识")
+		}
+		if _, cross := s.OwnershipTransfers[id]; cross {
+			return fmt.Errorf("更正标识 %q 同时被分配更正与归属更正占用（更正标识不得跨类型复用）", id)
 		}
 		p, ok := s.Payments[c.PaymentID]
 		if !ok {
@@ -1019,6 +1041,7 @@ func (s *state) validate() error {
 		if len(c.Allocations) == 0 {
 			return fmt.Errorf("更正 %q 没有新分配", id)
 		}
+		owner := paymentOwnerAt(s, p, c.Seq)
 		seenMonths := make(map[string]bool)
 		var sum int64
 		for _, al := range c.Allocations {
@@ -1032,8 +1055,8 @@ func (s *state) validate() error {
 			if al.Amount <= 0 {
 				return fmt.Errorf("更正 %q 在 %s 的分配金额不是正整数", id, al.Month)
 			}
-			if _, ok := s.Bills[billKey(p.CustomerID, al.Month)]; !ok {
-				return fmt.Errorf("更正 %q 的分配引用了不存在的账单（客户 %s 月份 %s）", id, p.CustomerID, al.Month)
+			if _, ok := s.Bills[billKey(owner, al.Month)]; !ok {
+				return fmt.Errorf("更正 %q 的分配引用了不存在的账单（更正时归属客户 %s 月份 %s）", id, owner, al.Month)
 			}
 			var err error
 			sum, err = add64(sum, al.Amount)
@@ -1047,19 +1070,90 @@ func (s *state) validate() error {
 		if c.Seq <= p.Seq || c.Seq > s.NextSeq {
 			return fmt.Errorf("更正 %q 的操作序号越界", id)
 		}
-		if p.Revoked && c.Seq > p.RevokeSeq {
-			return fmt.Errorf("更正 %q 的操作序号晚于关联收款 %q 的撤销序号", id, c.PaymentID)
-		}
 		if prev, dup := seenSeq[c.Seq]; dup {
 			return fmt.Errorf("更正 %q 与 %q 的操作序号重复", id, prev)
 		}
 		seenSeq[c.Seq] = "更正 " + id
 	}
+	// 归属更正记录自洽校验：目标收款存在、原因非空、前后客户不同且均存在、
+	// FromCustomerID 必须是该序号发生时的当前归属客户、新分配非空、月份不
+	// 重复、均为正整数、引用目标客户已有账单、合计等于原总额，序号唯一且
+	// 晚于收款登记。归属转移的逐步余额与操作先后由统一时间线核验把关。
+	for id, t := range s.OwnershipTransfers {
+		if t == nil {
+			return fmt.Errorf("归属更正 %q 的数据为空", id)
+		}
+		if t.ID != id {
+			return fmt.Errorf("归属更正标识不一致: 键 %q / 记录 %q", id, t.ID)
+		}
+		if t.ID == "" {
+			return errors.New("存在空的归属更正标识")
+		}
+		if _, cross := s.Corrections[id]; cross {
+			return fmt.Errorf("更正标识 %q 同时被归属更正与分配更正占用（更正标识不得跨类型复用）", id)
+		}
+		p, ok := s.Payments[t.PaymentID]
+		if !ok {
+			return fmt.Errorf("归属更正 %q 引用了不存在的收款 %q", id, t.PaymentID)
+		}
+		if strings.TrimSpace(t.Reason) == "" {
+			return fmt.Errorf("归属更正 %q 的原因为空", id)
+		}
+		from, to := t.FromCustomerID, t.ToCustomerID
+		if _, ok := s.Customers[from]; !ok {
+			return fmt.Errorf("归属更正 %q 引用了不存在的原归属客户 %q", id, from)
+		}
+		if _, ok := s.Customers[to]; !ok {
+			return fmt.Errorf("归属更正 %q 引用了不存在的目标客户 %q", id, to)
+		}
+		if from == to {
+			return fmt.Errorf("归属更正 %q 的目标客户 %q 与当前归属客户相同", id, to)
+		}
+		if want := paymentOwnerAt(s, p, t.Seq); want != from {
+			return fmt.Errorf("归属更正 %q 的原归属客户 %q 与序号 %d 发生时的实际归属客户 %q 不符（归属链损坏）",
+				id, from, t.Seq, want)
+		}
+		if len(t.Allocations) == 0 {
+			return fmt.Errorf("归属更正 %q 没有新分配", id)
+		}
+		seenMonths := make(map[string]bool)
+		var sum int64
+		for _, al := range t.Allocations {
+			if !validMonth(al.Month) {
+				return fmt.Errorf("归属更正 %q 的分配月份 %q 无效", id, al.Month)
+			}
+			if seenMonths[al.Month] {
+				return fmt.Errorf("归属更正 %q 的分配月份 %s 重复", id, al.Month)
+			}
+			seenMonths[al.Month] = true
+			if al.Amount <= 0 {
+				return fmt.Errorf("归属更正 %q 在 %s 的分配金额不是正整数", id, al.Month)
+			}
+			if _, ok := s.Bills[billKey(to, al.Month)]; !ok {
+				return fmt.Errorf("归属更正 %q 的分配引用了不存在的账单（目标客户 %s 月份 %s）", id, to, al.Month)
+			}
+			var err error
+			sum, err = add64(sum, al.Amount)
+			if err != nil {
+				return fmt.Errorf("归属更正 %q 的分配金额汇总溢出: %w", id, err)
+			}
+		}
+		if sum != p.Total {
+			return fmt.Errorf("归属更正 %q 的分配合计 %d 分与关联收款 %q 的总额 %d 分不一致", id, sum, t.PaymentID, p.Total)
+		}
+		if t.Seq <= p.Seq || t.Seq > s.NextSeq {
+			return fmt.Errorf("归属更正 %q 的操作序号越界", id)
+		}
+		if prev, dup := seenSeq[t.Seq]; dup {
+			return fmt.Errorf("归属更正 %q 与 %q 的操作序号重复", id, prev)
+		}
+		seenSeq[t.Seq] = "归属更正 " + id
+	}
 	// 退款记录：标识、目标收款、原因、各月退款与序号都必须自洽。退款标识与
 	// 收款、调整、更正标识命名空间相互独立，允许同名。退款只作用于未撤销
-	// 收款的最新分配涉及的月份；首次退款后该收款不得再更正或整笔撤销，
-	// 因此全部退款都以当前最新分配为准核验，累计不得超退。旧文件缺少退款
-	// 记录视为无退款（Refunds 已在载入时补为空表）。
+	// 收款的最新分配涉及的月份；首次退款后该收款不得再做两类更正或整笔撤销，
+	// 因此全部退款都以当前最新分配为准核验，累计不得超退。操作先后与逐步
+	// 余额由统一时间线核验把关。旧文件缺少退款记录视为无退款。
 	for id, r := range s.Refunds {
 		if r == nil {
 			return fmt.Errorf("退款 %q 的数据为空", id)
@@ -1080,6 +1174,7 @@ func (s *state) validate() error {
 		if len(r.Allocations) == 0 {
 			return fmt.Errorf("退款 %q 没有月份金额清单", id)
 		}
+		currentOwner := paymentCurrentCustomer(s, p)
 		current := currentAllocations(s, p)
 		seenMonths := make(map[string]bool)
 		for _, al := range r.Allocations {
@@ -1093,6 +1188,9 @@ func (s *state) validate() error {
 			if al.Amount <= 0 {
 				return fmt.Errorf("退款 %q 在 %s 的金额不是正整数", id, al.Month)
 			}
+			if _, ok := s.Bills[billKey(currentOwner, al.Month)]; !ok {
+				return fmt.Errorf("退款 %q 的月份 %s 引用了不存在的账单（当前归属客户 %s）", id, al.Month, currentOwner)
+			}
 			if allocAmountFor(current, al.Month) <= 0 {
 				return fmt.Errorf("退款 %q 的月份 %s 不在收款 %q 的最新分配中（仅允许退最新分配涉及的月份）", id, al.Month, r.PaymentID)
 			}
@@ -1105,55 +1203,108 @@ func (s *state) validate() error {
 		}
 		seenSeq[r.Seq] = "退款 " + id
 	}
-	// 逐收款核验退款相关约束：已退款的收款不得被整笔撤销；首次退款后不得
-	// 再出现更正（最新分配已固定）；各月累计退款不得超过该笔在该月的最新
-	// 分配（累计超退即余额异常）。
+	// 逐收款核验操作先后合法性，并按全局序号回放每笔收款的完整时间线
+	// （登记 → 分配更正/归属更正 → 退款/整笔撤销）：
+	//   - 整笔撤销之后不得再出现两类更正；已退款的收款不得被整笔撤销；
+	//   - 首次退款之后不得再出现分配更正、归属更正或整笔撤销；
+	//   - 各月累计退款不得超过该笔在该月的最新分配（累计超退即余额异常）。
+	// 归属迁移后退款只可能作用于新归属客户的最新分配月份；旧月份分配为 0，
+	// 超退校验自然失败。逐步 0 ≤ 实收 ≤ 应付 的余额核验在随后的逐客户账后
+	// 流水回放中统一完成（与 ledger/reconcile 同一套推导）。
 	for pid, p := range s.Payments {
-		refs := refundsFor(s, pid)
-		if len(refs) == 0 {
-			continue
+		timeline, err := buildPaymentTimeline(s, p)
+		if err != nil {
+			return err
 		}
-		firstRefundSeq := refs[0].Seq // refundsFor 按序号升序
-		if p.Revoked {
-			return fmt.Errorf("收款 %q 已发生退款（首次退款序号 %d）却又被整笔撤销（序号 %d），操作先后非法", pid, firstRefundSeq, p.RevokeSeq)
-		}
-		for _, c := range s.Corrections {
-			if c.PaymentID == pid && c.Seq > firstRefundSeq {
-				return fmt.Errorf("更正 %q 的序号 %d 晚于收款 %q 的首次退款序号 %d（首次退款后最新分配已固定），操作先后非法", c.ID, c.Seq, pid, firstRefundSeq)
-			}
-		}
-		current := currentAllocations(s, p)
-		totals := make(map[string]int64)
-		for _, r := range refs {
-			for _, al := range r.Allocations {
-				sum, err := add64(totals[al.Month], al.Amount)
-				if err != nil {
-					return fmt.Errorf("收款 %q 在 %s 的累计退款溢出有符号 64 位整数范围，余额异常", pid, al.Month)
+		var firstRefundSeq int64
+		refunded := make(map[string]int64) // 月份 -> 累计退款（首次退款后分配固定）
+		for _, ev := range timeline {
+			switch ev.kind {
+			case ptRefund:
+				if firstRefundSeq == 0 || ev.seq < firstRefundSeq {
+					firstRefundSeq = ev.seq
 				}
-				totals[al.Month] = sum
-			}
-		}
-		for month, refunded := range totals {
-			if alloc := allocAmountFor(current, month); refunded > alloc {
-				return fmt.Errorf("收款 %q 在 %s 的累计退款 %d 分超过该月分配 %d 分（累计超退），余额异常", pid, month, refunded, alloc)
+				if p.Revoked && ev.seq > p.RevokeSeq {
+					return fmt.Errorf("收款 %q 在整笔撤销（序号 %d）之后发生退款 %q（序号 %d），操作先后非法",
+						pid, p.RevokeSeq, ev.id, ev.seq)
+				}
+				for _, al := range ev.allocs {
+					sum, err := add64(refunded[al.Month], al.Amount)
+					if err != nil {
+						return fmt.Errorf("收款 %q 在 %s 的累计退款溢出有符号 64 位整数范围，余额异常", pid, al.Month)
+					}
+					refunded[al.Month] = sum
+					alloc := allocAmountFor(ev.before, al.Month)
+					if alloc <= 0 {
+						return fmt.Errorf("退款 %q 的月份 %s 不在收款 %q 退款时的最新分配中（仅允许退当时最新分配涉及的月份），数据异常",
+							ev.id, al.Month, pid)
+					}
+					if sum > alloc {
+						return fmt.Errorf("收款 %q 在 %s 的累计退款 %d 分超过该月分配 %d 分（累计超退），余额异常",
+							pid, al.Month, sum, alloc)
+					}
+				}
+			case ptCorrection, ptTransfer:
+				if p.Revoked && ev.seq > p.RevokeSeq {
+					return fmt.Errorf("收款 %q 在整笔撤销（序号 %d）之后又出现更正 %q（序号 %d），操作先后非法",
+						pid, p.RevokeSeq, ev.id, ev.seq)
+				}
+				if firstRefundSeq != 0 && ev.seq > firstRefundSeq {
+					return fmt.Errorf("更正 %q 的序号 %d 晚于收款 %q 的首次退款序号 %d（首次退款后最新分配已固定），操作先后非法",
+						ev.id, ev.seq, pid, firstRefundSeq)
+				}
+			case ptRevoke:
+				if firstRefundSeq != 0 {
+					return fmt.Errorf("收款 %q 已发生退款（首次退款序号 %d）却又被整笔撤销（序号 %d），操作先后非法",
+						pid, firstRefundSeq, ev.seq)
+				}
 			}
 		}
 	}
-	// 每张账单：当前应付（原总金额 + 全部未撤销调整净额）必须介于
-	// 0 与有符号 64 位最大值之间；实收（全部未撤销收款按最新分配在该月
-	// 计入并扣除退款后的合计）必须满足 0 ≤ 实收 ≤ 当前应付。越界说明
-	// 金额与记录不一致。
-	for key, b := range s.Bills {
-		_, payable, err := billTotals(b, adjustmentsFor(s, b.CustomerID, b.Month))
+	// 逐客户核验余额：
+	//   - 每张账单的当前最终余额（当前应付区间、0 ≤ 实收 ≤ 应付）必须合法；
+	//   - 涉及归属迁移的客户额外按全局序号回放完整账后流水（与 bill ledger /
+	//     bill reconcile 同一套 postbill 推导），逐步核验每个事件之后都满足
+	//     0 ≤ 实收 ≤ 应付 ≤ 有符号 64 位最大值，截止序号之后的历史步骤也不
+	//     放过。归属转出/转入是跨账单的整笔迁移，最终余额合法不足以保证
+	//     迁移过程没有逐步越界；不含归属迁移的存档沿用最终余额核验（中间
+	//     步骤的异常由只读流水查询逐步核验拒绝）。
+	for custID := range s.Customers {
+		ops, err := postbillOps(s, custID)
 		if err != nil {
-			return fmt.Errorf("账单 %q 的调整金额与记录不一致: %w", key, err)
+			return err
 		}
-		received, err := paymentReceived(s, b.CustomerID, b.Month)
-		if err != nil {
-			return fmt.Errorf("账单 %q 的收款金额与记录不一致: %w", key, err)
+		hasTransfer := false
+		for _, op := range ops {
+			if op.kind == pbTransferOut || op.kind == pbTransferIn {
+				hasTransfer = true
+				break
+			}
 		}
-		if received > payable {
-			return fmt.Errorf("账单 %q 的实收 %d 分超过当前应付 %d 分", key, received, payable)
+		var bills []*bill
+		for _, b := range s.Bills {
+			if b.CustomerID == custID {
+				bills = append(bills, b)
+			}
+		}
+		if hasTransfer {
+			if _, err := verifyPostbillLedgers(ops, bills); err != nil {
+				return err
+			}
+			continue
+		}
+		for _, b := range bills {
+			received, err := paymentReceived(s, custID, b.Month)
+			if err != nil {
+				return fmt.Errorf("账单 %q 的收款金额与记录不一致: %w", billKey(custID, b.Month), err)
+			}
+			_, payable, err := billTotals(b, adjustmentsFor(s, custID, b.Month))
+			if err != nil {
+				return fmt.Errorf("账单 %q 的调整金额与记录不一致: %w", billKey(custID, b.Month), err)
+			}
+			if received > payable {
+				return fmt.Errorf("账单 %q 的实收 %d 分超过当前应付 %d 分", billKey(custID, b.Month), received, payable)
+			}
 		}
 	}
 	return nil
@@ -1495,11 +1646,12 @@ func adjustmentsFor(s *state, customerID, month string) []*adjustment {
 	return list
 }
 
-// correctionsFor 返回某收款的全部分配更正，按操作序号升序。
+// correctionsFor 返回某收款的全部分配更正（bill correct），按操作序号升序。
+// 载入校验可能在结构损坏的库上调用，nil 记录跳过（随后由结构校验报错）。
 func correctionsFor(s *state, paymentID string) []*correction {
 	var list []*correction
 	for _, c := range s.Corrections {
-		if c.PaymentID == paymentID {
+		if c != nil && c.PaymentID == paymentID {
 			list = append(list, c)
 		}
 	}
@@ -1507,17 +1659,148 @@ func correctionsFor(s *state, paymentID string) []*correction {
 	return list
 }
 
+// ownershipTransfersFor 返回某收款的全部归属更正，按操作序号升序。
+func ownershipTransfersFor(s *state, paymentID string) []*ownershipTransfer {
+	var list []*ownershipTransfer
+	for _, t := range s.OwnershipTransfers {
+		if t != nil && t.PaymentID == paymentID {
+			list = append(list, t)
+		}
+	}
+	sort.Slice(list, func(i, j int) bool { return list[i].Seq < list[j].Seq })
+	return list
+}
+
+// paymentTimelineEventKind 标识一笔收款时间线上的单个账后事件类型。
+type paymentTimelineEventKind string
+
+const (
+	ptPayment    paymentTimelineEventKind = "收款"
+	ptCorrection paymentTimelineEventKind = "更正"     // bill correct：同客户内分配更正
+	ptTransfer   paymentTimelineEventKind = "归属更正" // bill reassign：归属客户转移
+	ptRefund     paymentTimelineEventKind = "退款"
+	ptRevoke     paymentTimelineEventKind = "撤销收款"
+)
+
+// paymentTimelineEvent 是一笔收款按全局序号回放的单个事件。owner 为事件
+// 发生时（应用事件之前）的归属客户；before/after 分别为事件前后该收款生效
+// 的完整分配（退款事件不改变分配，二者相同；撤销事件 after 为 nil）。
+type paymentTimelineEvent struct {
+	seq    int64
+	kind   paymentTimelineEventKind
+	id     string
+	note   string
+	owner  string
+	to     string                   // 仅归属更正：目标客户
+	before []paymentAllocation      // 事件前分配
+	after  []paymentAllocation      // 事件后分配
+	allocs []paymentAllocation      // 退款事件：各月退款金额
+	linkSeq int64                   // 撤销事件关联的登记序号
+}
+
+// buildPaymentTimeline 按全局序号升序构建一笔收款从登记起的完整时间线：
+// 登记 → 分配更正/归属更正 → 退款 → 整笔撤销，逐事件推进当前归属客户与
+// 最新分配。归属更正的 FromCustomerID 与当时归属一致性已在载入校验中核验；
+// 退款与撤销不改变归属。
+func buildPaymentTimeline(s *state, p *payment) ([]paymentTimelineEvent, error) {
+	owner := p.CustomerID
+	running := p.Allocations
+	evs := []paymentTimelineEvent{{
+		seq: p.Seq, kind: ptPayment, id: p.ID, note: p.Note,
+		owner: owner, after: running,
+	}}
+	// 收集登记之后的全部事件并按序号回放。
+	var later []paymentTimelineEvent
+	for _, c := range correctionsFor(s, p.ID) {
+		later = append(later, paymentTimelineEvent{
+			seq: c.Seq, kind: ptCorrection, id: c.ID, note: c.Reason,
+			before: nil, after: c.Allocations,
+		})
+	}
+	for _, t := range ownershipTransfersFor(s, p.ID) {
+		later = append(later, paymentTimelineEvent{
+			seq: t.Seq, kind: ptTransfer, id: t.ID, note: t.Reason,
+			to: t.ToCustomerID, after: t.Allocations,
+		})
+	}
+	for _, r := range refundsFor(s, p.ID) {
+		later = append(later, paymentTimelineEvent{
+			seq: r.Seq, kind: ptRefund, id: r.ID, note: r.Reason,
+			allocs: r.Allocations,
+		})
+	}
+	if p.Revoked {
+		later = append(later, paymentTimelineEvent{
+			seq: p.RevokeSeq, kind: ptRevoke, id: p.ID, note: p.RevokeReason,
+			linkSeq: p.Seq,
+		})
+	}
+	sort.Slice(later, func(i, j int) bool { return later[i].seq < later[j].seq })
+	for i := range later {
+		ev := later[i]
+		ev.owner = owner
+		ev.before = running
+		switch ev.kind {
+		case ptCorrection:
+			running = ev.after
+		case ptTransfer:
+			owner = ev.to
+			running = ev.after
+		case ptRefund:
+			ev.after = running
+		case ptRevoke:
+			ev.after = nil
+		}
+		later[i] = ev
+		evs = append(evs, ev)
+	}
+	return evs, nil
+}
+
+// paymentOwnerAt 返回严格发生在 seq 之前的最后一个事件完成后收款的归属
+// 客户：即序号 seq 的事件发生时的当前归属客户。载入校验保证归属链自洽。
+func paymentOwnerAt(s *state, p *payment, seq int64) string {
+	evs, _ := buildPaymentTimeline(s, p)
+	owner := p.CustomerID
+	for _, ev := range evs {
+		if ev.seq >= seq {
+			break
+		}
+		if ev.kind == ptTransfer {
+			owner = ev.to
+		}
+	}
+	return owner
+}
+
+// paymentCurrentCustomer 返回收款当前归属客户（最后一次归属更正的目标
+// 客户；无归属更正时为首次登记客户）。退款与整笔撤销不改变归属。
+func paymentCurrentCustomer(s *state, p *payment) string {
+	var owner string = p.CustomerID
+	for _, t := range ownershipTransfersFor(s, p.ID) {
+		owner = t.ToCustomerID
+	}
+	return owner
+}
+
 // currentAllocations 返回一笔收款当前生效的分配：无更正时为首次登记的
-// 原始分配，否则为序号最大（最新）的更正的分配。
+// 原始分配，否则为序号最大（最新）的分配更正或归属更正携带的分配。归属
+// 更正携带的是目标客户账期上的新分配。载入校验可能遍历到 nil 记录，跳过。
 func currentAllocations(s *state, p *payment) []paymentAllocation {
-	var latest *correction
+	var latestSeq int64
+	var latest []paymentAllocation
 	for _, c := range s.Corrections {
-		if c.PaymentID == p.ID && (latest == nil || c.Seq > latest.Seq) {
-			latest = c
+		if c != nil && c.PaymentID == p.ID && c.Seq > latestSeq {
+			latestSeq, latest = c.Seq, c.Allocations
+		}
+	}
+	for _, t := range s.OwnershipTransfers {
+		if t != nil && t.PaymentID == p.ID && t.Seq > latestSeq {
+			latestSeq, latest = t.Seq, t.Allocations
 		}
 	}
 	if latest != nil {
-		return latest.Allocations
+		return latest
 	}
 	return p.Allocations
 }
@@ -1532,21 +1815,36 @@ func allocAmountFor(allocs []paymentAllocation, month string) int64 {
 	return 0
 }
 
-// paymentsEverFor 返回历史上曾涉及某客户某月账单的全部收款（首次登记
-// 分配或任一次更正的新分配涉及该月，即使后来被更正移出），按操作序号升序。
+// paymentsEverFor 返回历史上曾以某客户为归属时涉及该客户某月账单的全部
+// 收款（登记分配、任一次分配更正或归属更正的转入/转出涉及该月，即使后来
+// 被更正移出或整笔转移给其他客户），按操作序号升序。归属转移后，收款在
+// 旧客户一侧只保留历史，当前实收不再计入。
 func paymentsEverFor(s *state, customerID, month string) []*payment {
 	var list []*payment
 	for _, p := range s.Payments {
-		if p.CustomerID != customerID {
+		evs, err := buildPaymentTimeline(s, p)
+		if err != nil {
 			continue
 		}
-		involved := p.amountFor(month) > 0
-		if !involved {
-			for _, c := range s.Corrections {
-				if c.PaymentID == p.ID && allocAmountFor(c.Allocations, month) > 0 {
+		involved := false
+		for _, ev := range evs {
+			// 普通事件以发生前归属客户 ev.owner 判断；归属事件两侧分别
+			// 看转出前分配（ev.owner 一侧）与转入新分配（ev.to 一侧）。
+			if ev.kind == ptTransfer {
+				if (ev.owner == customerID && allocAmountFor(ev.before, month) > 0) ||
+					(ev.to == customerID && allocAmountFor(ev.after, month) > 0) {
 					involved = true
 					break
 				}
+				continue
+			}
+			if ev.owner != customerID {
+				continue
+			}
+			// 撤销事件不携带新分配，以前后分配判断曾涉及即可。
+			if allocAmountFor(ev.before, month) > 0 || allocAmountFor(ev.after, month) > 0 {
+				involved = true
+				break
 			}
 		}
 		if involved {
@@ -1557,13 +1855,13 @@ func paymentsEverFor(s *state, customerID, month string) []*payment {
 	return list
 }
 
-// paymentReceived 返回全部未撤销收款按最新分配在指定月份计入并扣除退款后
-// 的实收之和。各笔净额（分配减累计退款）均为非负整数，用非负 64 位加法
-// 累加，溢出时返回错误。
+// paymentReceived 返回当前归属为指定客户的全部未撤销收款，按最新分配在
+// 指定月份计入并扣除退款后的实收之和。归属已转出的收款不在此列；各笔净额
+// （分配减累计退款）均为非负整数，用非负 64 位加法累加，溢出时返回错误。
 func paymentReceived(s *state, customerID, month string) (int64, error) {
 	var received int64
 	for _, p := range s.Payments {
-		if p.CustomerID != customerID || p.Revoked {
+		if p.Revoked || paymentCurrentCustomer(s, p) != customerID {
 			continue
 		}
 		amt := allocAmountFor(currentAllocations(s, p), month) - refundedForMonth(s, p.ID, month)
@@ -1579,11 +1877,12 @@ func paymentReceived(s *state, customerID, month string) (int64, error) {
 	return received, nil
 }
 
-// refundsFor 返回某收款的全部退款，按操作序号升序。
+// refundsFor 返回某收款的全部退款，按操作序号升序。nil 记录跳过（载入
+// 校验时随后按结构损坏报错）。
 func refundsFor(s *state, paymentID string) []*refund {
 	var list []*refund
 	for _, r := range s.Refunds {
-		if r.PaymentID == paymentID {
+		if r != nil && r.PaymentID == paymentID {
 			list = append(list, r)
 		}
 	}
