@@ -109,6 +109,13 @@ func cmdUsageCorrect(dir, origID, newID, newCustomerID, newTimeText, qtyText, re
 		return fmt.Errorf("新用量属于客户 %s 的 %s（UTC 自然月），该月处于暂停区间（%s），暂停服务期间不接收用量，拒绝更正",
 			newCustomerID, newMonth, describeSuspension(s, newCustomerID, newMonth))
 	}
+	// 终止限制只约束更正替代记录的目标客户与目标 UTC 月份：目标月不早于
+	// 目标客户终止月时拒绝，原记录、替代标识及关联均不变；终止前未封账
+	// 用量仍可按原规则更正到其他客户。
+	if s.isTerminatedMonth(newCustomerID, newMonth) {
+		return fmt.Errorf("新用量属于客户 %s 的 %s（UTC 自然月），不早于该客户终止月 %s，订阅已终止不接收新用量，拒绝更正；原记录、替代标识及关联均不变",
+			newCustomerID, newMonth, s.Terminations[newCustomerID].Month)
+	}
 
 	// 单条从零计价预检：固定单价检查 数量×单价；阶梯客户按新时间换算的
 	// UTC 月份的有效方案计价，检查分段金额不溢出。月累计溢出仍由结算把关。

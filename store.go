@@ -247,6 +247,18 @@ type suspensionResume struct {
 	CreatedAt   string `json:"created_at"`
 }
 
+// termination 是阶梯客户的按月订阅终止登记：自终止月（UTC 自然月，含）起
+// 永久结束后续服务——不接收新用量、不结算、不封账、不收月费、不生成零金额
+// 账单，终止前月份仍按原规则补结算，历史账务全部保留。每客户只能登记一次，
+// 记录永久保留、不可修改或撤销，客户标识不能复用；终止不产生账后流水事件，
+// 也不占用全局操作序号。固定单价客户不适用终止。
+type termination struct {
+	CustomerID string `json:"customer_id"`
+	Month      string `json:"month"` // YYYY-MM（UTC），终止月（含），与操作当天无关
+	Reason     string `json:"reason"`
+	CreatedAt  string `json:"created_at"`
+}
+
 // withdrawal 是一条用量记录的撤回标记：原记录（客户、时间、数量、标识）永久
 // 保留在 Usage 中，撤回只追加状态与原因，用于纠正误导入的记录。撤回不可恢复、
 // 标识不可复用；已撤回用量不参与结算、方案变更预检与暂停区间冲突检查，但相同
@@ -297,7 +309,10 @@ type state struct {
 	// UsageCorrections 以原用量标识为键保存用量更正关联；原记录同时在
 	// Withdrawals 中按更正原因标记撤回。旧存档缺少本字段视为无更正。
 	UsageCorrections map[string]*usageCorrection `json:"usage_corrections,omitempty"`
-	NextSeq          int64                       `json:"next_seq"` // 已分配的最大操作序号（调整/收款/更正/退款及其撤销共用；方案变更、暂停、用量撤回与用量更正不占用）
+	// Terminations 以客户标识为键保存按月订阅终止登记；每客户至多一条，
+	// 永久保留、不可修改或撤销。旧存档缺少本字段视为未终止。
+	Terminations map[string]*termination `json:"terminations,omitempty"`
+	NextSeq      int64                   `json:"next_seq"` // 已分配的最大操作序号（调整/收款/更正/退款及其撤销共用；方案变更、暂停、用量撤回与用量更正不占用）
 	path             string                      `json:"-"`
 }
 
@@ -332,9 +347,9 @@ func loadStore(dir string) (*state, error) {
 		return nil, fmt.Errorf("数据文件已损坏: %w", err)
 	}
 	// 旧版本数据文件没有 plans/adjustments/payments/corrections/refunds/
-	// plan_changes/suspensions/withdrawals/usage_corrections/next_seq 字段：
-	// 视为零方案、零调整、零实收、零更正、零退款、零方案变更、零暂停、
-	// 零撤回、零用量更正（全部用量有效）。
+	// plan_changes/suspensions/withdrawals/usage_corrections/terminations/
+	// next_seq 字段：视为零方案、零调整、零实收、零更正、零退款、零方案变更、
+	// 零暂停、零撤回、零用量更正（全部用量有效）、未终止。
 	if s.Plans == nil {
 		s.Plans = map[string]*plan{}
 	}
@@ -368,6 +383,9 @@ func loadStore(dir string) (*state, error) {
 	if s.UsageCorrections == nil {
 		s.UsageCorrections = map[string]*usageCorrection{}
 	}
+	if s.Terminations == nil {
+		s.Terminations = map[string]*termination{}
+	}
 	s.path = p
 	return &s, nil
 }
@@ -389,6 +407,7 @@ func newState(p string) *state {
 		SuspensionResumes:     map[string]*suspensionResume{},
 		Withdrawals:           map[string]*withdrawal{},
 		UsageCorrections:      map[string]*usageCorrection{},
+		Terminations:          map[string]*termination{},
 		path:                  p,
 	}
 }
@@ -809,6 +828,48 @@ func (s *state) validate() error {
 					return fmt.Errorf("客户 %s 在暂停有效区间 %s..%s（不含结束月）内存在账单（月份 %s），暂停月不得封账",
 						customerID, su.StartMonth, effEnd, b.Month)
 				}
+			}
+		}
+	}
+
+	// 按月订阅终止登记：键即客户标识；客户必须存在且为绑定阶梯方案的客户
+	// （固定单价客户不适用终止）；终止月必须是合法的 YYYY-MM；原因非空。
+	// 终止月（含）起不得存在有效（未撤回）用量或账单——已撤回用量与保留的
+	// 方案变更、暂停及提前恢复安排正常读取，不参与本检查。旧文件缺少终止
+	// 记录视为未终止（Terminations 已在载入时补为空表）。
+	for key, tm := range s.Terminations {
+		if tm == nil {
+			return fmt.Errorf("订阅终止 %q 的数据为空", key)
+		}
+		if tm.CustomerID != key {
+			return fmt.Errorf("订阅终止键不一致: 键 %q / 客户 %q", key, tm.CustomerID)
+		}
+		c, ok := s.Customers[tm.CustomerID]
+		if !ok {
+			return fmt.Errorf("订阅终止 %q 引用了不存在的客户 %q", key, tm.CustomerID)
+		}
+		if c.PlanID == "" {
+			return fmt.Errorf("订阅终止 %q 的客户 %q 未绑定阶梯方案（固定单价客户不适用终止）", key, tm.CustomerID)
+		}
+		if !validMonth(tm.Month) {
+			return fmt.Errorf("订阅终止 %q 的终止月无效（必须是 YYYY-MM）", key)
+		}
+		if strings.TrimSpace(tm.Reason) == "" {
+			return fmt.Errorf("订阅终止 %q 的原因为空", key)
+		}
+		for _, u := range s.Usage {
+			if _, withdrawn := s.Withdrawals[u.ID]; withdrawn {
+				continue
+			}
+			if u.CustomerID == tm.CustomerID && utcMonth(u.Time) >= tm.Month {
+				return fmt.Errorf("客户 %s 的终止月 %s 及之后存在有效用量 %q（%s），终止月起不接收新用量",
+					tm.CustomerID, tm.Month, u.ID, utcMonth(u.Time))
+			}
+		}
+		for _, b := range s.Bills {
+			if b.CustomerID == tm.CustomerID && b.Month >= tm.Month {
+				return fmt.Errorf("客户 %s 的终止月 %s 及之后存在账单（月份 %s），终止月起不结算、不封账",
+					tm.CustomerID, tm.Month, b.Month)
 			}
 		}
 	}
@@ -1340,6 +1401,21 @@ func (s *state) isSuspendedMonth(customerID, month string) bool {
 		}
 	}
 	return false
+}
+
+// terminationOf 返回某客户的按月订阅终止登记；未登记时返回 nil。
+// 终止以客户标识识别，每客户至多一条。
+func (s *state) terminationOf(customerID string) *termination {
+	return s.Terminations[customerID]
+}
+
+// isTerminatedMonth 报告某客户的指定 UTC 自然月是否不早于其终止月：自终止月
+// （含）起永久结束后续服务，不接收新用量、不结算、不封账、不收月费。未登记
+// 终止时全部月份正常服务。终止限制与暂停、提前恢复相互独立：任何安排都不能
+// 越过终止边界恢复服务。
+func (s *state) isTerminatedMonth(customerID, month string) bool {
+	tm := s.Terminations[customerID]
+	return tm != nil && month >= tm.Month
 }
 
 // planChangesFor 返回某客户的全部方案变更，按生效月升序。
