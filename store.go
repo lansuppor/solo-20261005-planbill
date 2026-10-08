@@ -93,6 +93,48 @@ type bill struct {
 	CreatedAt  string     `json:"created_at"`
 }
 
+// settlementDraft 是单客户单 UTC 自然月账期的结算草案：创建时按当时有效
+// 的固定单价或阶梯方案（含月费）与有效用量完整计价，保存计费输入、方案
+// 规则、逐条及跨档明细、数量和金额的不可变快照；草案不生成账单、不封账、
+// 不占账后序号，也不限制后续用量、方案或生命周期操作。以全局草案标识判重：
+// 同客户同月份的相同重放返回原快照，不重新计算、不写盘；内容不同拒绝。
+//
+// 确认时以确认时状态重新计价，并与快照逐项比对（方案、月费及规则、有效
+// 用量的标识、解析后的时间点和数量、明细与金额，不能仅比较总额）；全部
+// 一致才生成与快照一致的正式账单并封账，同时把草案置为已确认并永久关联
+// 账单，三项一次原子保存。快照永久保留、不可改写；待确认草案因后续操作
+// 过时是合法状态，确认时拒绝即可。
+type settlementDraft struct {
+	ID         string          `json:"id"`                        // 全局唯一草案标识，非空
+	CustomerID string          `json:"customer_id"`               // 客户标识
+	Month      string          `json:"month"`                     // YYYY-MM（UTC 自然月）
+	UsageRefs  []draftUsageRef `json:"usage_refs"`                // 计费输入快照：参与计价的全部有效用量（计价顺序）
+	UnitPrice  int64           `json:"unit_price_fen,omitempty"`  // 固定单价快照；阶梯草案恒为 0
+	Pricing    string          `json:"pricing,omitempty"`         // 空或 fixed 为固定单价；tiered 为阶梯计费
+	PlanID     string          `json:"plan_id,omitempty"`         // 阶梯草案：当月有效方案标识
+	PlanName   string          `json:"plan_name,omitempty"`       // 阶梯草案：方案名称（快照）
+	PlanTiers  []tier          `json:"plan_tiers,omitempty"`      // 阶梯草案：完整方案规则（快照）
+	MonthlyFee int64           `json:"monthly_fee_fen,omitempty"` // 阶梯草案：有效方案固定月费快照
+	TierTotals []tierTotal     `json:"tier_totals,omitempty"`     // 阶梯草案：各档数量与金额合计
+	Lines      []billLine      `json:"lines"`                     // 逐条明细（阶梯含跨档分段）
+	TotalQty   int64           `json:"total_quantity"`            // 数量快照
+	TotalFee   int64           `json:"total_fee_fen"`             // 金额快照：月费加全月用量费
+	CreatedAt  string          `json:"created_at"`
+	// 确认状态：未确认时以下字段均为零值；确认成功时账单、封账与确认状态在
+	// 同一次原子保存中落盘，BillID 永久关联生成的正式账单。
+	Confirmed   bool   `json:"confirmed,omitempty"`
+	ConfirmedAt string `json:"confirmed_at,omitempty"`
+	BillID      string `json:"bill_id,omitempty"`
+}
+
+// draftUsageRef 是草案计费输入中一条有效用量的身份与数量快照：用量标识、
+// 解析后的时间点（以 RFC3339 原文保存，比较时按瞬间判定）与数量。
+type draftUsageRef struct {
+	UsageID  string `json:"usage_id"`
+	Time     string `json:"time"` // RFC3339；Z 与 +00:00 等同一瞬间写法等价
+	Quantity int64  `json:"quantity"`
+}
+
 // adjustment 是对已结算账单的一次费用调整（正数补收、负数减免）。
 // 记录一旦写入永不删除；撤销只是追加撤销信息，保留原记录。
 type adjustment struct {
@@ -326,8 +368,11 @@ type state struct {
 	// Terminations 以客户标识为键保存按月订阅终止登记；每客户至多一条，
 	// 永久保留、不可修改或撤销。旧存档缺少本字段视为未终止。
 	Terminations map[string]*termination `json:"terminations,omitempty"`
-	NextSeq      int64                   `json:"next_seq"` // 已分配的最大操作序号（调整/收款/更正/退款及其撤销共用；方案变更、暂停、用量撤回与用量更正不占用）
-	path         string                  `json:"-"`
+	// Drafts 以全局草案标识为键保存结算草案；快照永久保留、不可改写，
+	// 确认状态只允许从待确认一次变为已确认。旧存档缺少本字段视为无草案。
+	Drafts  map[string]*settlementDraft `json:"drafts,omitempty"`
+	NextSeq int64                       `json:"next_seq"` // 已分配的最大操作序号（调整/收款/更正/退款及其撤销共用；方案变更、暂停、用量撤回、用量更正与结算草案不占用）
+	path    string                      `json:"-"`
 }
 
 // loadStore 读取数据目录；目录不存在时按需创建并视为空库。
@@ -400,6 +445,9 @@ func loadStore(dir string) (*state, error) {
 	if s.Terminations == nil {
 		s.Terminations = map[string]*termination{}
 	}
+	if s.Drafts == nil {
+		s.Drafts = map[string]*settlementDraft{}
+	}
 	s.path = p
 	return &s, nil
 }
@@ -422,6 +470,7 @@ func newState(p string) *state {
 		Withdrawals:           map[string]*withdrawal{},
 		UsageCorrections:      map[string]*usageCorrection{},
 		Terminations:          map[string]*termination{},
+		Drafts:                map[string]*settlementDraft{},
 		path:                  p,
 	}
 }
@@ -1206,6 +1255,12 @@ func (s *state) validate() error {
 		if received > payable {
 			return fmt.Errorf("账单 %q 的实收 %d 分超过当前应付 %d 分", key, received, payable)
 		}
+	}
+	// 结算草案：引用不得缺失，快照计价必须自洽；已确认草案关联账单的客户、
+	// 月份及计费快照必须与正式账单一致。待确认草案因后续用量、方案或生命
+	// 周期操作过时是合法状态，不在此处判错。旧存档缺少草案字段视为无草案。
+	if err := s.validateDrafts(); err != nil {
+		return err
 	}
 	return nil
 }
