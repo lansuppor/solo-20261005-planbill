@@ -68,7 +68,7 @@ func runCmd(args []string, dataDir string) error {
 
 	case "plan":
 		if len(args) < 2 {
-			return usageError("缺少子命令，应为：plan add|add-fee|show|list|change|schedule ...")
+			return usageError("缺少子命令，应为：plan add|add-fee|show|list|change|revoke|schedule ...")
 		}
 		switch args[1] {
 		case "add":
@@ -96,6 +96,11 @@ func runCmd(args []string, dataDir string) error {
 				return usageError("用法：plan change <客户标识> <YYYY-MM> <方案标识> <原因>")
 			}
 			return cmdPlanChange(dataDir, args[2], args[3], args[4], args[5])
+		case "revoke":
+			if len(args) != 5 {
+				return usageError("用法：plan revoke <客户标识> <目标变更生效月 YYYY-MM> <原因>")
+			}
+			return cmdPlanRevoke(dataDir, args[2], args[3], args[4])
 		case "schedule":
 			if len(args) != 3 && len(args) != 4 {
 				return usageError("用法：plan schedule <客户标识> [YYYY-MM]")
@@ -106,7 +111,7 @@ func runCmd(args []string, dataDir string) error {
 			}
 			return cmdPlanSchedule(dataDir, args[2], month, hasMonth)
 		default:
-			return usageError("未知 plan 子命令 %q；可用：add、add-fee、show、list、change、schedule", args[1])
+			return usageError("未知 plan 子命令 %q；可用：add、add-fee、show、list、change、revoke、schedule", args[1])
 		}
 
 	case "usage":

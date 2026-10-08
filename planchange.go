@@ -43,6 +43,15 @@ func cmdPlanChange(dir, customerID, month, planID, reason string) error {
 		// 原记录，不重复生效——即使后来追加了变更或相关月份已封账；
 		// 同一项内容不同则拒绝，已有变更不可改写。
 		if existing.PlanID == planID && existing.Reason == reason {
+			if rv, revoked := s.PlanChangeRevokes[key]; revoked {
+				// 已撤销变更的相同重放仍返回原记录与已撤销状态，不能恢复安排；
+				// 撤销后该月按撤销时确定的当前安排计价。
+				fmt.Fprintf(stdout, "客户 %s 在 %s 的方案变更已存在且内容相同，但该变更已撤销（撤销原因 %q）：返回原记录与已撤销状态，不恢复安排、不写盘：\n\n",
+					customerID, month, rv.Reason)
+				printPlanChange(existing, s)
+				fmt.Fprintf(stdout, "当前状态：已撤销（撤销原因：%s；撤销不可撤销，重放不恢复安排）\n", rv.Reason)
+				return nil
+			}
 			fmt.Fprintf(stdout, "客户 %s 在 %s 的方案变更已存在且内容相同，返回原记录（不重复生效）：\n\n", customerID, month)
 			printPlanChange(existing, s)
 			return nil
@@ -51,10 +60,11 @@ func cmdPlanChange(dir, customerID, month, planID, reason string) error {
 			customerID, month, existing.PlanID, existing.Reason)
 	}
 
-	// 新变更只能按生效月递增追加。
-	for _, ch := range s.PlanChanges {
-		if ch.CustomerID == customerID && ch.Month >= month {
-			return fmt.Errorf("客户 %s 已存在生效月 %s 的变更，新生效月 %s 必须更晚（新变更只能按生效月递增追加）",
+	// 新变更只能按生效月递增追加：已撤销变更仍占用其生效月（原客户月份不能
+	// 复用），新生效月必须晚于该客户全部已登记变更（包括已撤销项）的月份。
+	for _, ch := range s.planChangesFor(customerID) {
+		if ch.Month >= month {
+			return fmt.Errorf("客户 %s 已存在生效月 %s 的变更（含已撤销变更，原客户月份不能复用），新生效月 %s 必须更晚（新变更只能按生效月递增追加）",
 				customerID, ch.Month, month)
 		}
 	}
@@ -145,11 +155,18 @@ func cmdPlanSchedule(dir, customerID, month string, hasMonth bool) error {
 	if len(changes) == 0 {
 		fmt.Fprintln(stdout, "方案变更：无")
 	} else {
-		fmt.Fprintln(stdout, "方案变更（按生效月升序）：")
+		fmt.Fprintln(stdout, "方案变更（按生效月升序；原内容与原因永久保留，另展示撤销状态与原因）：")
 		for i, ch := range changes {
 			p := s.Plans[ch.PlanID] // 载入时已校验存在
-			fmt.Fprintf(stdout, "  %d. 自 %s 起改用 %s（%s）：月费 %d 分，规则 %s，原因：%s\n",
-				i+1, ch.Month, p.ID, p.Name, p.MonthlyFee, formatTiers(p.Tiers), ch.Reason)
+			if rv, revoked := s.PlanChangeRevokes[planChangeKey(ch.CustomerID, ch.Month)]; revoked {
+				// 已撤销变更仍按生效月列出原目标方案与原因，但不参与有效方案；
+				// 撤销原因永久保留、不可撤销。
+				fmt.Fprintf(stdout, "  %d. 自 %s 起改用 %s（%s）：月费 %d 分，规则 %s，原因：%s［已撤销（撤销原因：%s，不参与有效方案）］\n",
+					i+1, ch.Month, p.ID, p.Name, p.MonthlyFee, formatTiers(p.Tiers), ch.Reason, rv.Reason)
+			} else {
+				fmt.Fprintf(stdout, "  %d. 自 %s 起改用 %s（%s）：月费 %d 分，规则 %s，原因：%s\n",
+					i+1, ch.Month, p.ID, p.Name, p.MonthlyFee, formatTiers(p.Tiers), ch.Reason)
+			}
 		}
 	}
 	if hasMonth {

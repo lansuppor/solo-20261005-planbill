@@ -206,6 +206,20 @@ type planChange struct {
 	CreatedAt  string `json:"created_at"`
 }
 
+// planChangeRevoke 是一项方案变更的撤销登记：以客户与目标变更的生效月共同
+// 标识，撤销自该生效月起误登记的价格安排。目标变更的原内容（目标方案、原因
+// 与登记时间）永久保留在 PlanChanges 中，撤销只在此追加撤销状态与原因；撤销
+// 记录一旦写入永不修改、不可撤销，每项变更只能撤销一次。撤销不产生账后流水
+// 事件，也不占用全局操作序号。有效方案只考虑未撤销变更：撤销后自目标生效月
+// 起沿用此前最后一项未撤销变更的方案（无则用初始方案），直到其后下一项未
+// 撤销变更的生效月前；没有后一项则覆盖之后所有月份。
+type planChangeRevoke struct {
+	CustomerID string `json:"customer_id"`
+	Month      string `json:"month"`  // YYYY-MM（UTC），目标变更的生效月
+	Reason     string `json:"reason"` // 撤销原因，非空
+	CreatedAt  string `json:"created_at"`
+}
+
 // suspension 是阶梯客户的一段按月暂停区间：自起月（UTC 自然月，含）起
 // 暂停服务，直到结束月（不含），即 [StartMonth, EndMonth) 覆盖的自然月。
 // 暂停月不接收用量、不产生月费账单；区间可相接（相接视为连续暂停）但不得
@@ -262,15 +276,18 @@ type usageCorrection struct {
 type state struct {
 	Version     int                     `json:"version"`
 	Customers   map[string]*customer    `json:"customers"`
-	Plans       map[string]*plan        `json:"plans"`                 // 全局唯一方案标识 -> 阶梯计费方案
-	Usage       map[string]*usageRecord `json:"usage"`                 // 全局唯一用量标识 -> 记录
-	Bills       map[string]*bill        `json:"bills"`                 // 客户 + "|" + 月份 -> 账单
-	Adjustments map[string]*adjustment  `json:"adjustments"`           // 全局唯一调整标识 -> 记录
-	Payments    map[string]*payment     `json:"payments"`              // 全局唯一收款标识 -> 记录（与调整标识相互独立，可同名）
-	Corrections map[string]*correction  `json:"corrections"`           // 全局唯一更正标识 -> 记录（与收款、调整标识相互独立，可同名）
-	Refunds     map[string]*refund      `json:"refunds,omitempty"`     // 全局唯一退款标识 -> 记录（与收款、调整、更正标识相互独立，可同名；不可撤销）
-	PlanChanges map[string]*planChange  `json:"plan_changes"`          // 客户 + "|" + 生效月 -> 方案变更（按生效月递增追加，不可改写）
-	Suspensions map[string]*suspension  `json:"suspensions,omitempty"` // 客户 + "|" + 起月 -> 暂停区间（原区间与原因不可改写）
+	Plans       map[string]*plan        `json:"plans"`             // 全局唯一方案标识 -> 阶梯计费方案
+	Usage       map[string]*usageRecord `json:"usage"`             // 全局唯一用量标识 -> 记录
+	Bills       map[string]*bill        `json:"bills"`             // 客户 + "|" + 月份 -> 账单
+	Adjustments map[string]*adjustment  `json:"adjustments"`       // 全局唯一调整标识 -> 记录
+	Payments    map[string]*payment     `json:"payments"`          // 全局唯一收款标识 -> 记录（与调整标识相互独立，可同名）
+	Corrections map[string]*correction  `json:"corrections"`       // 全局唯一更正标识 -> 记录（与收款、调整标识相互独立，可同名）
+	Refunds     map[string]*refund      `json:"refunds,omitempty"` // 全局唯一退款标识 -> 记录（与收款、调整、更正标识相互独立，可同名；不可撤销）
+	PlanChanges map[string]*planChange  `json:"plan_changes"`      // 客户 + "|" + 生效月 -> 方案变更（按生效月递增追加，不可改写）
+	// PlanChangeRevokes 以客户与目标变更生效月为键保存方案变更的撤销登记；
+	// 目标变更仍永久保留在 PlanChanges 中。旧存档缺少本字段时全部变更视为有效。
+	PlanChangeRevokes map[string]*planChangeRevoke `json:"plan_change_revokes,omitempty"`
+	Suspensions       map[string]*suspension       `json:"suspensions,omitempty"` // 客户 + "|" + 起月 -> 暂停区间（原区间与原因不可改写）
 	// SuspensionResumes 以客户与原起月为键保存暂停的提前恢复登记；旧存档
 	// 缺少本字段时暂停沿用原区间。恢复记录永久保留、不可改写或撤销。
 	SuspensionResumes map[string]*suspensionResume `json:"suspension_resumes,omitempty"`
@@ -313,9 +330,9 @@ func loadStore(dir string) (*state, error) {
 		return nil, fmt.Errorf("数据文件已损坏: %w", err)
 	}
 	// 旧版本数据文件没有 plans/adjustments/payments/corrections/refunds/
-	// plan_changes/suspensions/withdrawals/usage_corrections/next_seq 字段：
-	// 视为零方案、零调整、零实收、零更正、零退款、零方案变更、零暂停、
-	// 零撤回、零用量更正（全部用量有效）。
+	// plan_changes/plan_change_revokes/suspensions/withdrawals/usage_corrections/
+	// next_seq 字段：视为零方案、零调整、零实收、零更正、零退款、零方案变更、
+	// 零方案变更撤销（全部变更有效）、零暂停、零撤回、零用量更正（全部用量有效）。
 	if s.Plans == nil {
 		s.Plans = map[string]*plan{}
 	}
@@ -333,6 +350,9 @@ func loadStore(dir string) (*state, error) {
 	}
 	if s.PlanChanges == nil {
 		s.PlanChanges = map[string]*planChange{}
+	}
+	if s.PlanChangeRevokes == nil {
+		s.PlanChangeRevokes = map[string]*planChangeRevoke{}
 	}
 	if s.Suspensions == nil {
 		s.Suspensions = map[string]*suspension{}
@@ -362,6 +382,7 @@ func newState(p string) *state {
 		Corrections:       map[string]*correction{},
 		Refunds:           map[string]*refund{},
 		PlanChanges:       map[string]*planChange{},
+		PlanChangeRevokes: map[string]*planChangeRevoke{},
 		Suspensions:       map[string]*suspension{},
 		SuspensionResumes: map[string]*suspensionResume{},
 		Withdrawals:       map[string]*withdrawal{},
@@ -432,6 +453,28 @@ func (s *state) validate() error {
 		}
 		if strings.TrimSpace(ch.Reason) == "" {
 			return fmt.Errorf("方案变更 %q 的原因为空", key)
+		}
+	}
+	// 方案变更撤销记录：键与客户/生效月一致；引用的目标变更必须存在（撤销
+	// 引用失效即损坏）；撤销原因非空。目标变更的原内容仍按上面的规则完整
+	// 校验，撤销不删除或改写原变更。旧文件缺少撤销记录视为全部变更有效
+	// （PlanChangeRevokes 已在载入时补为空表）。撤销后账单是否符合有效安排
+	// 在下面的阶梯账单校验中通过 effectivePlanID（跳过已撤销变更）核验。
+	for key, rv := range s.PlanChangeRevokes {
+		if rv == nil {
+			return fmt.Errorf("方案变更撤销 %q 的数据为空", key)
+		}
+		if planChangeKey(rv.CustomerID, rv.Month) != key {
+			return fmt.Errorf("方案变更撤销键不一致: 键 %q / 客户月份 %s|%s", key, rv.CustomerID, rv.Month)
+		}
+		if _, ok := s.PlanChanges[key]; !ok {
+			return fmt.Errorf("方案变更撤销 %q 引用了不存在的方案变更（客户 %q 生效月 %q，撤销目标失效）", key, rv.CustomerID, rv.Month)
+		}
+		if !validMonth(rv.Month) {
+			return fmt.Errorf("方案变更撤销 %q 的生效月无效", key)
+		}
+		if strings.TrimSpace(rv.Reason) == "" {
+			return fmt.Errorf("方案变更撤销 %q 的原因为空", key)
 		}
 	}
 	for id, u := range s.Usage {
@@ -1296,7 +1339,7 @@ func (s *state) isSuspendedMonth(customerID, month string) bool {
 	return false
 }
 
-// planChangesFor 返回某客户的全部方案变更，按生效月升序。
+// planChangesFor 返回某客户的全部方案变更（含已撤销），按生效月升序。
 func (s *state) planChangesFor(customerID string) []*planChange {
 	var list []*planChange
 	for _, ch := range s.PlanChanges {
@@ -1308,13 +1351,36 @@ func (s *state) planChangesFor(customerID string) []*planChange {
 	return list
 }
 
-// effectivePlanID 返回客户在某 UTC 自然月实际适用的阶梯方案标识：
-// 创建时绑定的初始方案，被生效月不晚于该月的最后一次变更替换。
+// isPlanChangeRevoked 报告某项方案变更（以客户与生效月标识）是否已撤销。
+// 有效方案、导入预检与结算只考虑未撤销变更；原变更记录仍永久保留。
+func (s *state) isPlanChangeRevoked(customerID, month string) bool {
+	_, ok := s.PlanChangeRevokes[planChangeKey(customerID, month)]
+	return ok
+}
+
+// activePlanChangesFor 返回某客户的全部未撤销方案变更，按生效月升序。
+func (s *state) activePlanChangesFor(customerID string) []*planChange {
+	var list []*planChange
+	for _, ch := range s.PlanChanges {
+		if ch.CustomerID == customerID && !s.isPlanChangeRevoked(ch.CustomerID, ch.Month) {
+			list = append(list, ch)
+		}
+	}
+	sort.Slice(list, func(i, j int) bool { return list[i].Month < list[j].Month })
+	return list
+}
+
+// effectivePlanID 返回客户在某 UTC 自然月实际适用的阶梯方案标识：创建时
+// 绑定的初始方案，被生效月不晚于该月的最后一次未撤销变更替换；已撤销变更
+// 不参与，撤销后沿用此前最后一项未撤销变更的方案，无则用初始方案。
 func (s *state) effectivePlanID(cust *customer, month string) string {
 	planID := cust.PlanID
 	latest := ""
 	for _, ch := range s.PlanChanges {
-		if ch.CustomerID == cust.ID && ch.Month <= month && ch.Month >= latest {
+		if ch.CustomerID != cust.ID || s.isPlanChangeRevoked(ch.CustomerID, ch.Month) {
+			continue
+		}
+		if ch.Month <= month && ch.Month >= latest {
 			latest = ch.Month
 			planID = ch.PlanID
 		}
