@@ -43,12 +43,19 @@ func cmdPlanChange(dir, customerID, month, planID, reason string) error {
 		// 原记录，不重复生效——即使后来追加了变更或相关月份已封账；
 		// 同一项内容不同则拒绝，已有变更不可改写。
 		if existing.PlanID == planID && existing.Reason == reason {
+			if rv, revoked := s.PlanChangeRevocations[key]; revoked {
+				// 原 plan change 的相同重放，在变更已撤销后仍返回其已撤销
+				// 状态，不能恢复安排；原内容与撤销记录都永久保留。
+				fmt.Fprintf(stdout, "客户 %s 在 %s 的方案变更已存在且内容相同，但该变更已撤销，返回已撤销状态（不恢复安排、不写盘）：\n\n", customerID, month)
+				printPlanRevocation(s, rv, existing)
+				return nil
+			}
 			fmt.Fprintf(stdout, "客户 %s 在 %s 的方案变更已存在且内容相同，返回原记录（不重复生效）：\n\n", customerID, month)
 			printPlanChange(existing, s)
 			return nil
 		}
-		return fmt.Errorf("客户 %s 在 %s 已登记方案变更（目标方案 %q，原因 %q），内容不同，已有变更不可改写",
-			customerID, month, existing.PlanID, existing.Reason)
+		return fmt.Errorf("客户 %s 在 %s 已登记方案变更（目标方案 %q，原因 %q%s），内容不同，已有变更不可改写",
+			customerID, month, existing.PlanID, existing.Reason, planChangeStatusSuffix(s, key))
 	}
 
 	// 新变更只能按生效月递增追加。
@@ -145,16 +152,25 @@ func cmdPlanSchedule(dir, customerID, month string, hasMonth bool) error {
 	if len(changes) == 0 {
 		fmt.Fprintln(stdout, "方案变更：无")
 	} else {
-		fmt.Fprintln(stdout, "方案变更（按生效月升序）：")
+		fmt.Fprintln(stdout, "方案变更（按生效月升序；原变更内容与原因永久保留，另展示撤销状态与原因；有效方案只考虑未撤销变更）：")
 		for i, ch := range changes {
 			p := s.Plans[ch.PlanID] // 载入时已校验存在
-			fmt.Fprintf(stdout, "  %d. 自 %s 起改用 %s（%s）：月费 %d 分，规则 %s，原因：%s\n",
-				i+1, ch.Month, p.ID, p.Name, p.MonthlyFee, formatTiers(p.Tiers), ch.Reason)
+			fmt.Fprintf(stdout, "  %d. 自 %s 起改用 %s（%s）：月费 %d 分，规则 %s，原因：%s%s\n",
+				i+1, ch.Month, p.ID, p.Name, p.MonthlyFee, formatTiers(p.Tiers), ch.Reason, planChangeStatusSuffix(s, planChangeKey(ch.CustomerID, ch.Month)))
 		}
 	}
 	if hasMonth {
 		p := s.Plans[s.effectivePlanID(cust, month)] // 载入时已校验存在
-		fmt.Fprintf(stdout, "月份 %s 的有效方案：%s（%s）：月费 %d 分，规则 %s\n", month, p.ID, p.Name, p.MonthlyFee, formatTiers(p.Tiers))
+		fmt.Fprintf(stdout, "月份 %s 的有效方案：%s（%s）：月费 %d 分，规则 %s（只考虑未撤销变更后的实际有效方案）\n", month, p.ID, p.Name, p.MonthlyFee, formatTiers(p.Tiers))
 	}
 	return nil
+}
+
+// planChangeStatusSuffix 返回一项方案变更当前撤销状态的可读后缀：已撤销时
+// 追加撤销状态与原因；未撤销时为空。
+func planChangeStatusSuffix(s *state, key string) string {
+	if rv, ok := s.PlanChangeRevocations[key]; ok {
+		return fmt.Sprintf("，当前状态：已撤销（撤销原因：%s；撤销不可撤销，原客户月份不可复用）", rv.Reason)
+	}
+	return ""
 }
