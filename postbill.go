@@ -36,6 +36,7 @@ const (
 	pbAdjustRevoke  = "撤销调整"
 	pbPayment       = "收款"
 	pbCorrection    = "更正"
+	pbReassign      = "归属更正"
 	pbPaymentRevoke = "撤销收款"
 	pbRefund        = "退款"
 )
@@ -51,14 +52,18 @@ type postbillEffect struct {
 }
 
 // postbillOp 是一笔已保存账后业务在共享计算中的统一表示：调整、撤销调整、
-// 收款、分配更正、撤销收款或退款。effects 给出该操作涉及各账期的金额影响：
+// 收款、分配更正、归属更正、撤销收款或退款。effects 给出该操作涉及各账期的
+// 金额影响：
 //
 //   - 调整/撤销调整：只含所属账期一项应付影响；
-//   - 收款：按登记时分配，每个分配月份一项实收影响；
-//   - 更正：以前后分配并集的每个月份一项实收影响（含前后均为 0 时不会
+//   - 收款：按登记时归属客户与分配，每个分配月份一项实收影响；
+//   - 分配更正：以前后分配并集的每个月份一项实收影响（含前后均为 0 时不会
 //     出现的月份被跳过；前后都涉及但金额相同的月份保留零差额明细）；
-//   - 撤销收款：撤销当时最新分配的每个月份一项实收影响；
-//   - 退款：每个退款月份一项实收影响。
+//   - 归属更正：在同一序号把实收从原归属客户账单整笔转出（负）并计入目标
+//     客户账单（正）；转出侧 effects 的 month 属于 fromCustomer，转入侧属于
+//     toCustomer，整笔合计为 0；
+//   - 撤销收款：撤销当时最新归属客户的最新分配的每个月份一项实收影响；
+//   - 退款：退款发生时归属客户的每个退款月份一项实收影响。
 type postbillOp struct {
 	seq      int64
 	kind     string
@@ -67,7 +72,12 @@ type postbillOp struct {
 	linkSeq  int64  // 撤销事件关联的原操作序号；非撤销为 0
 	payID    string // 收款自身标识；更正/退款/撤销收款：关联收款标识
 	payTotal int64  // 收款类操作：汇款总额（仅展示用，不计入范围内实收）
-	effects  []postbillEffect
+	// 归属更正专用：reassign 为 true，fromCustomer/toCustomer 分别是转出侧
+	// （更正发生时当前归属客户）与转入侧（目标客户）。
+	reassign     bool
+	fromCustomer string
+	toCustomer   string
+	effects      []postbillEffect
 }
 
 // postbillOps 构建一个客户的全部账后操作，按全局操作序号升序返回。同一全局
@@ -102,47 +112,84 @@ func postbillOps(s *state, customerID string) ([]postbillOp, error) {
 		}
 	}
 
+	// 收款相关操作按“当时归属”回放：收款可能经归属更正在客户间整笔转移，
+	// 因此不能只遍历首次登记客户。对每笔收款沿更正链维护当时归属客户与当时
+	// 生效分配，只把与查询客户相关的一侧加入其操作列表；归属更正在转出客户
+	// 与转入客户两侧各生成一条同一序号的操作（金额符号相反，整笔合计为 0），
+	// 截止后的转移因此不会提前出现在任一侧。
 	for _, p := range s.Payments {
-		if p.CustomerID != customerID {
-			continue
-		}
-		// 收款按登记时分配计入实收；多月汇款在每个分配月份各有一项影响，
-		// 调用方按账期筛选时只取本账期/范围内月份，不重复累加汇款总额。
-		op := postbillOp{
-			seq: p.Seq, kind: pbPayment, refID: p.ID, note: p.Note,
-			payID: p.ID, payTotal: p.Total,
-		}
-		for _, al := range p.Allocations {
-			op.effects = append(op.effects, postbillEffect{
-				month: al.Month, deltaReceived: al.Amount, alloc: al.Amount,
-			})
-		}
-		ops = append(ops, op)
-
-		// 以登记分配为起点按序号回放更正：每次更正按发生时的前后分配计算
-		// 影响。running 始终是该更正发生前生效的分配。
-		running := p.Allocations
-		for _, c := range correctionsFor(s, p.ID) {
-			cop := postbillOp{
-				seq: c.Seq, kind: pbCorrection, refID: c.ID, note: c.Reason,
+		// 收款登记只属于首次登记客户；归属更正不改写首次登记身份。
+		if p.CustomerID == customerID {
+			op := postbillOp{
+				seq: p.Seq, kind: pbPayment, refID: p.ID, note: p.Note,
 				payID: p.ID, payTotal: p.Total,
 			}
-			for _, m := range unionMonths(running, c.Allocations) {
-				b4, af := allocAmountFor(running, m), allocAmountFor(c.Allocations, m)
-				if b4 == 0 && af == 0 {
-					continue
-				}
-				cop.effects = append(cop.effects, postbillEffect{
-					month: m, deltaReceived: af - b4, beforeAlloc: b4, afterAlloc: af,
+			for _, al := range p.Allocations {
+				op.effects = append(op.effects, postbillEffect{
+					month: al.Month, deltaReceived: al.Amount, alloc: al.Amount,
 				})
 			}
-			ops = append(ops, cop)
+			ops = append(ops, op)
+		}
+
+		// 以登记分配与首次归属为起点，按序号回放该收款的全部更正。
+		owner := p.CustomerID
+		running := p.Allocations
+		for _, c := range correctionsFor(s, p.ID) {
+			switch {
+			case c.Reassign && owner == customerID:
+				// 转出侧：整笔撤去当前归属客户的最新分配。
+				cop := postbillOp{
+					seq: c.Seq, kind: pbReassign, refID: c.ID, note: c.Reason,
+					payID: p.ID, payTotal: p.Total, reassign: true,
+					fromCustomer: owner, toCustomer: c.TargetCustomerID,
+				}
+				for _, al := range running {
+					cop.effects = append(cop.effects, postbillEffect{
+						month: al.Month, deltaReceived: -al.Amount, alloc: al.Amount,
+						beforeAlloc: al.Amount, afterAlloc: 0,
+					})
+				}
+				ops = append(ops, cop)
+			case c.Reassign && c.TargetCustomerID == customerID:
+				// 转入侧：整笔计入目标客户的新分配。
+				cop := postbillOp{
+					seq: c.Seq, kind: pbReassign, refID: c.ID, note: c.Reason,
+					payID: p.ID, payTotal: p.Total, reassign: true,
+					fromCustomer: owner, toCustomer: c.TargetCustomerID,
+				}
+				for _, al := range c.Allocations {
+					cop.effects = append(cop.effects, postbillEffect{
+						month: al.Month, deltaReceived: al.Amount, alloc: al.Amount,
+						beforeAlloc: 0, afterAlloc: al.Amount,
+					})
+				}
+				ops = append(ops, cop)
+			case !c.Reassign && owner == customerID:
+				// 同客户分配更正：按发生时前后分配计算影响。
+				cop := postbillOp{
+					seq: c.Seq, kind: pbCorrection, refID: c.ID, note: c.Reason,
+					payID: p.ID, payTotal: p.Total,
+				}
+				for _, m := range unionMonths(running, c.Allocations) {
+					b4, af := allocAmountFor(running, m), allocAmountFor(c.Allocations, m)
+					if b4 == 0 && af == 0 {
+						continue
+					}
+					cop.effects = append(cop.effects, postbillEffect{
+						month: m, deltaReceived: af - b4, beforeAlloc: b4, afterAlloc: af,
+					})
+				}
+				ops = append(ops, cop)
+			}
+			if c.Reassign {
+				owner = c.TargetCustomerID
+			}
 			running = c.Allocations
 		}
 
-		// 撤销取消的是撤销发生时的最新分配（running 即回放全部更正后的
-		// 分配；更正序号均先于撤销序号）。
-		if p.Revoked {
+		// 撤销取消的是撤销发生时最新归属客户的最新分配。
+		if p.Revoked && owner == customerID {
 			rop := postbillOp{
 				seq: p.RevokeSeq, kind: pbPaymentRevoke, refID: p.ID, note: p.RevokeReason,
 				linkSeq: p.Seq, payID: p.ID, payTotal: p.Total,
@@ -155,9 +202,12 @@ func postbillOps(s *state, customerID string) ([]postbillOp, error) {
 			ops = append(ops, rop)
 		}
 
-		// 退款只减少对应月实收、不可撤销；退款月份必属于最新分配。
-		// 跨月退款是一次操作，多个月份的影响合并在同一条目下。
+		// 退款只减少退款发生时归属客户的对应月实收、不可撤销；退款月份必
+		// 属于当时最新分配。跨月退款是一次操作，多个月份的影响合并在同一条目。
 		for _, r := range refundsFor(s, p.ID) {
+			if paymentOwnerAt(s, p, r.Seq) != customerID {
+				continue
+			}
 			rop := postbillOp{
 				seq: r.Seq, kind: pbRefund, refID: r.ID, note: r.Reason,
 				payID: p.ID, payTotal: p.Total,
@@ -230,6 +280,18 @@ func postbillLedger(ops []postbillOp, b *bill) []ledgerEvent {
 				deltaReceived: e.deltaReceived, note: op.note, payID: op.payID,
 				beforeAlloc: e.beforeAlloc, afterAlloc: e.afterAlloc,
 			})
+		case pbReassign:
+			e, ok := effectFor(op, b.Month)
+			if !ok {
+				continue
+			}
+			events = append(events, ledgerEvent{
+				seq: op.seq, kind: op.kind, refID: op.refID,
+				deltaReceived: e.deltaReceived, note: op.note, payID: op.payID,
+				payTotal:     op.payTotal,
+				fromCustomer: op.fromCustomer, toCustomer: op.toCustomer,
+				beforeAlloc: e.beforeAlloc, afterAlloc: e.afterAlloc,
+			})
 		case pbPaymentRevoke:
 			// 曾涉及该账单的收款（登记分配或任一次更正的新分配曾落在本
 			// 月）即使在撤销时已被更正移出，也保留零金额撤销事件。
@@ -261,15 +323,16 @@ func postbillLedger(ops []postbillOp, b *bill) []ledgerEvent {
 	return events
 }
 
-// paymentEverTouched 报告某收款是否曾在登记或任一次更正中把分配落到指定
-// 账期（即使后来被更正移出）。零金额撤销事件的保留只依据“曾经涉及”。
+// paymentEverTouched 报告某收款是否曾在登记、任一次分配更正或归属更正转入中
+// 把分配落到指定账期（即使后来被更正移出或整笔转出）。零金额撤销事件的保留
+// 只依据“曾经涉及”。
 func paymentEverTouched(ops []postbillOp, payID, month string) bool {
 	for _, op := range ops {
 		if op.payID != payID {
 			continue
 		}
 		switch op.kind {
-		case pbPayment, pbCorrection:
+		case pbPayment, pbCorrection, pbReassign:
 			if _, ok := effectFor(op, month); ok {
 				return true
 			}
@@ -362,6 +425,7 @@ func postbillRangeEvents(ops []postbillOp, startMonth, endMonth string, startSeq
 		out = append(out, reconEvent{
 			seq: op.seq, kind: op.kind, refID: op.refID, note: op.note,
 			linkSeq: op.linkSeq, payTotal: op.payTotal, payID: op.payID,
+			fromCustomer: op.fromCustomer, toCustomer: op.toCustomer,
 			changes: changes,
 		})
 	}

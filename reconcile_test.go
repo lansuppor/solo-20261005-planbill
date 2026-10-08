@@ -386,8 +386,8 @@ func TestReconcileOldFormatPayment(t *testing.T) {
 
 func TestReconcileCorruptLedgerRejected(t *testing.T) {
 	h := newHarness(t)
-	// 最终余额合法但中间步骤越界（序号 2 之后实收 500 > 应付 0）：
-	// 即使查询终点在异常之前也拒绝，不输出部分报表。
+	// 最终余额合法但中间步骤越界（序号 2 之后实收 500 > 应付 0）：载入时的
+	// 逐步回放即拒绝，即使查询终点在异常序号之前也无法读取，存档保持不变。
 	h.writeFile("state.json", `{
   "version": 1,
   "customers": {"c1": {"id": "c1", "name": "甲方", "price_fen": 100}},
@@ -412,11 +412,15 @@ func TestReconcileCorruptLedgerRejected(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	// 终点在异常序号之前同样拒绝。
-	if msg := h.runExpectErr("bill", "reconcile", "c1", "2026-01", "2026-01", "0", "1"); !strings.Contains(msg, "数据异常") {
-		t.Fatalf("中间越界应按数据异常拒绝：%s", msg)
+	// 载入即拒绝：终点在异常之前或最新都失败。
+	for _, args := range [][]string{
+		{"bill", "reconcile", "c1", "2026-01", "2026-01", "0", "1"},
+		{"bill", "reconcile", "c1", "2026-01", "2026-01"},
+	} {
+		if msg := h.runExpectErr(args...); !strings.Contains(msg, "数据文件已损坏") {
+			t.Fatalf("args=%v 中间越界应按数据文件损坏拒绝：%s", args, msg)
+		}
 	}
-	h.runExpectErr("bill", "reconcile", "c1", "2026-01", "2026-01")
 	// 失败不改写存档。
 	after, err := os.ReadFile(h.statePath())
 	if err != nil {

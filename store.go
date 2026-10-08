@@ -168,17 +168,31 @@ func (p *payment) amountFor(month string) int64 {
 	return 0
 }
 
-// correction 是对一笔未撤销收款的分配更正：客户、总额、备注、原账单及
-// 应付不变，仅把该笔收款当前生效的分配整体替换为完整新分配。记录一旦写入
-// 永不删除；首次登记内容永久保留，bill pay / bill remit 仍按原始分配判重，
-// 更正不影响收款身份。可连续更正，每次以当时最新分配为起点。
+// correction 是对一笔未撤销收款的一次更正登记，分两类：
+//
+//   - 分配更正（Reassign 为 false）：客户、总额、备注、原账单及应付不变，
+//     仅把该笔收款当前生效的分配整体替换为完整新分配。记录一旦写入永不
+//     删除；首次登记内容永久保留，bill pay / bill remit 仍按原始分配判重，
+//     更正不影响收款身份。可连续更正，每次以当时最新分配为起点。
+//   - 收款客户归属更正（Reassign 为 true，bill reassign）：把整笔实收从
+//     当前归属客户转移到另一个已存在客户，不重复收钱。当前客户最新分配
+//     整笔撤去，计入目标客户的新分配（Allocations）；原登记客户、总额、
+//     备注、首次分配及自动或显式登记身份不改写，收款 CustomerID 仍为首次
+//     登记客户。记录永久保留、不可撤销，可连续更正（包括再次归属更正）。
+//
+// 两类更正共用全局唯一更正标识：同一标识不可跨类型复用。
 type correction struct {
 	ID          string              `json:"id"`
 	PaymentID   string              `json:"payment_id"` // 目标收款标识
 	Reason      string              `json:"reason"`
 	Allocations []paymentAllocation `json:"allocations"` // 完整新分配，至少一项，月份不重复，按月份升序保存
-	Seq         int64               `json:"seq"`         // 全局递增操作序号，与调整/收款及其撤销共用
-	CreatedAt   string              `json:"created_at"`
+	// Reassign 为 true 表示这是一笔收款客户归属更正：Allocations 的月份
+	// 属于目标客户 TargetCustomerID（异于更正发生时的当前归属客户）；
+	// false（含旧存档缺字段）表示同客户分配更正，月份属于收款当前归属客户。
+	Reassign         bool   `json:"reassign,omitempty"`
+	TargetCustomerID string `json:"target_customer_id,omitempty"` // 归属更正的目标客户标识；仅 Reassign 为 true 时非空
+	Seq              int64  `json:"seq"`                          // 全局递增操作序号，与调整/收款及其撤销共用
+	CreatedAt        string `json:"created_at"`
 }
 
 // refund 是对一笔已登记收款的部分退款登记：从该收款当前最新分配涉及的
@@ -313,7 +327,7 @@ type state struct {
 	// 永久保留、不可修改或撤销。旧存档缺少本字段视为未终止。
 	Terminations map[string]*termination `json:"terminations,omitempty"`
 	NextSeq      int64                   `json:"next_seq"` // 已分配的最大操作序号（调整/收款/更正/退款及其撤销共用；方案变更、暂停、用量撤回与用量更正不占用）
-	path             string                      `json:"-"`
+	path         string                  `json:"-"`
 }
 
 // loadStore 读取数据目录；目录不存在时按需创建并视为空库。
@@ -997,8 +1011,11 @@ func (s *state) validate() error {
 			return fmt.Errorf("收款 %q 未撤销但存在撤销信息", id)
 		}
 	}
-	// 分配更正记录：标识、目标收款、原因、新分配与序号都必须自洽。
-	// 更正标识与收款、调整标识命名空间相互独立，允许同名。
+	// 分配更正与归属更正记录：标识、目标收款、原因、新分配与序号都必须自洽。
+	// 两类更正共用全局唯一更正标识（map 键保证），不可跨类型复用；允许与收款、
+	// 调整标识同名。分配更正的月份须属于更正发生时（序号前一状态）当前归属
+	// 客户的已存在账单；归属更正的目标客户须存在且异于当前归属客户，月份须
+	// 属于目标客户的已存在账单。归属时间线与逐步余额在本循环之后统一回放核验。
 	for id, c := range s.Corrections {
 		if c == nil {
 			return fmt.Errorf("更正 %q 的数据为空", id)
@@ -1019,6 +1036,27 @@ func (s *state) validate() error {
 		if len(c.Allocations) == 0 {
 			return fmt.Errorf("更正 %q 没有新分配", id)
 		}
+		// 归属更正必须带目标客户；分配更正不得带目标客户。
+		if c.Reassign {
+			if c.TargetCustomerID == "" {
+				return fmt.Errorf("归属更正 %q 缺少目标客户", id)
+			}
+			if _, ok := s.Customers[c.TargetCustomerID]; !ok {
+				return fmt.Errorf("归属更正 %q 引用了不存在的目标客户 %q", id, c.TargetCustomerID)
+			}
+		} else if c.TargetCustomerID != "" {
+			return fmt.Errorf("分配更正 %q 携带了目标客户 %q（仅归属更正允许转移客户）", id, c.TargetCustomerID)
+		}
+		// 更正发生时（序号前一状态）收款的归属客户；归属更正的目标必须异于
+		// 该客户，分配月份按更正类型归属到对应客户的已存在账单。
+		ownerBefore := paymentOwnerAt(s, p, c.Seq-1)
+		allocCustomer := ownerBefore
+		if c.Reassign {
+			if c.TargetCustomerID == ownerBefore {
+				return fmt.Errorf("归属更正 %q 的目标客户 %q 与收款 %q 当前归属客户相同，不得自我归属更正", id, c.TargetCustomerID, c.PaymentID)
+			}
+			allocCustomer = c.TargetCustomerID
+		}
 		seenMonths := make(map[string]bool)
 		var sum int64
 		for _, al := range c.Allocations {
@@ -1032,8 +1070,8 @@ func (s *state) validate() error {
 			if al.Amount <= 0 {
 				return fmt.Errorf("更正 %q 在 %s 的分配金额不是正整数", id, al.Month)
 			}
-			if _, ok := s.Bills[billKey(p.CustomerID, al.Month)]; !ok {
-				return fmt.Errorf("更正 %q 的分配引用了不存在的账单（客户 %s 月份 %s）", id, p.CustomerID, al.Month)
+			if _, ok := s.Bills[billKey(allocCustomer, al.Month)]; !ok {
+				return fmt.Errorf("更正 %q 的分配引用了不存在的账单（客户 %s 月份 %s）", id, allocCustomer, al.Month)
 			}
 			var err error
 			sum, err = add64(sum, al.Amount)
@@ -1106,8 +1144,8 @@ func (s *state) validate() error {
 		seenSeq[r.Seq] = "退款 " + id
 	}
 	// 逐收款核验退款相关约束：已退款的收款不得被整笔撤销；首次退款后不得
-	// 再出现更正（最新分配已固定）；各月累计退款不得超过该笔在该月的最新
-	// 分配（累计超退即余额异常）。
+	// 再出现任何更正（分配更正与归属更正都禁止，最新分配已固定）；各月累计
+	// 退款不得超过该笔在该月的最新分配（累计超退即余额异常）。
 	for pid, p := range s.Payments {
 		refs := refundsFor(s, pid)
 		if len(refs) == 0 {
@@ -1119,7 +1157,12 @@ func (s *state) validate() error {
 		}
 		for _, c := range s.Corrections {
 			if c.PaymentID == pid && c.Seq > firstRefundSeq {
-				return fmt.Errorf("更正 %q 的序号 %d 晚于收款 %q 的首次退款序号 %d（首次退款后最新分配已固定），操作先后非法", c.ID, c.Seq, pid, firstRefundSeq)
+				kind := "分配更正"
+				if c.Reassign {
+					kind = "归属更正"
+				}
+				return fmt.Errorf("%s %q 的序号 %d 晚于收款 %q 的首次退款序号 %d（首次退款后最新分配已固定，两类更正均禁止新增），操作先后非法",
+					kind, c.ID, c.Seq, pid, firstRefundSeq)
 			}
 		}
 		current := currentAllocations(s, p)
@@ -1139,10 +1182,18 @@ func (s *state) validate() error {
 			}
 		}
 	}
+	// 逐步回放全部账后操作，核验每张被触及账单在每一步之后都满足
+	// 0 ≤ 实收 ≤ 应付 ≤ 有符号 64 位最大值——归属更正把实收从原客户账单整笔
+	// 转出、计入目标客户账单，两侧都必须在迁移发生序号即合法；只核验最终余额
+	// 会放过中间越界的存档。截止后的迁移不提前影响历史余额也在此体现：每个
+	// 序号只回放该序号以前（含）的操作。
+	if err := s.validatePostbillTimeline(); err != nil {
+		return err
+	}
 	// 每张账单：当前应付（原总金额 + 全部未撤销调整净额）必须介于
-	// 0 与有符号 64 位最大值之间；实收（全部未撤销收款按最新分配在该月
-	// 计入并扣除退款后的合计）必须满足 0 ≤ 实收 ≤ 当前应付。越界说明
-	// 金额与记录不一致。
+	// 0 与有符号 64 位最大值之间；实收（当前归属本客户的全部未撤销收款按
+	// 最新分配在该月计入并扣除退款后的合计）必须满足 0 ≤ 实收 ≤ 当前应付。
+	// 越界说明金额与记录不一致。
 	for key, b := range s.Bills {
 		_, payable, err := billTotals(b, adjustmentsFor(s, b.CustomerID, b.Month))
 		if err != nil {
@@ -1154,6 +1205,195 @@ func (s *state) validate() error {
 		}
 		if received > payable {
 			return fmt.Errorf("账单 %q 的实收 %d 分超过当前应付 %d 分", key, received, payable)
+		}
+	}
+	return nil
+}
+
+// tvDelta 是一次账后操作对一张账单的应付/实收增量（分，带符号）。
+type tvDelta struct {
+	payable  int64
+	received int64
+}
+
+// validatePostbillTimeline 按全局操作序号逐步回放全部账后操作（调整及其撤销、
+// 收款登记、两类更正、收款撤销与退款），核验每张被触及账单在每一步之后都
+// 满足 0 ≤ 实收 ≤ 应付 ≤ 有符号 64 位最大值。归属更正在其发生序号把实收
+// 从原归属客户账单整笔转出（负增量）并计入目标客户账单（正增量），两侧在
+// 同一序号都必须合法；截止后的迁移因此不会提前影响较早序号的余额。任一
+// 中间步骤越界、溢出或回放终态与当前推导不一致，都按数据损坏拒绝。
+func (s *state) validatePostbillTimeline() error {
+	type tvEvent struct {
+		seq    int64
+		desc   string
+		deltas map[string]tvDelta // billKey -> 增量
+	}
+	var events []tvEvent
+	addDelta := func(ev *tvEvent, key string, dpay, drecv int64) error {
+		cur := ev.deltas[key]
+		if dpay != 0 {
+			v, err := addSigned64(cur.payable, dpay)
+			if err != nil {
+				return fmt.Errorf("操作序号 %d（%s）之后应付越出有符号 64 位整数范围，余额异常", ev.seq, ev.desc)
+			}
+			cur.payable = v
+		}
+		if drecv != 0 {
+			v, err := addSigned64(cur.received, drecv)
+			if err != nil {
+				return fmt.Errorf("操作序号 %d（%s）之后实收越出有符号 64 位整数范围，余额异常", ev.seq, ev.desc)
+			}
+			cur.received = v
+		}
+		ev.deltas[key] = cur
+		return nil
+	}
+
+	// 调整及其撤销只改所属账期应付。
+	for _, a := range s.Adjustments {
+		ev := tvEvent{seq: a.Seq, desc: "调整 " + a.ID, deltas: map[string]tvDelta{}}
+		if err := addDelta(&ev, billKey(a.CustomerID, a.Month), a.Amount, 0); err != nil {
+			return err
+		}
+		events = append(events, ev)
+		if a.Revoked {
+			neg, err := neg64(a.Amount)
+			if err != nil {
+				return fmt.Errorf("调整 %q 的金额 %d 分无法抵消（越界），余额异常", a.ID, a.Amount)
+			}
+			rev := tvEvent{seq: a.RevokeSeq, desc: "撤销调整 " + a.ID, deltas: map[string]tvDelta{}}
+			if err := addDelta(&rev, billKey(a.CustomerID, a.Month), neg, 0); err != nil {
+				return err
+			}
+			events = append(events, rev)
+		}
+	}
+
+	for _, p := range s.Payments {
+		// 收款登记：按首次登记客户与首次分配增加对应账期实收。
+		reg := tvEvent{seq: p.Seq, desc: "收款 " + p.ID, deltas: map[string]tvDelta{}}
+		for _, al := range p.Allocations {
+			if err := addDelta(&reg, billKey(p.CustomerID, al.Month), 0, al.Amount); err != nil {
+				return err
+			}
+		}
+		events = append(events, reg)
+
+		// 沿更正链回放：分配更正只在同客户账单间替换；归属更正在同一序号
+		// 从原归属客户账单整笔转出、计入目标客户账单。
+		owner := p.CustomerID
+		running := p.Allocations
+		for _, c := range correctionsFor(s, p.ID) {
+			ev := tvEvent{seq: c.Seq, deltas: map[string]tvDelta{}}
+			if c.Reassign {
+				ev.desc = "归属更正 " + c.ID
+			} else {
+				ev.desc = "更正 " + c.ID
+			}
+			for _, m := range unionMonths(running, c.Allocations) {
+				oldAmt, newAmt := allocAmountFor(running, m), allocAmountFor(c.Allocations, m)
+				if oldAmt > 0 {
+					if err := addDelta(&ev, billKey(owner, m), 0, -oldAmt); err != nil {
+						return err
+					}
+				}
+				if newAmt > 0 {
+					target := owner
+					if c.Reassign {
+						target = c.TargetCustomerID
+					}
+					if err := addDelta(&ev, billKey(target, m), 0, newAmt); err != nil {
+						return err
+					}
+				}
+			}
+			events = append(events, ev)
+			if c.Reassign {
+				owner = c.TargetCustomerID
+			}
+			running = c.Allocations
+		}
+
+		// 整笔撤销取消撤销发生时最新归属客户的最新分配。
+		if p.Revoked {
+			rev := tvEvent{seq: p.RevokeSeq, desc: "撤销收款 " + p.ID, deltas: map[string]tvDelta{}}
+			for _, al := range running {
+				if err := addDelta(&rev, billKey(owner, al.Month), 0, -al.Amount); err != nil {
+					return err
+				}
+			}
+			events = append(events, rev)
+		}
+
+		// 退款只减少退款发生时归属客户的对应月实收。
+		for _, r := range refundsFor(s, p.ID) {
+			ownerAt := paymentOwnerAt(s, p, r.Seq)
+			ev := tvEvent{seq: r.Seq, desc: "退款 " + r.ID, deltas: map[string]tvDelta{}}
+			for _, al := range r.Allocations {
+				if err := addDelta(&ev, billKey(ownerAt, al.Month), 0, -al.Amount); err != nil {
+					return err
+				}
+			}
+			events = append(events, ev)
+		}
+	}
+
+	sort.Slice(events, func(i, j int) bool { return events[i].seq < events[j].seq })
+
+	payable := make(map[string]int64, len(s.Bills))
+	received := make(map[string]int64, len(s.Bills))
+	for key, b := range s.Bills {
+		payable[key] = b.TotalFee
+		received[key] = 0
+	}
+	for _, ev := range events {
+		// 同一事件先累加应付再累加实收，并在每张被触及账单上校验边界。
+		for key, d := range ev.deltas {
+			if _, ok := payable[key]; !ok {
+				return fmt.Errorf("操作序号 %d（%s）引用了不存在的账单 %s（引用缺失）", ev.seq, ev.desc, key)
+			}
+			if d.payable != 0 {
+				v, err := addSigned64(payable[key], d.payable)
+				if err != nil {
+					return fmt.Errorf("操作序号 %d（%s）之后应付越出有符号 64 位整数范围，余额异常", ev.seq, ev.desc)
+				}
+				payable[key] = v
+			}
+		}
+		for key, d := range ev.deltas {
+			if d.received != 0 {
+				v, err := addSigned64(received[key], d.received)
+				if err != nil {
+					return fmt.Errorf("操作序号 %d（%s）之后实收越出有符号 64 位整数范围，余额异常", ev.seq, ev.desc)
+				}
+				received[key] = v
+			}
+			if payable[key] < 0 {
+				return fmt.Errorf("操作序号 %d（%s）之后账单 %s 应付为 %d 分（小于 0），逐步余额越界", ev.seq, ev.desc, key, payable[key])
+			}
+			if received[key] < 0 {
+				return fmt.Errorf("操作序号 %d（%s）之后账单 %s 实收为 %d 分（小于 0），逐步余额越界", ev.seq, ev.desc, key, received[key])
+			}
+			if received[key] > payable[key] {
+				return fmt.Errorf("操作序号 %d（%s）之后账单 %s 实收 %d 分超过应付 %d 分，逐步余额越界",
+					ev.seq, ev.desc, key, received[key], payable[key])
+			}
+		}
+	}
+
+	// 回放终态必须与当前推导一致，确保两套计算口径相同。
+	for key, b := range s.Bills {
+		_, wantPayable, err := billTotals(b, adjustmentsFor(s, b.CustomerID, b.Month))
+		if err != nil {
+			return fmt.Errorf("账单 %q 的调整金额与记录不一致: %w", key, err)
+		}
+		wantReceived, err := paymentReceived(s, b.CustomerID, b.Month)
+		if err != nil {
+			return fmt.Errorf("账单 %q 的收款金额与记录不一致: %w", key, err)
+		}
+		if payable[key] != wantPayable || received[key] != wantReceived {
+			return fmt.Errorf("账单 %q 的账后回放终态（应付 %d、实收 %d）与当前余额（应付 %d、实收 %d）不一致，数据异常",
+				key, payable[key], received[key], wantPayable, wantReceived)
 		}
 	}
 	return nil
@@ -1495,7 +1735,7 @@ func adjustmentsFor(s *state, customerID, month string) []*adjustment {
 	return list
 }
 
-// correctionsFor 返回某收款的全部分配更正，按操作序号升序。
+// correctionsFor 返回某收款的全部更正（分配更正与归属更正），按操作序号升序。
 func correctionsFor(s *state, paymentID string) []*correction {
 	var list []*correction
 	for _, c := range s.Corrections {
@@ -1507,19 +1747,54 @@ func correctionsFor(s *state, paymentID string) []*correction {
 	return list
 }
 
-// currentAllocations 返回一笔收款当前生效的分配：无更正时为首次登记的
-// 原始分配，否则为序号最大（最新）的更正的分配。
-func currentAllocations(s *state, p *payment) []paymentAllocation {
-	var latest *correction
-	for _, c := range s.Corrections {
-		if c.PaymentID == p.ID && (latest == nil || c.Seq > latest.Seq) {
-			latest = c
+// paymentOwnerAt 返回某收款在指定操作序号完成后的归属客户标识：以首次登记
+// 客户为起点，按序号回放全部归属更正（Reassign），序号不晚于 at 的归属更正
+// 生效。分配更正不改变归属。载入时已校验归属更正目标客户存在且互不相同。
+func paymentOwnerAt(s *state, p *payment, at int64) string {
+	owner := p.CustomerID
+	for _, c := range correctionsFor(s, p.ID) {
+		if c.Reassign && c.Seq <= at {
+			owner = c.TargetCustomerID
 		}
 	}
-	if latest != nil {
-		return latest.Allocations
+	return owner
+}
+
+// paymentOwner 返回某收款的当前归属客户标识（全部归属更正生效后）。
+func paymentOwner(s *state, p *payment) string {
+	return paymentOwnerAt(s, p, s.NextSeq)
+}
+
+// allocationsAt 返回某收款在指定操作序号完成后生效的分配：以首次登记分配为
+// 起点，按序号回放全部更正（分配更正替换同客户月份，归属更正整笔替换为目标
+// 客户的新分配），取序号不晚于 at 的最后一次更正结果。
+func allocationsAt(s *state, p *payment, at int64) []paymentAllocation {
+	current := p.Allocations
+	for _, c := range correctionsFor(s, p.ID) {
+		if c.Seq <= at {
+			current = c.Allocations
+		}
 	}
-	return p.Allocations
+	return current
+}
+
+// currentAllocations 返回一笔收款当前生效的分配：无更正时为首次登记的
+// 原始分配，否则为序号最大（最新）的更正（分配更正或归属更正）的分配。
+// 最新分配所属客户用 paymentOwner 取得，二者必然一致。
+func currentAllocations(s *state, p *payment) []paymentAllocation {
+	return allocationsAt(s, p, s.NextSeq)
+}
+
+// reassignsFor 返回某收款的全部归属更正，按操作序号升序。
+func reassignsFor(s *state, paymentID string) []*correction {
+	var list []*correction
+	for _, c := range s.Corrections {
+		if c.PaymentID == paymentID && c.Reassign {
+			list = append(list, c)
+		}
+	}
+	sort.Slice(list, func(i, j int) bool { return list[i].Seq < list[j].Seq })
+	return list
 }
 
 // allocAmountFor 返回分配列表中指定月份的金额；无该月分配时为 0。
@@ -1532,20 +1807,43 @@ func allocAmountFor(allocs []paymentAllocation, month string) int64 {
 	return 0
 }
 
-// paymentsEverFor 返回历史上曾涉及某客户某月账单的全部收款（首次登记
-// 分配或任一次更正的新分配涉及该月，即使后来被更正移出），按操作序号升序。
+// paymentsEverFor 返回历史上曾以某客户为归属、且分配曾涉及该客户某月账单的
+// 全部收款（首次登记分配或任一次更正——含归属更正转入——涉及该月，即使后来
+// 被更正移出或整笔转出到其他客户），按操作序号升序。收款的首次登记客户
+// 永久保留在 payment.CustomerID，归属经归属更正变化，故不能只按该字段过滤。
 func paymentsEverFor(s *state, customerID, month string) []*payment {
 	var list []*payment
 	for _, p := range s.Payments {
-		if p.CustomerID != customerID {
+		// 该收款是否曾归属于该客户：首次登记客户或某次归属更正的目标客户。
+		everOwned := p.CustomerID == customerID
+		if !everOwned {
+			for _, c := range reassignsFor(s, p.ID) {
+				if c.TargetCustomerID == customerID {
+					everOwned = true
+					break
+				}
+			}
+		}
+		if !everOwned {
 			continue
 		}
-		involved := p.amountFor(month) > 0
+		involved := false
+		// 沿更正链只在归属为该客户期间检查分配是否涉及该月：首次分配（首次
+		// 登记客户）或某次以该客户为目标的更正的新分配涉及该月即可。
+		if p.CustomerID == customerID && p.amountFor(month) > 0 {
+			involved = true
+		}
 		if !involved {
 			for _, c := range s.Corrections {
 				if c.PaymentID == p.ID && allocAmountFor(c.Allocations, month) > 0 {
-					involved = true
-					break
+					owner := c.TargetCustomerID
+					if !c.Reassign {
+						owner = paymentOwnerAt(s, p, c.Seq-1)
+					}
+					if owner == customerID {
+						involved = true
+						break
+					}
 				}
 			}
 		}
@@ -1557,13 +1855,15 @@ func paymentsEverFor(s *state, customerID, month string) []*payment {
 	return list
 }
 
-// paymentReceived 返回全部未撤销收款按最新分配在指定月份计入并扣除退款后
-// 的实收之和。各笔净额（分配减累计退款）均为非负整数，用非负 64 位加法
+// paymentReceived 返回当前归属于指定客户、未撤销的全部收款，按最新分配在
+// 指定月份计入并扣除退款后的实收之和。收款可能经归属更正来自其他客户，
+// 归属按归属更正时间线取当前值；已整笔转出（当前归属为其他客户）或已撤销
+// 的收款不计入。各笔净额（分配减累计退款）均为非负整数，用非负 64 位加法
 // 累加，溢出时返回错误。
 func paymentReceived(s *state, customerID, month string) (int64, error) {
 	var received int64
 	for _, p := range s.Payments {
-		if p.CustomerID != customerID || p.Revoked {
+		if p.Revoked || paymentOwner(s, p) != customerID {
 			continue
 		}
 		amt := allocAmountFor(currentAllocations(s, p), month) - refundedForMonth(s, p.ID, month)

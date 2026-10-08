@@ -1750,8 +1750,8 @@ func TestLedgerSameNameAdjustAndPayment(t *testing.T) {
 func TestLedgerRejectsCorruptHistory(t *testing.T) {
 	h := newHarness(t)
 	// 手工构造：中间步骤实收超过应付（序号 2 之后 1000 > 500），但最终余额
-	// 合法（应付 1500 ≥ 实收 1000），载入校验可通过；流水查询必须逐步核验
-	// 并拒绝，即使截止序号在异常之前。
+	// 合法（应付 1500 ≥ 实收 1000）。载入时的逐步回放即拒绝此类存档，任何
+	// 命令（含 bill show、任意截止的流水查询）都无法读取，且保留原文件。
 	corrupt := `{
   "version": 1,
   "customers": {"c1": {"id": "c1", "name": "甲方", "price_fen": 100}},
@@ -1778,25 +1778,26 @@ func TestLedgerRejectsCorruptHistory(t *testing.T) {
 	if err := os.WriteFile(h.statePath(), []byte(corrupt), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	// 最终余额合法，bill show 不受影响。
-	h.mustRun("bill", "show", "c1", "2026-09")
-	// 完整流水核验失败：无截止、截止在异常之前都拒绝，不输出部分正常报告。
+	// 载入即拒绝：bill show 与无截止、截止在异常之前的流水查询都失败，
+	// 不输出部分正常报告。
 	for _, args := range [][]string{
+		{"bill", "show", "c1", "2026-09"},
 		{"bill", "ledger", "c1", "2026-09"},
 		{"bill", "ledger", "c1", "2026-09", "1"},
 		{"bill", "ledger", "c1", "2026-09", "0"},
 	} {
 		msg := h.runExpectErr(args...)
-		if !strings.Contains(msg, "数据异常") {
+		if !strings.Contains(msg, "数据文件已损坏") {
 			t.Fatalf("args=%v 错误信息异常: %s", args, msg)
 		}
 	}
 	got, _ := os.ReadFile(h.statePath())
 	if string(got) != corrupt {
-		t.Fatal("查询失败后数据文件被改写")
+		t.Fatal("载入失败后数据文件被改写")
 	}
 
-	// 中间步骤应付越出有符号 64 位最大值（最终净额为 0、余额合法）：同样拒绝。
+	// 中间步骤应付越出有符号 64 位最大值（最终净额为 0、余额合法）：载入时
+	// 的逐步回放同样拒绝。
 	overflow := `{
   "version": 1,
   "customers": {"c1": {"id": "c1", "name": "甲方", "price_fen": 1}},
@@ -1820,12 +1821,12 @@ func TestLedgerRejectsCorruptHistory(t *testing.T) {
 		t.Fatal(err)
 	}
 	msg := h.runExpectErr("bill", "ledger", "c1", "2026-09")
-	if !strings.Contains(msg, "数据异常") {
+	if !strings.Contains(msg, "数据文件已损坏") {
 		t.Fatal(msg)
 	}
 	got, _ = os.ReadFile(h.statePath())
 	if string(got) != overflow {
-		t.Fatal("查询失败后数据文件被改写")
+		t.Fatal("载入失败后数据文件被改写")
 	}
 }
 

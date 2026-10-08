@@ -302,9 +302,8 @@ func TestPostbillHistoricalCutoff(t *testing.T) {
 	}
 }
 
-// 完整流水异常：构造最终余额合法但中间步骤实收超过应付的存档，两类查询在
-// 任意截止（含截止 0、终点早于异常）都整体拒绝，不输出部分报告，且不改写
-// 存档。
+// 完整流水异常：构造最终余额合法但中间步骤实收超过应付的存档，载入时的逐步
+// 回放即拒绝（任何命令都无法读取），且保留原文件、不覆盖。
 func TestPostbillRejectIntermediateAnomaly(t *testing.T) {
 	h := newHarness(t)
 	h.mustRun("customer", "add", "c1", "甲方", "100")
@@ -315,8 +314,8 @@ func TestPostbillRejectIntermediateAnomaly(t *testing.T) {
 	h.mustRun("bill", "settle", "c1", "2026-01")
 	h.mustRun("bill", "settle", "c1", "2026-02")
 	// 序号 1 收款 1000；序号 2 减免 -1500（应付 500 < 实收 1000，中间越界）；
-	// 序号 3 补回 +1500... 实际补回 +1000 后应付 1500 ≥ 实收 1000，最终余额
-	// 合法——载入校验只看当前余额可以通过，查询时的逐步核验必须拒绝。
+	// 序号 3 补回 +1000 后应付 1500 ≥ 实收 1000，最终余额合法——载入时的逐步
+	// 回放仍必须拒绝。
 	corrupt := `{
   "version": 1,
   "customers": {"c1": {"id": "c1", "name": "甲方", "price_fen": 100}},
@@ -348,17 +347,15 @@ func TestPostbillRejectIntermediateAnomaly(t *testing.T) {
 	if err := os.WriteFile(h.statePath(), []byte(corrupt), 0o644); err != nil {
 		t.Fatal(err)
 	}
-	// bill show 只依赖当前余额（合法），不受影响。
-	h.mustRun("bill", "show", "c1", "2026-02")
-
-	ledgerQueries := [][]string{
+	// 载入即按数据损坏拒绝：bill show 与任意截止的流水、报表命令都失败。
+	for _, args := range [][]string{
+		{"bill", "show", "c1", "2026-02"},
 		{"bill", "ledger", "c1", "2026-02"},
 		{"bill", "ledger", "c1", "2026-02", "1"}, // 截止早于异常序号 2 仍拒绝
 		{"bill", "ledger", "c1", "2026-02", "0"},
-	}
-	for _, args := range ledgerQueries {
-		if msg := h.runExpectErr(args...); !strings.Contains(msg, "数据异常") {
-			t.Fatalf("args=%v 应按数据异常拒绝：%s", args, msg)
+	} {
+		if msg := h.runExpectErr(args...); !strings.Contains(msg, "数据文件已损坏") {
+			t.Fatalf("args=%v 应按数据文件损坏拒绝：%s", args, msg)
 		}
 	}
 	// 报表同样整体拒绝：终点在异常之前、只查未涉及异常的 2026-01 也拒绝
@@ -367,8 +364,8 @@ func TestPostbillRejectIntermediateAnomaly(t *testing.T) {
 		{"bill", "reconcile", "c1", "2026-01", "2026-02", "0", "1"},
 		{"bill", "reconcile", "c1", "2026-01", "2026-02"},
 	} {
-		if msg := h.runExpectErr(args...); !strings.Contains(msg, "数据异常") {
-			t.Fatalf("args=%v 应按数据异常拒绝：%s", args, msg)
+		if msg := h.runExpectErr(args...); !strings.Contains(msg, "数据文件已损坏") {
+			t.Fatalf("args=%v 应按数据文件损坏拒绝：%s", args, msg)
 		}
 	}
 	after, err := os.ReadFile(h.statePath())
@@ -376,7 +373,7 @@ func TestPostbillRejectIntermediateAnomaly(t *testing.T) {
 		t.Fatal(err)
 	}
 	if string(after) != corrupt {
-		t.Fatal("异常查询改写了存档")
+		t.Fatal("载入失败改写了存档")
 	}
 }
 
